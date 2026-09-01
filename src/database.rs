@@ -127,10 +127,19 @@ impl Database {
         )?)
     }
 
-    pub fn upsert_messages(&self, messages: &[Message]) -> Result<()> {
+    pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let mut inserted = 0;
         for message in messages {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+                [message.id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                inserted += 1;
+            }
             transaction.execute(
                 "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body",
                 params![
@@ -156,7 +165,7 @@ impl Database {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok(inserted)
     }
 
     pub fn list_messages(&self, account_id: Option<i64>, folder: &str) -> Result<Vec<Message>> {

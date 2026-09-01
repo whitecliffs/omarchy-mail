@@ -13,6 +13,8 @@ without making the GTK main loop responsible for network activity.
 - `mail/credentials.rs` stores passwords using the Linux Secret Service via
   the `keyring` crate.
 - `mail/mime.rs` parses MIME messages and sanitises HTML before the UI sees it.
+- `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
+  worker threads, with bounded fetches and per-account error reports.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the first vertical slice of the desktop experience.

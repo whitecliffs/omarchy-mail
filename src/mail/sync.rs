@@ -8,6 +8,7 @@ pub struct SyncReport {
     pub account_id: Option<i64>,
     pub email: String,
     pub fetched: usize,
+    pub new_messages: usize,
     pub error: Option<String>,
 }
 
@@ -33,16 +34,18 @@ pub fn spawn_account_sync(
         let report = match credentials::load_password(&account.email) {
             Ok(password) => match imap::sync_inbox(&account, &password, 250) {
                 Ok(messages) => match database.upsert_messages(&messages) {
-                    Ok(()) => SyncReport {
+                    Ok(new_messages) => SyncReport {
                         account_id: account.id,
                         email: account.email,
                         fetched: messages.len(),
+                        new_messages,
                         error: None,
                     },
                     Err(error) => SyncReport {
                         account_id: account.id,
                         email: account.email,
                         fetched: 0,
+                        new_messages: 0,
                         error: Some(error.to_string()),
                     },
                 },
@@ -50,6 +53,7 @@ pub fn spawn_account_sync(
                     account_id: account.id,
                     email: account.email,
                     fetched: 0,
+                    new_messages: 0,
                     error: Some(error.to_string()),
                 },
             },
@@ -57,6 +61,7 @@ pub fn spawn_account_sync(
                 account_id: account.id,
                 email: account.email,
                 fetched: 0,
+                new_messages: 0,
                 error: Some(error.to_string()),
             },
         };

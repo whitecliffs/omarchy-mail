@@ -4,11 +4,13 @@ Omarchy Mail is a lightweight, native email client for Omarchy Linux. It is
 designed around calm typography, clear hierarchy, and the practical reliability
 of a local cache rather than a dashboard full of unrelated features.
 
-The project is an early working slice: the GTK4/libadwaita shell, responsive
+The current working slice includes the GTK4/libadwaita shell, responsive
 three-pane layout, first-run account flow, Secret Service password storage,
-SQLite/FTS cache, safe MIME boundary, compose/settings surfaces, and Omarchy
-theme integration are in place. IMAP/SMTP synchronisation and the remaining
-mail actions are the next implementation milestone.
+SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
+fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
+actions, compose/settings surfaces, and Omarchy theme integration. Full folder
+reconciliation, conversation rendering, OAuth2, and richer attachment handling
+remain explicit follow-up milestones.
 
 ## Build and preview
 

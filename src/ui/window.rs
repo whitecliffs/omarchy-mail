@@ -3,7 +3,6 @@ use crate::mail;
 use crate::models::{Account, Message, SecurityMode, ServerConfig};
 use crate::theme;
 use adw::prelude::*;
-use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -119,10 +118,10 @@ pub fn build_window(application: &adw::Application) {
 
     if !state.accounts.borrow().is_empty() {
         let state_for_startup_sync = state.clone();
-        glib::idle_add_local_once(move || sync_all(state_for_startup_sync));
+        glib::idle_add_local_once(move || sync_all(state_for_startup_sync, false));
         let state_for_periodic_sync = state.clone();
         glib::timeout_add_local(Duration::from_secs(300), move || {
-            sync_all(state_for_periodic_sync.clone());
+            sync_all(state_for_periodic_sync.clone(), true);
             glib::ControlFlow::Continue
         });
     }
@@ -156,7 +155,7 @@ fn connect_header_actions(
     let state_for_compose = state.clone();
     compose.connect_clicked(move |_| open_compose(state_for_compose.clone()));
     let state_for_refresh = state.clone();
-    refresh.connect_clicked(move |_| sync_all(state_for_refresh.clone()));
+    refresh.connect_clicked(move |_| sync_all(state_for_refresh.clone(), true));
     let state_for_settings = state;
     settings.connect_clicked(move |_| open_settings(state_for_settings.clone()));
 }
@@ -378,7 +377,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     }
 }
 
-fn sync_all(state: Rc<AppState>) {
+fn sync_all(state: Rc<AppState>, notify: bool) {
     let accounts = state
         .accounts
         .borrow()
@@ -406,8 +405,8 @@ fn sync_all(state: Rc<AppState>) {
             completed += 1;
             if let Some(error) = report.error {
                 errors.push(format!("{}: {error}", report.email));
-            } else if report.fetched > 0 {
-                crate::mail::sync::notify_new_mail(&report.email, report.fetched);
+            } else if notify && report.new_messages > 0 {
+                crate::mail::sync::notify_new_mail(&report.email, report.new_messages);
             }
             if let Ok(messages) = state.database.list_messages(None, "Inbox") {
                 state.messages.replace(messages);
@@ -862,7 +861,11 @@ fn open_account_dialog(state: Rc<AppState>) {
         account.outgoing = ServerConfig {
             hostname: outgoing_host.text().trim().to_string(),
             port: outgoing_port.value_as_int().max(1) as u16,
-            security: SecurityMode::Tls,
+            security: if outgoing_port.value_as_int() == 587 {
+                SecurityMode::StartTls
+            } else {
+                SecurityMode::Tls
+            },
             username: address.clone(),
         };
         button.set_sensitive(false);
