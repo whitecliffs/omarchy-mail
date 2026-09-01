@@ -306,53 +306,58 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                 match imap::sync_inbox(account, &password, 250) {
                     Ok(snapshot) => {
                         let fetched = snapshot.messages.len();
-                        report = Some(match database.upsert_messages(&snapshot.messages) {
+                        let uidvalidity = snapshot.uidvalidity;
+                        let all_uids = snapshot.all_uids;
+                        let messages = snapshot.messages;
+                        let folders = account.id.map(|account_id| {
+                            snapshot
+                                .folders
+                                .into_iter()
+                                .map(|folder| MailFolder {
+                                    account_id,
+                                    name: folder.name,
+                                    remote_name: folder.remote_name,
+                                    kind: folder.kind,
+                                    unread_count: folder.unread_count,
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        report = Some(match database.upsert_messages(&messages) {
                             Ok(new_messages) => {
-                                let folders = account.id.map(|account_id| {
-                                    snapshot
-                                        .folders
-                                        .into_iter()
-                                        .map(|folder| MailFolder {
-                                            account_id,
-                                            name: folder.name,
-                                            remote_name: folder.remote_name,
-                                            kind: folder.kind,
-                                            unread_count: folder.unread_count,
-                                        })
-                                        .collect::<Vec<_>>()
-                                });
-                                match folders {
-                                    Some(folders) => match database.upsert_folders(&folders) {
-                                        Ok(()) => SyncReport {
-                                            account_id: account.id,
-                                            email: account.email.clone(),
-                                            fetched,
-                                            new_messages,
-                                            initial: false,
-                                            error: reconciliation_error.clone(),
-                                        },
-                                        Err(error) => SyncReport {
-                                            account_id: account.id,
-                                            email: account.email.clone(),
-                                            fetched,
-                                            new_messages,
-                                            initial: false,
-                                            error: Some(match reconciliation_error.as_deref() {
-                                                Some(reconciliation_error) => {
-                                                    format!("{error}; {reconciliation_error}")
-                                                }
-                                                None => error.to_string(),
-                                            }),
-                                        },
-                                    },
-                                    None => SyncReport {
-                                        account_id: account.id,
-                                        email: account.email.clone(),
-                                        fetched,
-                                        new_messages,
-                                        initial: false,
-                                        error: reconciliation_error.clone(),
-                                    },
+                                let mut cache_error = reconciliation_error.clone();
+                                if let (Some(account_id), Some(uidvalidity)) =
+                                    (account.id, uidvalidity)
+                                    && let Err(error) = database.reconcile_folder(
+                                        account_id,
+                                        "Inbox",
+                                        uidvalidity,
+                                        &all_uids,
+                                    )
+                                {
+                                    append_error(&mut cache_error, error);
+                                }
+                                if let Some(folders) = folders {
+                                    if let Err(error) = database.upsert_folders(&folders) {
+                                        append_error(&mut cache_error, error);
+                                    } else if let Some(account_id) = account.id {
+                                        let remote_names = folders
+                                            .iter()
+                                            .map(|folder| folder.remote_name.clone())
+                                            .collect::<Vec<_>>();
+                                        if let Err(error) =
+                                            database.reconcile_folders(account_id, &remote_names)
+                                        {
+                                            append_error(&mut cache_error, error);
+                                        }
+                                    }
+                                }
+                                SyncReport {
+                                    account_id: account.id,
+                                    email: account.email.clone(),
+                                    fetched,
+                                    new_messages,
+                                    initial: false,
+                                    error: cache_error,
                                 }
                             }
                             Err(error) => SyncReport {
@@ -394,6 +399,17 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
     }
 }
 
+fn append_error(errors: &mut Option<String>, error: impl ToString) {
+    let error = error.to_string();
+    match errors {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&error);
+        }
+        None => *errors = Some(error),
+    }
+}
+
 fn sync_standard_folders(
     account: &Account,
     password: &str,
@@ -418,12 +434,12 @@ fn sync_standard_folders(
     let mut new_total = 0;
     let mut errors = Vec::new();
     for folder in standard {
-        let mut messages = None;
+        let mut snapshot = None;
         let mut last_error = None;
         for attempt in 0..3 {
             match imap::sync_folder(account, password, &folder.remote_name, &folder.name, 100) {
-                Ok(fetched) => {
-                    messages = Some(fetched);
+                Ok(result) => {
+                    snapshot = Some(result);
                     break;
                 }
                 Err(error) => {
@@ -434,11 +450,23 @@ fn sync_standard_folders(
                 }
             }
         }
-        match messages {
-            Some(messages) => {
-                fetched_total += messages.len();
-                match database.upsert_messages(&messages) {
-                    Ok(new_messages) => new_total += new_messages,
+        match snapshot {
+            Some(snapshot) => {
+                fetched_total += snapshot.messages.len();
+                match database.upsert_messages(&snapshot.messages) {
+                    Ok(new_messages) => {
+                        new_total += new_messages;
+                        if let Some(uidvalidity) = snapshot.uidvalidity
+                            && let Err(error) = database.reconcile_folder(
+                                account_id,
+                                &folder.name,
+                                uidvalidity,
+                                &snapshot.all_uids,
+                            )
+                        {
+                            errors.push(format!("{}: {error}", folder.name));
+                        }
+                    }
                     Err(error) => errors.push(format!("{}: {error}", folder.name)),
                 }
             }
@@ -501,12 +529,12 @@ pub fn spawn_folder_sync(
     thread::spawn(move || {
         let report = match load_imap_password(&account) {
             Ok(password) => {
-                let mut messages = None;
+                let mut snapshot = None;
                 let mut last_error = None;
                 for attempt in 0..3 {
                     match imap::sync_folder(&account, &password, &remote_name, &local_name, 250) {
-                        Ok(fetched) => {
-                            messages = Some(fetched);
+                        Ok(result) => {
+                            snapshot = Some(result);
                             break;
                         }
                         Err(error) => {
@@ -517,18 +545,33 @@ pub fn spawn_folder_sync(
                         }
                     }
                 }
-                match messages {
-                    Some(messages) => {
-                        let fetched = messages.len();
-                        match database.upsert_messages(&messages) {
-                            Ok(new_messages) => FolderSyncReport {
-                                account_id: account.id,
-                                email: account.email,
-                                folder: local_name,
-                                fetched,
-                                new_messages,
-                                error: None,
-                            },
+                match snapshot {
+                    Some(snapshot) => {
+                        let fetched = snapshot.messages.len();
+                        match database.upsert_messages(&snapshot.messages) {
+                            Ok(new_messages) => {
+                                let error = snapshot
+                                    .uidvalidity
+                                    .and_then(|uidvalidity| {
+                                        database
+                                            .reconcile_folder(
+                                                account.id?,
+                                                &local_name,
+                                                uidvalidity,
+                                                &snapshot.all_uids,
+                                            )
+                                            .err()
+                                    })
+                                    .map(|error| error.to_string());
+                                FolderSyncReport {
+                                    account_id: account.id,
+                                    email: account.email,
+                                    folder: local_name,
+                                    fetched,
+                                    new_messages,
+                                    error,
+                                }
+                            }
                             Err(error) => FolderSyncReport {
                                 account_id: account.id,
                                 email: account.email,

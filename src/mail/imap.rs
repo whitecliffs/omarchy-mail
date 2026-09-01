@@ -33,6 +33,8 @@ pub struct RemoteFolder {
 pub struct SyncSnapshot {
     pub messages: Vec<Message>,
     pub folders: Vec<RemoteFolder>,
+    pub uidvalidity: Option<u32>,
+    pub all_uids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub fn sync_folder(
     remote_name: &str,
     local_name: &str,
     limit: usize,
-) -> Result<Vec<Message>, ImapError> {
+) -> Result<SyncSnapshot, ImapError> {
     let tls = TlsConnector::builder().build()?;
     let address = (account.incoming.hostname.as_str(), account.incoming.port);
     let snapshot = match account.incoming.security {
@@ -130,7 +132,7 @@ pub fn sync_folder(
             )?
         }
     };
-    Ok(snapshot.messages)
+    Ok(snapshot)
 }
 
 /// Re-fetches one complete RFC822 message when its disposable attachment
@@ -486,8 +488,9 @@ fn sync_client<T: Read + Write>(
     let uids = session
         .uid_search("ALL")
         .map_err(|error| ImapError::Protocol(error.to_string()))?;
-    let mut selected = uids.into_iter().collect::<Vec<_>>();
-    selected.sort_unstable_by(|left, right| right.cmp(left));
+    let mut all_uids = uids.into_iter().collect::<Vec<_>>();
+    all_uids.sort_unstable_by(|left, right| right.cmp(left));
+    let mut selected = all_uids.clone();
     selected.truncate(limit);
     let sequence = selected
         .iter()
@@ -507,7 +510,12 @@ fn sync_client<T: Read + Write>(
     }
     messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
     let _ = session.logout();
-    Ok(SyncSnapshot { messages, folders })
+    Ok(SyncSnapshot {
+        messages,
+        folders,
+        uidvalidity,
+        all_uids,
+    })
 }
 
 fn fetch_message_client<T: Read + Write>(

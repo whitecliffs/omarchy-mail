@@ -3,6 +3,7 @@ use crate::models::{
 };
 use chrono::Utc;
 use rusqlite::{Connection, params};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -360,6 +361,90 @@ impl Database {
         Ok(())
     }
 
+    /// Removes cached rows that the server has proven absent from a mailbox.
+    /// The caller must provide the mailbox's current UIDVALIDITY and the
+    /// complete UID set returned by IMAP; recent-message fetch limits are not
+    /// sufficient evidence for deletion.
+    pub fn reconcile_folder(
+        &self,
+        account_id: i64,
+        folder: &str,
+        uidvalidity: u32,
+        remote_uids: &[u32],
+    ) -> Result<usize> {
+        let known_uids = remote_uids.iter().copied().collect::<HashSet<_>>();
+        let connection = self.connection()?;
+        let stale_ids = {
+            let mut statement = connection.prepare(
+                "SELECT id, remote_uid, uidvalidity FROM messages
+                 WHERE account_id = ?1 AND folder = ?2",
+            )?;
+            let rows = statement.query_map(params![account_id, folder], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<u32>>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
+            })?;
+            let existing = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            existing
+                .into_iter()
+                .filter_map(|(id, remote_uid, cached_uidvalidity)| {
+                    (cached_uidvalidity != Some(uidvalidity)
+                        || remote_uid.is_none()
+                        || !known_uids.contains(&remote_uid.unwrap_or_default()))
+                    .then_some(id)
+                })
+                .collect::<Vec<_>>()
+        };
+        if stale_ids.is_empty() {
+            return Ok(0);
+        }
+        let transaction = connection.unchecked_transaction()?;
+        for id in &stale_ids {
+            transaction.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(stale_ids.len())
+    }
+
+    /// Reconciles the local mailbox map against an authoritative IMAP LIST
+    /// result. Cached messages belonging to a mailbox removed on the server
+    /// are removed with its folder metadata.
+    pub fn reconcile_folders(&self, account_id: i64, remote_names: &[String]) -> Result<usize> {
+        let connection = self.connection()?;
+        let stale_folders = {
+            let mut statement = connection
+                .prepare("SELECT id, name, remote_name FROM folders WHERE account_id = ?1")?;
+            let rows = statement.query_map([account_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, _, remote_name)| {
+                    !remote_names.iter().any(|known| known == remote_name)
+                })
+                .collect::<Vec<_>>()
+        };
+        if stale_folders.is_empty() {
+            return Ok(0);
+        }
+        let transaction = connection.unchecked_transaction()?;
+        for (folder_id, local_name, _) in &stale_folders {
+            transaction.execute(
+                "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2",
+                params![account_id, local_name],
+            )?;
+            transaction.execute("DELETE FROM folders WHERE id = ?1", [folder_id])?;
+        }
+        transaction.commit()?;
+        Ok(stale_folders.len())
+    }
+
     pub fn queue_send(&self, send: &PendingSend) -> Result<i64> {
         let connection = self.connection()?;
         let cc_json = serde_json::to_string(&send.cc)
@@ -651,6 +736,38 @@ mod tests {
     }
 
     #[test]
+    fn reconciles_deleted_messages_and_uidvalidity_changes() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("account");
+        let mut messages = Message::demo_messages();
+        messages.truncate(3);
+        for message in &mut messages {
+            message.account_id = Some(account_id);
+            message.remote_uid = Some(40 + message.id as u32);
+            message.uidvalidity = Some(if message.id == 3 { 6 } else { 7 });
+        }
+        database.upsert_messages(&messages).expect("messages");
+
+        assert_eq!(
+            database
+                .reconcile_folder(account_id, "Inbox", 7, &[41])
+                .expect("reconcile"),
+            2
+        );
+        let remaining = database
+            .list_messages(Some(account_id), "Inbox")
+            .expect("remaining messages");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].remote_uid, Some(41));
+
+        let found = database.search_messages("Saturday").expect("search");
+        assert!(found.is_empty());
+    }
+
+    #[test]
     fn round_trips_server_folder_metadata() {
         let directory = tempdir().expect("temp directory");
         let database = Database::open(directory.path()).expect("database");
@@ -680,6 +797,14 @@ mod tests {
         assert_eq!(folders[0].name, "Inbox");
         assert_eq!(folders[0].unread_count, 4);
         assert_eq!(folders[1].remote_name, "Archive/Receipts");
+
+        assert_eq!(
+            database
+                .reconcile_folders(account_id, &["INBOX".into()])
+                .expect("reconcile folders"),
+            1
+        );
+        assert_eq!(database.load_folders().expect("reload folders").len(), 1);
     }
 
     #[test]

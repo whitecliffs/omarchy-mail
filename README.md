@@ -13,8 +13,9 @@ per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, lightweight All/Unread/Starred/Attachment filters, safe inline image
 rendering, attachment re-fetch after cache eviction, a durable offline Outbox,
-and Omarchy theme integration. Complete folder-wide reconciliation and OAuth2
-remain explicit follow-up milestones. Read/star/move
+and Omarchy theme integration. The cache now reconciles deleted messages and
+server-side mailbox removals using complete UID/UIDVALIDITY snapshots. OAuth2
+remains an explicit follow-up milestone. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server.
 

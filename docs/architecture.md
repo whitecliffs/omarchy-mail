@@ -61,6 +61,12 @@ backoff by an account-local outbox monitor. Permanent response or local file
 errors remain visible in Outbox until the user chooses Retry now or Discard;
 credentials are never copied into queued message data.
 
+IMAP sync asks each selected mailbox for its complete UID set while fetching
+only a bounded recent window of full messages. After a successful upsert, the
+cache removes rows with absent UIDs or an old UIDVALIDITY, and mailbox
+discovery removes folders no longer returned by LIST. This keeps startup and
+scrolling light without allowing deleted server mail to remain indefinitely.
+
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the
 synchronisation worker deletes an action only after the IMAP server accepts
