@@ -510,12 +510,11 @@ fn message_from_fetch(
         return Ok(None);
     };
     let id = stable_id(account_id, folder, remote_uid, uidvalidity);
-    let thread_key = parsed
-        .references
-        .last()
-        .cloned()
-        .or_else(|| parsed.in_reply_to.clone())
-        .or_else(|| parsed.message_id.clone());
+    let thread_key = derive_thread_key(
+        &parsed.references,
+        parsed.in_reply_to.as_deref(),
+        parsed.message_id.as_deref(),
+    );
     let received_at = fetch
         .internal_date()
         .map(|date| date.with_timezone(&Utc).to_rfc3339())
@@ -582,6 +581,18 @@ fn preview(body: &str) -> String {
         .collect()
 }
 
+fn derive_thread_key(
+    references: &[String],
+    in_reply_to: Option<&str>,
+    message_id: Option<&str>,
+) -> Option<String> {
+    references
+        .first()
+        .cloned()
+        .or_else(|| in_reply_to.map(str::to_string))
+        .or_else(|| message_id.map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +616,27 @@ mod tests {
     #[test]
     fn preview_collapses_whitespace() {
         assert_eq!(preview("hello\n\nthere"), "hello there");
+    }
+
+    #[test]
+    fn threading_prefers_the_root_reference() {
+        let references = vec!["<root@example.com>".into(), "<parent@example.com>".into()];
+        assert_eq!(
+            derive_thread_key(
+                &references,
+                Some("<parent@example.com>"),
+                Some("<reply@example.com>")
+            ),
+            Some("<root@example.com>".into())
+        );
+        assert_eq!(
+            derive_thread_key(
+                &[],
+                Some("<parent@example.com>"),
+                Some("<reply@example.com>")
+            ),
+            Some("<parent@example.com>".into())
+        );
     }
 
     #[test]

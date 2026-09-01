@@ -73,8 +73,22 @@ pub fn spawn_account_monitor(
 
             let mut report = sync_account_once(&account, &database);
             report.initial = initial_sync;
-            initial_sync = false;
+            if initial_sync && report.error.is_none() {
+                match credentials::load_password(&account.email, "imap") {
+                    Ok(password) => match sync_standard_folders(&account, &password, &database) {
+                        Ok((fetched, new_messages)) => {
+                            report.fetched += fetched;
+                            report.new_messages += new_messages;
+                        }
+                        Err(error) => report.error = Some(error),
+                    },
+                    Err(error) => report.error = Some(error.to_string()),
+                }
+            }
             let sync_failed = report.error.is_some();
+            if !sync_failed {
+                initial_sync = false;
+            }
             let _ = sender.send_blocking(report);
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -230,6 +244,71 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
             initial: false,
             error: Some(error.to_string()),
         },
+    }
+}
+
+fn sync_standard_folders(
+    account: &Account,
+    password: &str,
+    database: &Database,
+) -> Result<(usize, usize), String> {
+    let Some(account_id) = account.id else {
+        return Ok((0, 0));
+    };
+    let folders = database
+        .load_folders()
+        .map_err(|error| format!("Could not load mailboxes: {error}"))?;
+    let standard = folders
+        .into_iter()
+        .filter(|folder| {
+            folder.account_id == account_id
+                && folder.kind != "custom"
+                && !folder.name.eq_ignore_ascii_case("Inbox")
+        })
+        .collect::<Vec<_>>();
+
+    let mut fetched_total = 0;
+    let mut new_total = 0;
+    let mut errors = Vec::new();
+    for folder in standard {
+        let mut messages = None;
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match imap::sync_folder(account, password, &folder.remote_name, &folder.name, 100) {
+                Ok(fetched) => {
+                    messages = Some(fetched);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt < 2 {
+                        thread::sleep(Duration::from_secs(1 << attempt));
+                    }
+                }
+            }
+        }
+        match messages {
+            Some(messages) => {
+                fetched_total += messages.len();
+                match database.upsert_messages(&messages) {
+                    Ok(new_messages) => new_total += new_messages,
+                    Err(error) => errors.push(format!("{}: {error}", folder.name)),
+                }
+            }
+            None => errors.push(format!(
+                "{}: {}",
+                folder.name,
+                last_error.unwrap_or_else(|| "unknown folder error".into())
+            )),
+        }
+    }
+    if errors.is_empty() {
+        Ok((fetched_total, new_total))
+    } else {
+        Err(format!(
+            "Some mailboxes could not sync: {}",
+            errors.join(" · ")
+        ))
     }
 }
 

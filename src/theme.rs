@@ -127,6 +127,8 @@ window.omarchy-mail-window {{
 .mail-reader-sender {{ color: @om-light-foreground; font-weight: 700; }}
 .mail-reader-meta {{ color: @om-muted; }}
 .mail-reader-body {{ color: @om-foreground; font-size: 1.03em; line-height: 1.5; }}
+.mail-conversation-label {{ color: @om-muted; font-size: 0.9em; font-weight: 700; }}
+.mail-conversation-expander {{ background: alpha(@om-selection, 0.32); border-radius: 8px; color: @om-light-foreground; }}
 .mail-attachment-chip {{ background: alpha(@om-selection, 0.8); border: 1px solid alpha(@om-accent, 0.35); border-radius: 8px; padding: 6px 10px; color: @om-light-foreground; }}
 .mail-empty-title {{ color: @om-light-foreground; font-size: 1.4em; font-weight: 700; }}
 .mail-empty-body {{ color: @om-muted; }}

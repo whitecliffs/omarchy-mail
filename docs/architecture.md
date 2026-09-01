@@ -34,10 +34,12 @@ filenames and metadata are retained with the cached message in SQLite.
 
 Each enabled account owns an isolated monitor thread. The monitor performs a
 bounded initial sync, waits for INBOX changes using IMAP IDLE for at most 25
-minutes, then reconnects and reconciles again. If IDLE is unavailable it polls
-every five minutes; connection and authentication failures use capped
-exponential backoff. Stop signals are checked between waits so removing an
-account does not start another sync.
+minutes, then reconnects and reconciles again. The initial pass also warms the
+standard non-Inbox folders with a 100-message bound per folder; custom folders
+remain on-demand. If IDLE is unavailable it polls every five minutes;
+connection and authentication failures use capped exponential backoff. Stop
+signals are checked between waits so removing an account does not start another
+sync.
 
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the

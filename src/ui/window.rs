@@ -613,32 +613,37 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
             .search_messages(raw_query)
             .unwrap_or_else(|_| state.messages.borrow().clone())
     };
-    for message in messages.iter().filter(|message| {
-        let in_scope = match &scope {
-            MailScope::Unified(folder) if folder == "Starred" => message.starred,
-            MailScope::Unified(folder) => message.folder.eq_ignore_ascii_case(folder),
-            MailScope::Account { id, folder } => {
-                message.account_id == Some(*id) && message.folder.eq_ignore_ascii_case(folder)
-            }
-        };
-        in_scope
-            && match filter {
-                MailFilter::All => true,
-                MailFilter::Unread => message.unread,
-                MailFilter::Starred => message.starred,
-                MailFilter::Attachments => message.has_attachments,
-            }
-            && (query.is_empty()
-                || [
-                    message.sender_name.as_str(),
-                    message.sender_email.as_str(),
-                    message.recipients.as_str(),
-                    message.subject.as_str(),
-                    message.body.as_str(),
-                ]
-                .iter()
-                .any(|value| value.to_lowercase().contains(&query)))
-    }) {
+    let mut visible = messages
+        .into_iter()
+        .filter(|message| {
+            let in_scope = match &scope {
+                MailScope::Unified(folder) if folder == "Starred" => message.starred,
+                MailScope::Unified(folder) => message.folder.eq_ignore_ascii_case(folder),
+                MailScope::Account { id, folder } => {
+                    message.account_id == Some(*id) && message.folder.eq_ignore_ascii_case(folder)
+                }
+            };
+            in_scope
+                && match filter {
+                    MailFilter::All => true,
+                    MailFilter::Unread => message.unread,
+                    MailFilter::Starred => message.starred,
+                    MailFilter::Attachments => message.has_attachments,
+                }
+                && (query.is_empty()
+                    || [
+                        message.sender_name.as_str(),
+                        message.sender_email.as_str(),
+                        message.recipients.as_str(),
+                        message.subject.as_str(),
+                        message.body.as_str(),
+                    ]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&query)))
+        })
+        .collect::<Vec<_>>();
+    visible.sort_by(compare_received_newest);
+    for message in group_messages(visible).iter() {
         let (row, star) = message_row(message);
         let message_id = message.id;
         let state_for_star = state.clone();
@@ -661,6 +666,42 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         row.add_controller(gesture);
         state.message_list.append(&row);
     }
+}
+
+fn conversation_identity(message: &Message) -> (Option<i64>, String, String) {
+    (
+        message.account_id,
+        message.folder.clone(),
+        message
+            .thread_key
+            .clone()
+            .unwrap_or_else(|| format!("message:{}", message.id)),
+    )
+}
+
+fn group_messages(messages: Vec<Message>) -> Vec<Message> {
+    let mut grouped: Vec<((Option<i64>, String, String), Message, usize)> = Vec::new();
+    for message in messages {
+        let identity = conversation_identity(&message);
+        if let Some((_, representative, count)) = grouped
+            .iter_mut()
+            .find(|(known_identity, _, _)| *known_identity == identity)
+        {
+            *count += 1;
+            representative.unread |= message.unread;
+            representative.starred |= message.starred;
+            representative.has_attachments |= message.has_attachments;
+            representative.thread_size = *count as u32;
+        } else {
+            let mut representative = message;
+            representative.thread_size = 1;
+            grouped.push((identity, representative, 1));
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(_, representative, _)| representative)
+        .collect()
 }
 
 fn sync_all(state: Rc<AppState>, notify: bool) {
@@ -988,6 +1029,7 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
 fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
     clear(&state.reader);
     if let Some(message) = message {
+        let conversation = conversation_messages(state, &message);
         let scroll = gtk::ScrolledWindow::builder()
             .vexpand(true)
             .hexpand(true)
@@ -1082,59 +1124,36 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         rule.set_margin_bottom(24);
         content.append(&rule);
 
-        let body = gtk::Label::new(None);
-        body.set_xalign(0.0);
-        body.set_yalign(0.0);
-        body.set_wrap(true);
-        body.set_selectable(true);
-        body.add_css_class("mail-reader-body");
-        if message.body.contains('<') {
-            body.set_use_markup(true);
-            body.set_markup(&crate::mail::mime::html_to_pango(&message.body));
-            body.connect_activate_link(|_, uri| {
-                let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
-                glib::Propagation::Stop
-            });
-        } else {
-            body.set_text(&message.body);
-        }
-        content.append(&body);
+        if conversation.len() > 1 {
+            let conversation_label = gtk::Label::new(Some(&format!(
+                "Conversation · {} messages",
+                conversation.len()
+            )));
+            conversation_label.set_xalign(0.0);
+            conversation_label.add_css_class("mail-conversation-label");
+            conversation_label.set_margin_bottom(8);
+            content.append(&conversation_label);
 
-        if !message.attachments.is_empty() {
-            let attachments = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            attachments.set_margin_top(30);
-            let heading = gtk::Label::new(Some("Attachments"));
-            heading.set_xalign(0.0);
-            heading.add_css_class("mail-reader-meta");
-            attachments.append(&heading);
-            for attachment in &message.attachments {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-                row.add_css_class("mail-attachment-chip");
-                let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
-                row.append(&icon);
-                let label = gtk::Label::new(Some(&format_attachment_label(attachment)));
-                label.set_xalign(0.0);
-                label.set_hexpand(true);
-                row.append(&label);
-                let save = gtk::Button::with_label("Save");
-                save.set_sensitive(!attachment.cache_path.is_empty());
-                let state_for_attachment = state.clone();
-                let attachment = attachment.clone();
-                save.connect_clicked(move |_| {
-                    save_attachment(state_for_attachment.clone(), attachment.clone())
-                });
-                row.append(&save);
-                attachments.append(&row);
+            for related in conversation
+                .iter()
+                .filter(|related| related.id != message.id)
+            {
+                let title = format!("{}  ·  {}", related.sender_name, related.received_at);
+                let expander = gtk::Expander::new(Some(&title));
+                expander.add_css_class("mail-conversation-expander");
+                expander.set_margin_bottom(8);
+                expander.set_expanded(false);
+                let older = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                older.set_margin_start(10);
+                older.set_margin_end(10);
+                older.set_margin_top(10);
+                older.set_margin_bottom(10);
+                append_message_content(&older, state, related);
+                expander.set_child(Some(&older));
+                content.append(&expander);
             }
-            content.append(&attachments);
-        } else if message.has_attachments {
-            let attachments = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            attachments.set_margin_top(30);
-            let chip = gtk::Label::new(Some("  attachment unavailable  "));
-            chip.add_css_class("mail-attachment-chip");
-            attachments.append(&chip);
-            content.append(&attachments);
         }
+        append_message_content(&content, state, &message);
         scroll.set_child(Some(&content));
         state.reader.append(&scroll);
     } else if state.accounts.borrow().is_empty() && !state.demo_mode {
@@ -1166,6 +1185,88 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         empty.append(&title);
         empty.append(&body);
         state.reader.append(&empty);
+    }
+}
+
+fn conversation_messages(state: &Rc<AppState>, selected: &Message) -> Vec<Message> {
+    let identity = conversation_identity(selected);
+    let mut messages = state
+        .messages
+        .borrow()
+        .iter()
+        .filter(|message| conversation_identity(message) == identity)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !messages.iter().any(|message| message.id == selected.id) {
+        messages.push(selected.clone());
+    }
+    messages.sort_by(|left, right| compare_received_newest(right, left));
+    messages
+}
+
+fn compare_received_newest(left: &Message, right: &Message) -> std::cmp::Ordering {
+    match (
+        chrono::DateTime::parse_from_rfc3339(&left.received_at),
+        chrono::DateTime::parse_from_rfc3339(&right.received_at),
+    ) {
+        (Ok(left), Ok(right)) => right.cmp(&left),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Message) {
+    let body = gtk::Label::new(None);
+    body.set_xalign(0.0);
+    body.set_yalign(0.0);
+    body.set_wrap(true);
+    body.set_selectable(true);
+    body.add_css_class("mail-reader-body");
+    if message.body.contains('<') {
+        body.set_use_markup(true);
+        body.set_markup(&crate::mail::mime::html_to_pango(&message.body));
+        body.connect_activate_link(|_, uri| {
+            let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
+            glib::Propagation::Stop
+        });
+    } else {
+        body.set_text(&message.body);
+    }
+    content.append(&body);
+
+    if !message.attachments.is_empty() {
+        let attachments = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        attachments.set_margin_top(30);
+        let heading = gtk::Label::new(Some("Attachments"));
+        heading.set_xalign(0.0);
+        heading.add_css_class("mail-reader-meta");
+        attachments.append(&heading);
+        for attachment in &message.attachments {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.add_css_class("mail-attachment-chip");
+            let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+            row.append(&icon);
+            let label = gtk::Label::new(Some(&format_attachment_label(attachment)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            row.append(&label);
+            let save = gtk::Button::with_label("Save");
+            save.set_sensitive(!attachment.cache_path.is_empty());
+            let state_for_attachment = state.clone();
+            let attachment = attachment.clone();
+            save.connect_clicked(move |_| {
+                save_attachment(state_for_attachment.clone(), attachment.clone())
+            });
+            row.append(&save);
+            attachments.append(&row);
+        }
+        content.append(&attachments);
+    } else if message.has_attachments {
+        let attachments = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        attachments.set_margin_top(30);
+        let chip = gtk::Label::new(Some("  attachment unavailable  "));
+        chip.add_css_class("mail-attachment-chip");
+        attachments.append(&chip);
+        content.append(&attachments);
     }
 }
 
@@ -2065,4 +2166,21 @@ fn clear(widget: &impl IsA<gtk::Widget>) {
 
 fn set_status(state: &AppState, message: &str) {
     state.status.set_text(message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_messages_by_account_folder_and_thread() {
+        let mut messages = Message::demo_messages();
+        messages[1].thread_key = messages[0].thread_key.clone();
+        let grouped = group_messages(messages);
+
+        assert_eq!(grouped.len(), 4);
+        assert_eq!(grouped[0].thread_size, 2);
+        assert!(grouped[0].unread);
+        assert!(grouped[0].starred);
+    }
 }

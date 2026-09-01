@@ -22,7 +22,9 @@ mailbox UIDVALIDITY still matches the server.
 Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
 refreshes the connection before common server idle limits, falls back to a
 five-minute poll for older servers, and retries transient failures with capped
-backoff.
+backoff. The first successful sync also warms the standard Sent, Drafts,
+Archive, Spam, and Trash folders with a bounded cache; custom folders remain
+on-demand.
 
 HTML mail is sanitized and rendered with native GTK/Pango formatting rather
 than a browser runtime. Incoming attachments are cached under
