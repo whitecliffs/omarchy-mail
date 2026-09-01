@@ -133,6 +133,66 @@ pub fn sync_folder(
     Ok(snapshot.messages)
 }
 
+/// Re-fetches one complete RFC822 message when its disposable attachment
+/// cache has been evicted. The selected mailbox UIDVALIDITY is checked before
+/// parsing so a recycled UID can never populate the wrong local message.
+pub fn fetch_message(
+    account: &Account,
+    password: &str,
+    remote_name: &str,
+    local_name: &str,
+    remote_uid: u32,
+    expected_uidvalidity: Option<u32>,
+) -> Result<Option<Message>, ImapError> {
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            fetch_message_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                remote_uid,
+                expected_uidvalidity,
+            )
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            fetch_message_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                remote_uid,
+                expected_uidvalidity,
+            )
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            fetch_message_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                remote_uid,
+                expected_uidvalidity,
+            )
+        }
+    }
+}
+
 /// Waits for the selected inbox to change using IMAP IDLE. The timeout is
 /// intentionally bounded so the caller can periodically refresh the IDLE
 /// connection and recover cleanly from laptop suspend or server idle limits.
@@ -448,6 +508,39 @@ fn sync_client<T: Read + Write>(
     messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
     let _ = session.logout();
     Ok(SyncSnapshot { messages, folders })
+}
+
+fn fetch_message_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    password: &str,
+    remote_name: &str,
+    local_name: &str,
+    remote_uid: u32,
+    expected_uidvalidity: Option<u32>,
+) -> Result<Option<Message>, ImapError> {
+    let mut session = client
+        .login(&account.incoming.username, password)
+        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mailbox = session
+        .select(remote_name)
+        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    if expected_uidvalidity.is_some() && mailbox.uid_validity != expected_uidvalidity {
+        let _ = session.logout();
+        return Err(ImapError::Protocol(
+            "the mailbox changed while this attachment was being downloaded".into(),
+        ));
+    }
+    let fetches = session
+        .uid_fetch(remote_uid.to_string(), "(RFC822 FLAGS INTERNALDATE)")
+        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let message = fetches
+        .iter()
+        .find(|fetch| fetch.uid == Some(remote_uid))
+        .map(|fetch| message_from_fetch(fetch, account.id, mailbox.uid_validity, local_name))
+        .transpose()?;
+    let _ = session.logout();
+    Ok(message.flatten())
 }
 
 fn remote_folder(folder: &Name) -> Option<RemoteFolder> {

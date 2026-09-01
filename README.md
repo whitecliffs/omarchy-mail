@@ -11,11 +11,10 @@ fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
 actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
-surfaces, lightweight All/Unread/Starred/Attachment filters, and Omarchy theme
-integration. Complete folder-wide reconciliation, live
-conversation rendering, inline image rendering, OAuth2, attachment re-fetch
-after cache eviction, and a full offline outbox remain explicit follow-up
-milestones. Read/star/move
+surfaces, lightweight All/Unread/Starred/Attachment filters, safe inline image
+rendering, attachment re-fetch after cache eviction, and Omarchy theme
+integration. Complete folder-wide reconciliation, OAuth2, and a full offline
+outbox remain explicit follow-up milestones. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server.
 

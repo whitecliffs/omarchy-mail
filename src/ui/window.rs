@@ -8,7 +8,7 @@ use adw::prelude::*;
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -1249,11 +1249,17 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
         heading.add_css_class("mail-reader-meta");
         images.append(&heading);
         for attachment in &inline_images {
-            if attachment.cache_path.is_empty() {
+            if !attachment_available(attachment) {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 let unavailable = gtk::Label::new(Some("Inline image unavailable"));
                 unavailable.set_xalign(0.0);
+                unavailable.set_hexpand(true);
                 unavailable.add_css_class("mail-empty-body");
-                images.append(&unavailable);
+                row.append(&unavailable);
+                let download = gtk::Button::with_label("Download");
+                connect_attachment_download(&download, state, message, attachment);
+                row.append(&download);
+                images.append(&row);
                 continue;
             }
             let picture = gtk::Picture::for_filename(&attachment.cache_path);
@@ -1290,13 +1296,20 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
             label.set_xalign(0.0);
             label.set_hexpand(true);
             row.append(&label);
-            let save = gtk::Button::with_label("Save");
-            save.set_sensitive(!attachment.cache_path.is_empty());
-            let state_for_attachment = state.clone();
-            let attachment = attachment.clone();
-            save.connect_clicked(move |_| {
-                save_attachment(state_for_attachment.clone(), attachment.clone())
+            let save = gtk::Button::with_label(if attachment_available(attachment) {
+                "Save"
+            } else {
+                "Download"
             });
+            if attachment_available(attachment) {
+                let state_for_attachment = state.clone();
+                let attachment = attachment.clone();
+                save.connect_clicked(move |_| {
+                    save_attachment(state_for_attachment.clone(), attachment.clone())
+                });
+            } else {
+                connect_attachment_download(&save, state, message, attachment);
+            }
             row.append(&save);
             attachments.append(&row);
         }
@@ -1319,6 +1332,158 @@ fn is_inline_image(attachment: &AttachmentInfo) -> bool {
             .starts_with("image/")
 }
 
+fn attachment_available(attachment: &AttachmentInfo) -> bool {
+    !attachment.cache_path.is_empty() && Path::new(&attachment.cache_path).is_file()
+}
+
+fn connect_attachment_download(
+    button: &gtk::Button,
+    state: &Rc<AppState>,
+    message: &Message,
+    attachment: &AttachmentInfo,
+) {
+    let state = state.clone();
+    let message = message.clone();
+    let attachment = attachment.clone();
+    button.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        button.set_label("Downloading…");
+        download_attachment(
+            state.clone(),
+            message.clone(),
+            attachment.clone(),
+            button.clone(),
+        );
+    });
+}
+
+fn download_attachment(
+    state: Rc<AppState>,
+    message: Message,
+    attachment: AttachmentInfo,
+    button: gtk::Button,
+) {
+    if state.demo_mode {
+        button.set_sensitive(true);
+        button.set_label("Download");
+        set_status(&state, "Preview messages have no remote attachments");
+        return;
+    }
+    let Some(account_id) = message.account_id else {
+        button.set_sensitive(true);
+        button.set_label("Download");
+        set_status(&state, "This message has no source account");
+        return;
+    };
+    let Some(account) = state
+        .accounts
+        .borrow()
+        .iter()
+        .find(|account| account.id == Some(account_id))
+        .cloned()
+    else {
+        button.set_sensitive(true);
+        button.set_label("Download");
+        set_status(&state, "The source account is no longer configured");
+        return;
+    };
+    let remote_name = state
+        .folders
+        .borrow()
+        .iter()
+        .find(|folder| folder.account_id == account_id && folder.name == message.folder)
+        .map(|folder| folder.remote_name.clone())
+        .or_else(|| {
+            matches!(
+                message.folder.as_str(),
+                "Inbox" | "Drafts" | "Sent" | "Archive" | "Spam" | "Trash"
+            )
+            .then(|| default_remote_folder(&message.folder).to_string())
+        });
+    let Some(remote_name) = remote_name else {
+        button.set_sensitive(true);
+        button.set_label("Download");
+        set_status(
+            &state,
+            "Refresh this account before downloading from that folder",
+        );
+        return;
+    };
+    set_status(&state, &format!("Downloading {}…", attachment.filename));
+    let (sender, receiver) = async_channel::bounded(1);
+    mail::sync::spawn_message_fetch(
+        account,
+        state.database.clone(),
+        message,
+        remote_name,
+        sender,
+    );
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(report) if report.error.is_none() => {
+                refresh_cached_view(&state);
+                if report
+                    .message
+                    .as_ref()
+                    .map(|message| {
+                        message
+                            .attachments
+                            .iter()
+                            .any(|candidate| same_attachment(candidate, &attachment))
+                    })
+                    .unwrap_or(false)
+                {
+                    set_status(&state, "Attachment downloaded");
+                } else {
+                    set_status(
+                        &state,
+                        "The message downloaded, but that attachment was not found",
+                    );
+                }
+            }
+            Ok(report) => {
+                button.set_sensitive(true);
+                button.set_label("Download");
+                set_status(
+                    &state,
+                    &format!(
+                        "Couldn’t download attachment: {}",
+                        report.error.unwrap_or_else(|| "unknown error".into())
+                    ),
+                );
+            }
+            Err(_) => {
+                button.set_sensitive(true);
+                button.set_label("Download");
+                set_status(&state, "The attachment worker stopped unexpectedly.");
+            }
+        }
+    });
+}
+
+fn same_attachment(left: &AttachmentInfo, right: &AttachmentInfo) -> bool {
+    match (&left.content_id, &right.content_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.filename == right.filename && left.content_type == right.content_type,
+    }
+}
+
+fn refresh_cached_view(state: &Rc<AppState>) {
+    load_messages_for_scope(state);
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
+    let selected_id = *state.selected_message.borrow();
+    let selected = selected_id.and_then(|id| {
+        state
+            .messages
+            .borrow()
+            .iter()
+            .find(|message| message.id == id)
+            .cloned()
+    });
+    render_reader(state, selected);
+}
+
 fn format_attachment_label(attachment: &AttachmentInfo) -> String {
     let size = if attachment.size < 1024 {
         format!("{} B", attachment.size)
@@ -1331,7 +1496,7 @@ fn format_attachment_label(attachment: &AttachmentInfo) -> String {
 }
 
 fn save_attachment(state: Rc<AppState>, attachment: AttachmentInfo) {
-    if attachment.cache_path.is_empty() {
+    if !attachment_available(&attachment) {
         set_status(
             &state,
             "This attachment is not available in the local cache",
@@ -2233,5 +2398,35 @@ mod tests {
         assert_eq!(grouped[0].thread_size, 2);
         assert!(grouped[0].unread);
         assert!(grouped[0].starred);
+    }
+
+    #[test]
+    fn matches_refetched_attachments_by_content_id_or_safe_metadata() {
+        let inline = AttachmentInfo {
+            filename: "inline-image".into(),
+            content_type: "image/png".into(),
+            size: 10,
+            cache_path: String::new(),
+            content_id: Some("logo@example.com".into()),
+        };
+        let refreshed_inline = AttachmentInfo {
+            cache_path: "/tmp/logo.png".into(),
+            ..inline.clone()
+        };
+        assert!(same_attachment(&inline, &refreshed_inline));
+
+        let file = AttachmentInfo {
+            filename: "notes.txt".into(),
+            content_type: "text/plain".into(),
+            size: 5,
+            cache_path: String::new(),
+            content_id: None,
+        };
+        let refreshed_file = AttachmentInfo {
+            cache_path: "/tmp/notes.txt".into(),
+            size: 99,
+            ..file.clone()
+        };
+        assert!(same_attachment(&file, &refreshed_file));
     }
 }

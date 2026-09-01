@@ -1,6 +1,6 @@
 use crate::database::Database;
 use crate::mail::{credentials, imap};
-use crate::models::{Account, MailFolder};
+use crate::models::{Account, MailFolder, Message};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -25,6 +25,12 @@ pub struct FolderSyncReport {
     pub folder: String,
     pub fetched: usize,
     pub new_messages: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct MessageFetchReport {
+    pub message: Option<Message>,
     pub error: Option<String>,
 }
 
@@ -421,6 +427,65 @@ pub fn spawn_folder_sync(
                 fetched: 0,
                 new_messages: 0,
                 error: Some(error.to_string()),
+            },
+        };
+        let _ = sender.send_blocking(report);
+    });
+}
+
+/// Re-fetches a cached message on a worker thread. This is intentionally a
+/// complete-message fetch: MIME parsing and attachment caching stay in the
+/// same trusted path as normal synchronisation, and the UI only receives the
+/// resulting safe local model.
+pub fn spawn_message_fetch(
+    account: Account,
+    database: Database,
+    message: Message,
+    remote_name: String,
+    sender: async_channel::Sender<MessageFetchReport>,
+) {
+    thread::spawn(move || {
+        let report = match (
+            message.remote_uid,
+            message.uidvalidity,
+            load_imap_password(&account),
+        ) {
+            (Some(remote_uid), uidvalidity, Ok(password)) => {
+                match imap::fetch_message(
+                    &account,
+                    &password,
+                    &remote_name,
+                    &message.folder,
+                    remote_uid,
+                    uidvalidity,
+                ) {
+                    Ok(Some(fetched)) => match database.upsert_messages(&[fetched.clone()]) {
+                        Ok(_) => MessageFetchReport {
+                            message: Some(fetched),
+                            error: None,
+                        },
+                        Err(error) => MessageFetchReport {
+                            message: None,
+                            error: Some(error.to_string()),
+                        },
+                    },
+                    Ok(None) => MessageFetchReport {
+                        message: None,
+                        error: Some("The message is no longer available on the server.".into()),
+                    },
+                    Err(error) => MessageFetchReport {
+                        message: None,
+                        error: Some(error.to_string()),
+                    },
+                }
+            }
+            (None, _, _) => MessageFetchReport {
+                message: None,
+                error: Some("This message has no remote copy to download from.".into()),
+            },
+            (_, _, Err(error)) => MessageFetchReport {
+                message: None,
+                error: Some(error),
             },
         };
         let _ = sender.send_blocking(report);

@@ -46,6 +46,12 @@ connection and authentication failures use capped exponential backoff. Stop
 signals are checked between waits so removing an account does not start another
 sync.
 
+Attachment bytes are disposable. If a cached path is missing, the reader
+offers Download and starts a complete RFC822 fetch on a worker. The fetch
+selects the recorded mailbox, verifies UIDVALIDITY, reparses the message, and
+upserts the refreshed metadata through the normal cache path. This keeps cache
+eviction recoverable without making SQLite authoritative over IMAP.
+
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the
 synchronisation worker deletes an action only after the IMAP server accepts
