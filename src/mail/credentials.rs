@@ -1,8 +1,10 @@
 use crate::models::AuthMethod;
 use keyring::Entry;
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 const SERVICE: &str = "org.omarchy.Mail";
+static KEYRING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthMaterial {
@@ -14,10 +16,19 @@ pub enum AuthMaterial {
 pub enum CredentialError {
     #[error("the system keyring rejected the credential: {0}")]
     Keyring(#[from] keyring::Error),
+    #[error("the system keyring did not retain the newly stored credential")]
+    VerificationFailed,
 }
 
 fn entry(account_email: &str, protocol: &str) -> Result<Entry, CredentialError> {
     Ok(Entry::new(SERVICE, &format!("{protocol}:{account_email}"))?)
+}
+
+fn keyring_lock() -> std::sync::MutexGuard<'static, ()> {
+    KEYRING_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn store_password(
@@ -25,7 +36,12 @@ pub fn store_password(
     protocol: &str,
     password: &str,
 ) -> Result<(), CredentialError> {
-    entry(account_email, protocol)?.set_password(password)?;
+    let _lock = keyring_lock();
+    let entry = entry(account_email, protocol)?;
+    entry.set_password(password)?;
+    if entry.get_password()? != password {
+        return Err(CredentialError::VerificationFailed);
+    }
     Ok(())
 }
 
@@ -42,10 +58,12 @@ pub fn store_auth_material(
 }
 
 pub fn load_password(account_email: &str, protocol: &str) -> Result<String, CredentialError> {
+    let _lock = keyring_lock();
     Ok(entry(account_email, protocol)?.get_password()?)
 }
 
 pub fn delete_password(account_email: &str, protocol: &str) -> Result<(), CredentialError> {
+    let _lock = keyring_lock();
     entry(account_email, protocol)?.delete_credential()?;
     Ok(())
 }
@@ -72,16 +90,23 @@ pub fn store_oauth2_token(
     protocol: &str,
     token: &str,
 ) -> Result<(), CredentialError> {
-    entry(account_email, &format!("oauth2:{protocol}"))?.set_password(token)?;
+    let _lock = keyring_lock();
+    let entry = entry(account_email, &format!("oauth2:{protocol}"))?;
+    entry.set_password(token)?;
+    if entry.get_password()? != token {
+        return Err(CredentialError::VerificationFailed);
+    }
     Ok(())
 }
 
 pub fn load_oauth2_token(account_email: &str, protocol: &str) -> Result<String, CredentialError> {
+    let _lock = keyring_lock();
     Ok(entry(account_email, &format!("oauth2:{protocol}"))?.get_password()?)
 }
 
 #[allow(dead_code)]
 pub fn delete_oauth2_token(account_email: &str, protocol: &str) -> Result<(), CredentialError> {
+    let _lock = keyring_lock();
     entry(account_email, &format!("oauth2:{protocol}"))?.delete_credential()?;
     Ok(())
 }
