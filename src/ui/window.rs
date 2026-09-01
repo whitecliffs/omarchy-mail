@@ -18,6 +18,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+use webkit6::prelude::*;
 
 struct AppState {
     window: adw::ApplicationWindow,
@@ -2032,14 +2033,62 @@ fn append_html_content(
     message: &Message,
     body_html: &str,
 ) {
-    let document = crate::mail::mime::html_document(body_html);
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.set_hexpand(true);
-    root.add_css_class("mail-html-document");
-    if let crate::mail::mime::HtmlNode::Document(children) = &document {
-        append_html_children(&root, state, message, children);
+    let remote_allowed = remote_images_allowed(state, message);
+    let settings = webkit6::Settings::builder()
+        .allow_file_access_from_file_urls(false)
+        .allow_universal_access_from_file_urls(false)
+        .allow_top_navigation_to_data_urls(false)
+        .auto_load_images(remote_allowed)
+        .enable_javascript(false)
+        .enable_javascript_markup(false)
+        .enable_media(false)
+        .enable_webgl(false)
+        .enable_html5_database(false)
+        .enable_html5_local_storage(false)
+        .build();
+    let webview = webkit6::WebView::builder().settings(&settings).build();
+    webview.set_hexpand(true);
+    webview.set_vexpand(true);
+    webview.set_size_request(-1, 320);
+    webview.add_css_class("mail-html-webview");
+    if let Ok(background) = webkit6::gdk::RGBA::parse(&theme::ThemePalette::load().background) {
+        webview.set_background_color(&background);
     }
-    content.append(&root);
+    webview.connect_decide_policy(|_, decision, decision_type| {
+        if matches!(
+            decision_type,
+            webkit6::PolicyDecisionType::NavigationAction
+                | webkit6::PolicyDecisionType::NewWindowAction
+        ) {
+            if let Some(navigation) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() {
+                let mut action = navigation.navigation_action();
+                let uri = action
+                    .as_mut()
+                    .and_then(|action| action.request())
+                    .and_then(|request| request.uri())
+                    .map(|uri| uri.to_string());
+                if let Some(uri) = uri
+                    && (uri.starts_with("https://")
+                        || uri.starts_with("http://")
+                        || uri.starts_with("mailto:"))
+                {
+                    let _ =
+                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                }
+            }
+            decision.ignore();
+            return true;
+        }
+        false
+    });
+    let prepared = crate::mail::mime::prepare_html_for_webview(
+        body_html,
+        &message.attachments,
+        remote_allowed,
+        &theme::ThemePalette::load().foreground,
+    );
+    webview.load_html(&prepared, Some("about:blank"));
+    content.append(&webview);
 }
 
 fn append_html_children(

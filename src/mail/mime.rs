@@ -1,5 +1,6 @@
 use crate::models::AttachmentInfo;
 use ammonia::Builder;
+use base64::Engine;
 use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
 use std::collections::HashSet;
 use std::fs;
@@ -87,13 +88,32 @@ pub fn sanitize_html(html: &str) -> String {
     builder
         .tags(HashSet::from([
             "a",
+            "abbr",
+            "address",
+            "article",
+            "aside",
             "b",
+            "bdi",
+            "bdo",
+            "button",
             "blockquote",
             "br",
+            "caption",
             "center",
+            "cite",
+            "col",
+            "colgroup",
             "code",
+            "data",
+            "dd",
+            "del",
             "div",
+            "dl",
             "em",
+            "figure",
+            "figcaption",
+            "font",
+            "footer",
             "h1",
             "h2",
             "h3",
@@ -103,12 +123,21 @@ pub fn sanitize_html(html: &str) -> String {
             "hr",
             "i",
             "img",
+            "ins",
             "li",
+            "main",
+            "mark",
+            "meta",
+            "nav",
             "ol",
             "p",
+            "picture",
             "pre",
+            "q",
             "span",
+            "samp",
             "strong",
+            "strike",
             "table",
             "tbody",
             "td",
@@ -116,59 +145,336 @@ pub fn sanitize_html(html: &str) -> String {
             "th",
             "thead",
             "tr",
+            "tt",
             "u",
             "ul",
+            "s",
+            "section",
+            "small",
+            "source",
+            "style",
+            "sub",
+            "sup",
+            "time",
+            "wbr",
         ]))
+        // Ammonia strips the contents of <style> by default. Keep style rules
+        // for WebKit layout, while script contents are removed below.
+        .clean_content_tags(HashSet::from(["script"]))
         .generic_attributes(HashSet::from([
             "align",
             "bgcolor",
             "border",
+            "background",
             "cellpadding",
             "cellspacing",
+            "class",
+            "color",
+            "colspan",
+            "dir",
+            "face",
             "height",
+            "id",
+            "lang",
+            "media",
+            "role",
+            "rowspan",
+            "size",
             "style",
             "title",
             "valign",
             "width",
         ]))
-        .add_tag_attributes("img", ["src", "alt", "width", "height"])
-        .filter_style_properties(HashSet::from([
-            "background-color",
-            "border",
-            "border-radius",
-            "color",
-            "font-size",
-            "font-weight",
-            "margin",
-            "margin-bottom",
-            "margin-left",
-            "margin-right",
-            "margin-top",
-            "padding",
-            "padding-bottom",
-            "padding-left",
-            "padding-right",
-            "padding-top",
-            "text-align",
-            "width",
-        ]))
+        .add_tag_attributes("a", ["href", "target"])
+        .add_tag_attributes("img", ["src", "srcset", "alt", "width", "height"])
+        .add_tag_attributes("source", ["src", "srcset", "type", "media"])
         .link_rel(Some("noopener noreferrer"))
         .url_relative(ammonia::UrlRelative::PassThrough)
-        .url_schemes(HashSet::from(["cid", "http", "https", "mailto"]))
+        .url_schemes(HashSet::from(["cid", "data", "http", "https", "mailto"]))
         .clean(&html)
         .to_string()
 }
 
-/// Parses already-sanitised HTML into a small structural tree. This is not a
-/// browser DOM: it deliberately retains only the tags and attributes that the
-/// native reader knows how to lay out safely.
+/// Parses already-sanitised HTML into a small structural tree used to rewrite
+/// resources before WebKit receives the document.
 pub fn html_document(html: &str) -> HtmlNode {
     let safe = sanitize_html(html);
     let mut cursor = 0;
     HtmlNode::Document(parse_html_nodes(&safe, &mut cursor, None))
 }
 
-/// Serializes a node back to safe HTML for the inline GTK text renderer.
+/// Prepares sanitized HTML for the native WebKitGTK reader. The browser
+/// engine is responsible for layout; this layer only rewrites resources so
+/// inline CID images work offline and blocked remote images remain in place.
+pub fn prepare_html_for_webview(
+    html: &str,
+    attachments: &[AttachmentInfo],
+    remote_images_allowed: bool,
+    default_foreground: &str,
+) -> String {
+    let document = html_document(html);
+    let mut body = String::with_capacity(html.len() + 256);
+    serialize_webview_node(
+        &document,
+        &mut body,
+        attachments,
+        remote_images_allowed,
+        false,
+    );
+    let default_foreground = valid_css_color(default_foreground).unwrap_or("#c1c497");
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>:root{{color-scheme:light dark;}}html,body{{margin:0;padding:0;background:transparent;}}body{{color:{default_foreground};font-family:system-ui,sans-serif;font-size:15px;line-height:1.45;overflow-wrap:anywhere;word-wrap:break-word;}}img{{max-width:100%;height:auto;}}table{{max-width:100%;}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;}}</style></head><body>{body}</body></html>"
+    )
+}
+
+fn serialize_webview_node(
+    node: &HtmlNode,
+    output: &mut String,
+    attachments: &[AttachmentInfo],
+    remote_images_allowed: bool,
+    inside_style: bool,
+) {
+    match node {
+        HtmlNode::Document(children) => {
+            for child in children {
+                serialize_webview_node(
+                    child,
+                    output,
+                    attachments,
+                    remote_images_allowed,
+                    inside_style,
+                );
+            }
+        }
+        HtmlNode::Text(text) => {
+            if inside_style {
+                output.push_str(&sanitize_css_resources(text, remote_images_allowed));
+            } else {
+                output.push_str(text);
+            }
+        }
+        HtmlNode::Element {
+            name,
+            attributes,
+            children,
+        } => {
+            output.push('<');
+            output.push_str(name);
+            for (attribute, value) in attributes {
+                if !remote_images_allowed
+                    && matches!(name.as_str(), "img" | "source")
+                    && matches!(attribute.as_str(), "srcset" | "sizes")
+                {
+                    continue;
+                }
+                let value = if name == "img" && attribute == "src" {
+                    let alt = attributes
+                        .iter()
+                        .find(|(known, _)| known == "alt")
+                        .map(|(_, value)| value.as_str())
+                        .unwrap_or_default();
+                    webview_image_source(value, alt, attachments, remote_images_allowed)
+                        .unwrap_or_else(|| value.clone())
+                } else if name == "source" && attribute == "src" {
+                    webview_background_source(value, attachments, remote_images_allowed)
+                        .unwrap_or_default()
+                } else if attribute == "style" {
+                    sanitize_css_resources(value, remote_images_allowed)
+                } else if attribute == "background" {
+                    webview_background_source(value, attachments, remote_images_allowed)
+                        .unwrap_or_default()
+                } else {
+                    value.clone()
+                };
+                output.push(' ');
+                output.push_str(attribute);
+                output.push_str("=\"");
+                output.push_str(&escape_html_attribute(&value));
+                output.push('"');
+            }
+            if matches!(
+                name.as_str(),
+                "area" | "br" | "hr" | "img" | "meta" | "source"
+            ) {
+                output.push('>');
+                return;
+            }
+            output.push('>');
+            let style = inside_style || name == "style";
+            for child in children {
+                serialize_webview_node(child, output, attachments, remote_images_allowed, style);
+            }
+            output.push_str("</");
+            output.push_str(name);
+            output.push('>');
+        }
+    }
+}
+
+fn webview_image_source(
+    source: &str,
+    alt: &str,
+    attachments: &[AttachmentInfo],
+    remote_images_allowed: bool,
+) -> Option<String> {
+    if let Some(content_id) = source.strip_prefix("cid:") {
+        let content_id = content_id.trim_matches(['<', '>']);
+        if let Some(attachment) = attachments.iter().find(|attachment| {
+            attachment.content_id.as_deref().is_some_and(|known| {
+                known
+                    .trim_matches(['<', '>'])
+                    .eq_ignore_ascii_case(content_id)
+            })
+        }) {
+            if !attachment.cache_path.is_empty()
+                && let Ok(bytes) = fs::read(&attachment.cache_path)
+            {
+                return Some(format!(
+                    "data:{};base64,{}",
+                    attachment.content_type,
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ));
+            }
+        }
+        return Some(blocked_image_data_uri("Inline image unavailable", alt));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        if remote_images_allowed {
+            return Some(source.to_string());
+        }
+        return Some(blocked_image_data_uri("Remote image blocked", alt));
+    }
+    if source.starts_with("data:image/") && source.len() <= 8 * 1024 * 1024 {
+        return Some(source.to_string());
+    }
+    Some(blocked_image_data_uri("Image unavailable", alt))
+}
+
+fn webview_background_source(
+    source: &str,
+    attachments: &[AttachmentInfo],
+    remote_images_allowed: bool,
+) -> Option<String> {
+    if let Some(content_id) = source.strip_prefix("cid:") {
+        let content_id = content_id.trim_matches(['<', '>']);
+        let attachment = attachments.iter().find(|attachment| {
+            attachment.content_id.as_deref().is_some_and(|known| {
+                known
+                    .trim_matches(['<', '>'])
+                    .eq_ignore_ascii_case(content_id)
+            })
+        })?;
+        let bytes = fs::read(&attachment.cache_path).ok()?;
+        return Some(format!(
+            "data:{};base64,{}",
+            attachment.content_type,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return remote_images_allowed.then(|| source.to_string());
+    }
+    if source.starts_with("data:image/") && source.len() <= 8 * 1024 * 1024 {
+        return Some(source.to_string());
+    }
+    None
+}
+
+fn blocked_image_data_uri(label: &str, alt: &str) -> String {
+    let alt = alt.trim();
+    let text = if alt.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}: {alt}")
+    };
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"320\" height=\"64\" viewBox=\"0 0 320 64\"><rect x=\"1\" y=\"1\" width=\"318\" height=\"62\" rx=\"8\" fill=\"#e8e8e8\" stroke=\"#9a9a9a\"/><text x=\"160\" y=\"36\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"13\" fill=\"#555\">{}</text></svg>",
+        escape_xml_text(&text)
+    );
+    format!(
+        "data:image/svg+xml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(svg)
+    )
+}
+
+fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn valid_css_color(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (value.starts_with('#')
+        && matches!(value.len(), 4 | 7 | 9)
+        && value[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+    .then_some(value)
+}
+
+fn sanitize_css_resources(css: &str, remote_images_allowed: bool) -> String {
+    let css = strip_css_imports(css);
+    let mut output = String::with_capacity(css.len());
+    let mut cursor = 0;
+    let lower = css.to_ascii_lowercase();
+    while cursor < css.len() {
+        let Some(relative) = lower[cursor..].find("url(") else {
+            output.push_str(&css[cursor..]);
+            break;
+        };
+        let start = cursor + relative;
+        output.push_str(&css[cursor..start]);
+        let Some(end_relative) = css[start + 4..].find(')') else {
+            output.push_str("none");
+            break;
+        };
+        let resource = css[start + 4..start + 4 + end_relative]
+            .trim()
+            .trim_matches(['\'', '"'])
+            .trim();
+        if ((resource.starts_with("http://") || resource.starts_with("https://"))
+            && remote_images_allowed)
+            || (resource.starts_with("data:image/") && resource.len() <= 8 * 1024 * 1024)
+        {
+            output.push_str("url(\"");
+            output.push_str(&escape_css_url(resource));
+            output.push_str("\")");
+        } else {
+            output.push_str("none");
+        }
+        cursor = start + 4 + end_relative + 1;
+    }
+    output
+}
+
+fn strip_css_imports(css: &str) -> String {
+    let lower = css.to_ascii_lowercase();
+    let mut output = String::with_capacity(css.len());
+    let mut cursor = 0;
+    while cursor < css.len() {
+        let Some(relative) = lower[cursor..].find("@import") else {
+            output.push_str(&css[cursor..]);
+            break;
+        };
+        let start = cursor + relative;
+        output.push_str(&css[cursor..start]);
+        let Some(end_relative) = css[start..].find(';') else {
+            break;
+        };
+        cursor = start + end_relative + 1;
+    }
+    output
+}
+
+fn escape_css_url(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Serializes a sanitized node back to HTML after resource rewriting.
 pub fn html_node_markup(node: &HtmlNode) -> String {
     match node {
         HtmlNode::Document(children) => children.iter().map(html_node_markup).collect(),
@@ -566,35 +872,84 @@ fn safe_css_color(value: &str) -> Option<String> {
 /// Returns only network image URLs from already-sanitised HTML. Local files,
 /// data URLs, cid resources, and malformed values never leave the MIME layer.
 pub fn remote_image_urls(html: &str) -> Vec<String> {
-    let safe = sanitize_html(html);
-    let lower = safe.to_ascii_lowercase();
     let mut urls = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find("<img") {
-        let start = cursor + relative;
-        let Some(end_relative) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + end_relative;
-        let tag = &safe[start..=end];
-        if let Some(src) = attribute_value(tag, "src") {
-            let src = decode_entities(&src);
-            if (src.starts_with("https://") || src.starts_with("http://"))
-                && src.len() <= 4096
-                && !src.chars().any(char::is_whitespace)
-                && !urls.iter().any(|known| known == &src)
-            {
-                urls.push(src);
+    collect_remote_image_urls(&html_document(html), &mut urls, false);
+    urls
+}
+
+fn collect_remote_image_urls(node: &HtmlNode, urls: &mut Vec<String>, inside_style: bool) {
+    match node {
+        HtmlNode::Document(children) => {
+            for child in children {
+                collect_remote_image_urls(child, urls, inside_style);
             }
         }
-        cursor = end + 1;
+        HtmlNode::Text(text) => {
+            if inside_style {
+                for url in remote_css_urls(text) {
+                    push_remote_image_url(urls, url);
+                }
+            }
+        }
+        HtmlNode::Element {
+            name,
+            attributes,
+            children,
+        } => {
+            for (attribute, value) in attributes {
+                if (name == "img" && attribute == "src") || attribute == "background" {
+                    if is_remote_image_url(value) {
+                        push_remote_image_url(urls, value.clone());
+                    }
+                } else if attribute == "style" {
+                    for url in remote_css_urls(value) {
+                        push_remote_image_url(urls, url);
+                    }
+                }
+            }
+            for child in children {
+                collect_remote_image_urls(child, urls, inside_style || name == "style");
+            }
+        }
+    }
+}
+
+fn remote_css_urls(css: &str) -> Vec<String> {
+    let lower = css.to_ascii_lowercase();
+    let mut urls = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative;
+        let Some(end_relative) = css[start + 4..].find(')') else {
+            break;
+        };
+        let value = css[start + 4..start + 4 + end_relative]
+            .trim()
+            .trim_matches(['\'', '"'])
+            .trim();
+        if is_remote_image_url(value) && !urls.iter().any(|known| known == value) {
+            urls.push(value.to_string());
+        }
+        cursor = start + 4 + end_relative + 1;
     }
     urls
 }
 
+fn is_remote_image_url(value: &str) -> bool {
+    (value.starts_with("https://") || value.starts_with("http://"))
+        && value.len() <= 4096
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn push_remote_image_url(urls: &mut Vec<String>, url: String) {
+    if !urls.iter().any(|known| known == &url) {
+        urls.push(url);
+    }
+}
+
 fn strip_dangerous_blocks(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
-    let dangerous = ["script", "style", "iframe", "object", "embed", "svg"];
+    let dangerous = ["script", "iframe", "object", "embed", "svg"];
     let mut output = String::with_capacity(html.len());
     let mut cursor = 0;
     while cursor < html.len() {
@@ -638,9 +993,7 @@ fn strip_dangerous_blocks(html: &str) -> String {
     output
 }
 
-/// Converts already-sanitised HTML into readable text for the GTK reader.
-/// Omarchy's base installation does not ship a GTK4 WebKit runtime, so v1
-/// deliberately keeps the reader dependency-light and never executes markup.
+/// Converts already-sanitised HTML into readable text for previews and search.
 pub fn html_to_text(html: &str) -> String {
     let safe = sanitize_html(html);
     let mut output = String::with_capacity(safe.len());
@@ -1063,6 +1416,15 @@ mod tests {
             remote_image_urls(&safe),
             vec!["https://images.example/logo.png"]
         );
+        assert_eq!(
+            remote_image_urls(
+                r#"<style>.hero { background-image: url('https://images.example/hero.png'); }</style><div style="background:url(https://images.example/tile.png)">Mail</div>"#
+            ),
+            vec![
+                "https://images.example/hero.png",
+                "https://images.example/tile.png"
+            ]
+        );
     }
 
     #[test]
@@ -1126,7 +1488,7 @@ mod tests {
                 .any(|(name, value)| { name == "width" && value == "640" })
         );
         assert!(
-            !attributes
+            attributes
                 .iter()
                 .any(|(name, value)| { name == "style" && value.contains("background-image") })
         );
@@ -1145,5 +1507,41 @@ mod tests {
                 if name == "tr" && children.len() == 2
         ));
         assert!(html_node_markup(&section_children[0]).contains("<strong>Hello</strong>"));
+    }
+
+    #[test]
+    fn prepares_real_world_html_for_webkit_without_destroying_layout_css() {
+        let html = concat!(
+            "<!doctype html><html><head>",
+            "<style>",
+            ".button { font-family: Arial, sans-serif; font-size: 18px; ",
+            "color: #ffffff; background: #123456; padding: 12px 20px; }",
+            "</style></head><body>",
+            "<table width=\"640\" style=\"width:640px; background-color:#f5f5f5; ",
+            "background-image:url(https://images.example.test/background.png); ",
+            "font-family:Arial,sans-serif;\"><tr><td style=\"padding:24px;\">",
+            "<a class=\"button\" href=\"https://example.test/read\">Read message</a>",
+            "<img src=\"https://images.example.test/hero.png\" alt=\"Hero\" ",
+            "width=\"600\" style=\"display:block;\"></td></tr></table>",
+            "</body></html>"
+        );
+
+        let prepared = prepare_html_for_webview(html, &[], true, "#d6d5bc");
+        assert_eq!(prepared.matches("<body>").count(), 1);
+        assert!(prepared.contains("font-family: Arial"));
+        assert!(prepared.contains("font-size: 18px"));
+        assert!(prepared.contains("background: #123456"));
+        assert!(prepared.contains("<table"));
+        assert!(prepared.contains("<a class=\"button\""));
+        assert!(prepared.contains("https://images.example.test/hero.png"));
+
+        let blocked = prepare_html_for_webview(html, &[], false, "#d6d5bc");
+        assert!(blocked.contains("font-family: Arial"));
+        assert!(blocked.contains("<table"));
+        assert!(blocked.contains("<a class=\"button\""));
+        assert!(!blocked.contains("https://images.example.test/hero.png"));
+        assert!(!blocked.contains("https://images.example.test/background.png"));
+        assert!(blocked.contains("data:image/svg+xml;base64,"));
+        assert!(!blocked.contains("@import"));
     }
 }

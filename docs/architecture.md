@@ -17,11 +17,12 @@ without making the GTK main loop responsible for network activity.
   mechanism; provider browser authorization is deferred until provider client
   registration can be configured without shipping secrets.
 - `mail/mime.rs` parses MIME messages, retains normalized `Content-ID` values,
-  and sanitises HTML before the UI sees it. Inline image bytes are cached as
-  ordinary disposable attachments and rendered by GTK only from that local
-  cache. Remote image URLs are reduced to an explicit `http(s)` allowlist and
-  are fetched only after a user action; no browser runtime or script execution
-  is involved.
+  and sanitises HTML before the UI sees it. HTML is rendered by WebKitGTK 6
+  inside the GTK window so email-authored tables, CSS, buttons, and font rules
+  use a complete layout engine. Inline CID image bytes are converted to data
+  URLs from the disposable attachment cache. Remote image URLs are blocked by
+  default and replaced with in-place placeholders until the user allows them;
+  WebKit JavaScript, file access, storage, media, and WebGL are disabled.
 - The composer keeps its small rich-text model in GTK text tags, with a plain
   text body always available as the compatibility part. Optional draft HTML is
   sanitized at the persistence boundary, and SMTP emits `multipart/alternative`

@@ -7,6 +7,10 @@ data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
 
 cd "$project_dir"
+if ! pkg-config --exists webkitgtk-6.0; then
+  printf 'Missing WebKitGTK 6. Install it with: sudo pacman -S --needed webkitgtk-6.0\n' >&2
+  exit 1
+fi
 cargo build --release --locked
 install -Dm755 target/release/omarchy-mail "$bin_dir/omarchy-mail"
 install -Dm644 packaging/org.omarchy.Mail.desktop "$data_dir/applications/org.omarchy.Mail.desktop"

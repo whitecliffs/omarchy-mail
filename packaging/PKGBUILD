@@ -1,11 +1,11 @@
 pkgname=omarchy-mail
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
 url='https://github.com/omarchy/omarchy-mail'
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'libsecret')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret')
 makedepends=('rust')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')

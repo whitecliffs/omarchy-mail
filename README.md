@@ -31,11 +31,12 @@ backoff. The first successful sync also warms the standard Sent, Drafts,
 Archive, Spam, and Trash folders with a bounded cache; custom folders remain
 on-demand.
 
-HTML mail is sanitized and rendered with native GTK/Pango formatting rather
-than a browser runtime. Safe `cid:` inline images are cached and shown as
-native GTK pictures. Remote images are blocked by default and can be loaded
-once for a message or trusted for a sender; explicit loads use GIO and reject
-images larger than 8 MiB. Incoming attachments are cached under
+HTML mail is sanitized and rendered by the system WebKitGTK 6 engine inside
+the native GTK window, so real-world tables, CSS typography, buttons, and
+responsive layouts retain their authored structure. Safe `cid:` inline images
+are inlined from the disposable attachment cache. Remote images are blocked by
+default and can be loaded once for a message or trusted for a sender; blocked
+images remain in place as placeholders. Incoming attachments are cached under
 `$XDG_CACHE_HOME/omarchy-mail/attachments/` (or `~/.cache/omarchy-mail/`) and
 can be saved from the reader.
 
@@ -55,9 +56,13 @@ HTML is sanitized before it is stored in a draft or handed to SMTP.
 
 ## Build and preview
 
-System requirements are the Omarchy GTK stack, Rust, and a Secret Service
-provider. On this machine GTK4 4.22.4, libadwaita 1.9.3, SQLite, libsecret,
-and Rust 1.98 are available.
+System requirements are the Omarchy GTK stack, WebKitGTK 6, Rust, and a Secret
+Service provider. On this machine GTK4 4.22.4, libadwaita 1.9.3, SQLite,
+libsecret, and Rust 1.98 are available. Install the renderer on Arch with:
+
+```bash
+sudo pacman -S --needed webkitgtk-6.0
+```
 
 ```bash
 cargo test
