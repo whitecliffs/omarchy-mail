@@ -1,0 +1,5 @@
+From: Jane Smith <jane@example.com>
+To: Jim <jim@example.com>
+Subject: A plain text note
+
+Hello from a fixture message.

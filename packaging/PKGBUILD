@@ -1,0 +1,25 @@
+pkgname=omarchy-mail
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A calm, native email client for Omarchy'
+arch=('x86_64')
+url='https://github.com/omarchy/omarchy-mail'
+license=('MIT')
+depends=('gtk4' 'libadwaita' 'libsecret')
+makedepends=('rust')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/omarchy-mail "$pkgdir/usr/bin/omarchy-mail"
+  install -Dm644 packaging/org.omarchy.Mail.desktop "$pkgdir/usr/share/applications/org.omarchy.Mail.desktop"
+  install -Dm644 packaging/icons/hicolor/scalable/apps/org.omarchy.Mail.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.omarchy.Mail.svg"
+  install -Dm644 packaging/omarchy-mail.css.tpl "$pkgdir/usr/share/omarchy-mail/omarchy-mail.css.tpl"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
