@@ -908,9 +908,17 @@ fn sync_folder_for_scope(state: &Rc<AppState>, account_id: i64, local_name: &str
                 load_messages_for_scope(&state);
                 render_sidebar(&state);
                 render_messages(&state, state.search_entry.text().as_str());
+                let suffix = if report.skipped_messages == 0 {
+                    String::new()
+                } else {
+                    format!(" · skipped {} malformed", report.skipped_messages)
+                };
                 set_status(
                     &state,
-                    &format!("{} ready · {} new", report.folder, report.new_messages),
+                    &format!(
+                        "{} ready · {} new{suffix}",
+                        report.folder, report.new_messages
+                    ),
                 );
             }
             Ok(report) => set_status(
@@ -1047,6 +1055,7 @@ fn search_text_matches(message: &Message, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
+    let query = query.to_lowercase();
     let fields = [
         message.sender_name.as_str(),
         message.sender_email.as_str(),
@@ -1055,7 +1064,7 @@ fn search_text_matches(message: &Message, query: &str) -> bool {
         message.body.as_str(),
     ]
     .iter()
-    .map(|value| value.to_ascii_lowercase())
+    .map(|value| value.to_lowercase())
     .collect::<Vec<_>>();
     query
         .split_whitespace()
@@ -1155,8 +1164,10 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
     glib::MainContext::default().spawn_local(async move {
         let mut completed = 0;
         let mut errors = Vec::new();
+        let mut skipped_messages = 0;
         while let Ok(report) = receiver.recv().await {
             completed += 1;
+            skipped_messages += report.skipped_messages;
             if let Some(error) = report.error {
                 errors.push(format!("{}: {error}", report.email));
             } else if notify && report.new_messages > 0 {
@@ -1171,7 +1182,16 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
             set_status(&state, &format!("Synchronised {completed}/{account_count}"));
         }
         if errors.is_empty() {
-            set_status(&state, "All accounts are up to date");
+            if skipped_messages == 0 {
+                set_status(&state, "All accounts are up to date");
+            } else {
+                set_status(
+                    &state,
+                    &format!(
+                        "All accounts are up to date · skipped {skipped_messages} malformed message(s)"
+                    ),
+                );
+            }
         } else {
             set_status(
                 &state,
@@ -1271,9 +1291,17 @@ fn listen_for_monitor_reports(
                     &format!("{} · {} new", report.email, report.new_messages),
                 );
             } else {
+                let suffix = if report.skipped_messages == 0 {
+                    String::new()
+                } else {
+                    format!(" · skipped {} malformed", report.skipped_messages)
+                };
                 set_status(
                     &state,
-                    &format!("{} is up to date · {} cached", report.email, report.fetched),
+                    &format!(
+                        "{} is up to date · {} cached{suffix}",
+                        report.email, report.fetched
+                    ),
                 );
             }
         }
@@ -4209,6 +4237,8 @@ mod tests {
     #[test]
     fn combines_text_and_local_search_filters() {
         let mut message = Message::demo_messages().remove(0);
+        message.sender_name = "Élodie".into();
+        message.body = "Café plans for the garden photos".into();
         message.account_id = Some(7);
         message.folder = "Sent".into();
         message.received_at = "2026-08-31T14:32:00+00:00".into();
@@ -4223,6 +4253,7 @@ mod tests {
         };
         assert!(search_filters_match(&message, &filters));
         assert!(search_text_matches(&message, "garden photos"));
+        assert!(search_text_matches(&message, "CAFÉ"));
         assert!(!search_text_matches(&message, "garden unrelated"));
         assert!(!search_filters_match(
             &message,

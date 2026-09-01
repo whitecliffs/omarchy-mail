@@ -503,6 +503,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_multipart_fixture_with_unicode_headers_and_attachment() {
+        let parsed = parse(include_bytes!("../../tests/fixtures/multipart-utf8.eml"))
+            .expect("fixture MIME parse");
+        assert!(parsed.sender.contains("Jane Smüth"));
+        assert!(parsed.subject.contains("Welcome"));
+        assert!(parsed.body.contains("café"));
+        assert_eq!(parsed.references, vec!["<fixture-root@example.com>"]);
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].filename, "notes.txt");
+        assert_eq!(parsed.attachments[0].bytes, b"notes from a fixture\n");
+    }
+
+    #[test]
+    fn parses_related_fixture_without_exposing_dangerous_markup() {
+        let parsed = parse(include_bytes!(
+            "../../tests/fixtures/related-remote-image.eml"
+        ))
+        .expect("related fixture MIME parse");
+        assert!(parsed.is_html);
+        assert!(
+            parsed
+                .body
+                .contains("https://images.example.test/header.png")
+        );
+        assert!(!parsed.body.contains("script"));
+        assert_eq!(
+            remote_image_urls(&parsed.body),
+            vec!["https://images.example.test/header.png"]
+        );
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(
+            parsed.attachments[0].content_id.as_deref(),
+            Some("logo@example.com")
+        );
+    }
+
+    #[test]
+    fn tolerates_a_truncated_multipart_fixture() {
+        let parsed = parse(include_bytes!(
+            "../../tests/fixtures/malformed-truncated.eml"
+        ))
+        .expect("truncated MIME should remain readable");
+        assert!(parsed.body.contains("ends before its MIME boundary"));
+    }
+
+    #[test]
     fn preserves_inline_image_content_id_and_lists_only_safe_remote_images() {
         let raw = concat!(
             "Content-Type: multipart/related; boundary=related\r\n\r\n",

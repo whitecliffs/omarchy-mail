@@ -39,6 +39,11 @@ images larger than 8 MiB. Incoming attachments are cached under
 `$XDG_CACHE_HOME/omarchy-mail/attachments/` (or `~/.cache/omarchy-mail/`) and
 can be saved from the reader.
 
+The local search index supports responsive prefix searches while treating
+typed FTS punctuation as ordinary text. During synchronisation, one malformed
+MIME message is skipped and reported without preventing the rest of the
+mailbox from being cached.
+
 The main window adapts to narrow Hyprland tiles: the reader becomes a focused
 second view with a Messages back action, and very narrow windows expose the
 sidebar through a compact navigation button.
@@ -80,6 +85,10 @@ icon, and theme template. It does not remove mail data from
 For an Arch package, use `packaging/PKGBUILD` with a release source tarball.
 The desktop entry uses the normal XDG application directory and appears in
 Omarchy’s launcher without a custom launcher integration.
+
+The test suite includes fixture messages for UTF-8 headers, multipart
+attachments, inline and remote images, truncated MIME, and a serialized SMTP
+round trip. It remains fully offline and does not require real credentials.
 
 ## Accounts and data
 

@@ -1,0 +1,21 @@
+From: Jane <jane@example.com>
+To: Jim <jim@example.com>
+Subject: A newsletter with images
+Message-ID: <fixture-related@example.com>
+Content-Type: multipart/related; boundary="fixture-related"
+
+--fixture-related
+Content-Type: text/html; charset=utf-8
+
+<p>Hello <strong>Jim</strong>.</p>
+<p><img src="cid:logo@example.com" alt="Logo"></p>
+<p><img src="https://images.example.test/header.png" alt="Remote header"></p>
+<p><img src="file:///home/jim/private.png"><script>alert('no')</script></p>
+--fixture-related
+Content-Type: image/png
+Content-ID: <logo@example.com>
+Content-Disposition: inline; filename="logo.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgo=
+--fixture-related--

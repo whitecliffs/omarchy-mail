@@ -36,6 +36,7 @@ pub struct SyncSnapshot {
     pub folders: Vec<RemoteFolder>,
     pub uidvalidity: Option<u32>,
     pub all_uids: Vec<u32>,
+    pub skipped_messages: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,13 +507,17 @@ fn sync_client<T: Read + Write>(
         .collect::<Vec<_>>()
         .join(",");
     let mut messages = Vec::new();
+    let mut skipped_messages = 0;
     if !sequence.is_empty() {
         let fetches = session
             .uid_fetch(sequence, "(RFC822 FLAGS INTERNALDATE)")
             .map_err(|error| ImapError::Protocol(error.to_string()))?;
         for fetch in fetches.iter() {
-            if let Some(message) = message_from_fetch(fetch, account.id, uidvalidity, local_name)? {
-                messages.push(message);
+            match message_from_fetch(fetch, account.id, uidvalidity, local_name) {
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => {}
+                Err(ImapError::Mime(_)) => skipped_messages += 1,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -523,6 +528,7 @@ fn sync_client<T: Read + Write>(
         folders,
         uidvalidity,
         all_uids,
+        skipped_messages,
     })
 }
 

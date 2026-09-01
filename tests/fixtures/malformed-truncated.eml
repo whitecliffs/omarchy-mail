@@ -1,0 +1,9 @@
+From: broken@example.com
+To: jim@example.com
+Subject: Truncated multipart
+Content-Type: multipart/mixed; boundary="never-closed"
+
+--never-closed
+Content-Type: text/plain; charset=utf-8
+
+This message ends before its MIME boundary.

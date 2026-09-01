@@ -1,0 +1,20 @@
+From: =?UTF-8?B?SmFuZSBTbcO8dGg=?= <jane@example.com>
+To: Jim <jim@example.com>
+Cc: Team <team@example.com>
+Subject: =?UTF-8?B?V2VsY29tZSDwn5iA?=
+Message-ID: <fixture-multipart@example.com>
+References: <fixture-root@example.com>
+Content-Type: multipart/mixed; boundary="fixture-mixed"
+
+--fixture-mixed
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Hello, caf=C3=A9. Here is the latest report.
+--fixture-mixed
+Content-Type: application/octet-stream; name="notes.txt"
+Content-Disposition: attachment; filename="notes.txt"
+Content-Transfer-Encoding: base64
+
+bm90ZXMgZnJvbSBhIGZpeHR1cmUK
+--fixture-mixed--

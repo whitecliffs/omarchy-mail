@@ -160,10 +160,7 @@ fn build_message_with_names(
         .parse()
         .map_err(|_| lettre::error::Error::MissingFrom)?;
     let from = Mailbox::new(Some(account.display_name.clone()), sender);
-    let mut builder = LettreMessage::builder()
-        .from(from)
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN);
+    let mut builder = LettreMessage::builder().from(from).subject(subject);
     for address in crate::mail::split_recipients(to) {
         builder = builder.to(address
             .parse()
@@ -313,5 +310,30 @@ mod tests {
                 .iter()
                 .any(|address| address.to_string() == "archive@example.com")
         );
+    }
+
+    #[test]
+    fn serialized_smtp_message_round_trips_through_the_mime_reader() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, b"round-trip attachment").expect("write attachment");
+        let account = Account::new("jim@example.com", "Jim");
+        let message = build_message_with_names(
+            &account,
+            "Jane <jane@example.com>",
+            &["Team <team@example.com>".into()],
+            &["Archive <archive@example.com>".into()],
+            "A styled note",
+            "Plain fallback",
+            Some("<p><strong>Rich note</strong></p>"),
+            &[("notes.txt".into(), path)],
+        )
+        .expect("build message");
+
+        let parsed = crate::mail::mime::parse(&message.formatted()).expect("parse serialized mail");
+        assert_eq!(parsed.subject, "A styled note");
+        assert!(parsed.body.contains("Rich note"));
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].bytes, b"round-trip attachment\r\n");
     }
 }

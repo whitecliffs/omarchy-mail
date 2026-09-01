@@ -15,6 +15,7 @@ pub struct SyncReport {
     pub email: String,
     pub fetched: usize,
     pub new_messages: usize,
+    pub skipped_messages: usize,
     pub initial: bool,
     pub error: Option<String>,
 }
@@ -26,6 +27,7 @@ pub struct FolderSyncReport {
     pub folder: String,
     pub fetched: usize,
     pub new_messages: usize,
+    pub skipped_messages: usize,
     pub error: Option<String>,
 }
 
@@ -101,9 +103,10 @@ pub fn spawn_account_monitor(
             if initial_sync && report.error.is_none() {
                 match load_imap_auth(&account) {
                     Ok(auth) => match sync_standard_folders(&account, &auth, &database) {
-                        Ok((fetched, new_messages)) => {
+                        Ok((fetched, new_messages, skipped_messages)) => {
                             report.fetched += fetched;
                             report.new_messages += new_messages;
+                            report.skipped_messages += skipped_messages;
                         }
                         Err(error) => report.error = Some(error),
                     },
@@ -134,6 +137,7 @@ pub fn spawn_account_monitor(
                         email: account.email.clone(),
                         fetched: 0,
                         new_messages: 0,
+                        skipped_messages: 0,
                         initial: false,
                         error: Some(error.to_string()),
                     });
@@ -153,6 +157,7 @@ pub fn spawn_account_monitor(
                         email: account.email.clone(),
                         fetched: 0,
                         new_messages: 0,
+                        skipped_messages: 0,
                         initial: false,
                         error: Some(format!("IMAP monitor reconnecting: {error}")),
                     });
@@ -292,6 +297,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                 match imap::sync_inbox(account, &auth, 250) {
                     Ok(snapshot) => {
                         let fetched = snapshot.messages.len();
+                        let skipped_messages = snapshot.skipped_messages;
                         let uidvalidity = snapshot.uidvalidity;
                         let all_uids = snapshot.all_uids;
                         let messages = snapshot.messages;
@@ -342,6 +348,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                                     email: account.email.clone(),
                                     fetched,
                                     new_messages,
+                                    skipped_messages,
                                     initial: false,
                                     error: cache_error,
                                 }
@@ -351,6 +358,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                                 email: account.email.clone(),
                                 fetched,
                                 new_messages: 0,
+                                skipped_messages,
                                 initial: false,
                                 error: Some(error.to_string()),
                             },
@@ -370,6 +378,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                 email: account.email.clone(),
                 fetched: 0,
                 new_messages: 0,
+                skipped_messages: 0,
                 initial: false,
                 error: last_error,
             })
@@ -379,6 +388,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
             email: account.email.clone(),
             fetched: 0,
             new_messages: 0,
+            skipped_messages: 0,
             initial: false,
             error: Some(error.to_string()),
         },
@@ -400,9 +410,9 @@ fn sync_standard_folders(
     account: &Account,
     auth: &credentials::AuthMaterial,
     database: &Database,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, usize), String> {
     let Some(account_id) = account.id else {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     };
     let folders = database
         .load_folders()
@@ -418,6 +428,7 @@ fn sync_standard_folders(
 
     let mut fetched_total = 0;
     let mut new_total = 0;
+    let mut skipped_total = 0;
     let mut errors = Vec::new();
     for folder in standard {
         let mut snapshot = None;
@@ -439,6 +450,7 @@ fn sync_standard_folders(
         match snapshot {
             Some(snapshot) => {
                 fetched_total += snapshot.messages.len();
+                skipped_total += snapshot.skipped_messages;
                 match database.upsert_messages(&snapshot.messages) {
                     Ok(new_messages) => {
                         new_total += new_messages;
@@ -464,7 +476,7 @@ fn sync_standard_folders(
         }
     }
     if errors.is_empty() {
-        Ok((fetched_total, new_total))
+        Ok((fetched_total, new_total, skipped_total))
     } else {
         Err(format!(
             "Some mailboxes could not sync: {}",
@@ -534,6 +546,7 @@ pub fn spawn_folder_sync(
                 match snapshot {
                     Some(snapshot) => {
                         let fetched = snapshot.messages.len();
+                        let skipped_messages = snapshot.skipped_messages;
                         match database.upsert_messages(&snapshot.messages) {
                             Ok(new_messages) => {
                                 let error = snapshot
@@ -555,6 +568,7 @@ pub fn spawn_folder_sync(
                                     folder: local_name,
                                     fetched,
                                     new_messages,
+                                    skipped_messages,
                                     error,
                                 }
                             }
@@ -564,6 +578,7 @@ pub fn spawn_folder_sync(
                                 folder: local_name,
                                 fetched,
                                 new_messages: 0,
+                                skipped_messages,
                                 error: Some(error.to_string()),
                             },
                         }
@@ -574,6 +589,7 @@ pub fn spawn_folder_sync(
                         folder: local_name,
                         fetched: 0,
                         new_messages: 0,
+                        skipped_messages: 0,
                         error: last_error,
                     },
                 }
@@ -584,6 +600,7 @@ pub fn spawn_folder_sync(
                 folder: local_name,
                 fetched: 0,
                 new_messages: 0,
+                skipped_messages: 0,
                 error: Some(error.to_string()),
             },
         };

@@ -718,8 +718,9 @@ fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
         .filter_map(|term| {
-            let term = term.replace('"', "");
-            (!term.is_empty()).then(|| format!("\"{term}\""))
+            let term = term.trim_matches(['"', '\'']);
+            let term = term.replace('"', "\"\"");
+            (!term.is_empty()).then(|| format!("\"{term}\"*"))
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -881,6 +882,24 @@ mod tests {
         let found = database.search_messages("garden").expect("search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].sender_name, "Jane Smith");
+    }
+
+    #[test]
+    fn searches_cached_messages_by_prefix_without_fts_syntax_injection() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        database
+            .upsert_messages(&Message::demo_messages())
+            .expect("insert messages");
+
+        let prefix = database.search_messages("gard").expect("prefix search");
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].subject, "A quiet afternoon in the garden");
+
+        let punctuation = database
+            .search_messages("garden OR 1=1")
+            .expect("quoted search");
+        assert!(punctuation.is_empty());
     }
 
     #[test]

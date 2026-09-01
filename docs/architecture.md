@@ -31,7 +31,9 @@ without making the GTK main loop responsible for network activity.
   worker threads, with transport-aware IMAP connections, mailbox discovery,
   bounded folder fetches, queued action reconciliation, attachment caching,
   per-account error reports, and long-lived IDLE monitors with a polling
-  fallback and capped reconnect backoff.
+  fallback and capped reconnect backoff. A malformed MIME payload is isolated
+  to its message during a mailbox fetch, counted in the sync report, and does
+  not discard the other messages returned by that server response.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the desktop experience, including adaptive pane
@@ -99,6 +101,10 @@ message rows so remote names such as
 `[Gmail]/Sent Mail` can be preserved while the UI stays calm. Local drafts
 are stored as messages in the `Drafts` folder, included in the FTS index, and
 reopened by parsing their compact To/Cc/Bcc recipient summary.
+
+Search terms are converted to SQLite FTS5 prefix expressions after quoting
+embedded syntax characters. This keeps the index responsive while ensuring
+operators typed into the search field remain plain search text.
 
 ## Theme boundary
 
