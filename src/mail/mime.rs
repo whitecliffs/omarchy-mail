@@ -405,8 +405,8 @@ mod tests {
     #[test]
     fn sanitizes_scripts_and_local_urls() {
         let safe = sanitize_html(
-        r#"<p>Hello</p><script>alert('x')</script><img src="file:///etc/passwd">"#,
-    );
+            r#"<p>Hello</p><script>alert('x')</script><img src="file:///etc/passwd">"#,
+        );
         assert!(safe.contains("Hello"));
         assert!(!safe.contains("script"));
         assert!(!safe.contains("alert"));
