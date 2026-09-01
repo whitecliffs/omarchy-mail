@@ -33,6 +33,12 @@ pub struct Attachment {
     pub content_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtmlFragment {
+    Markup(String),
+    Image { src: String, alt: String },
+}
+
 pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
     let mail = parse_mail(raw)?;
     let body = find_body(&mail, false).unwrap_or_default();
@@ -69,16 +75,224 @@ pub fn sanitize_html(html: &str) -> String {
     let mut builder = Builder::default();
     builder
         .tags(HashSet::from([
-            "a", "b", "br", "code", "div", "em", "i", "img", "li", "ol", "p", "pre", "span",
-            "strong", "u", "ul",
+            "a",
+            "b",
+            "blockquote",
+            "br",
+            "center",
+            "code",
+            "div",
+            "em",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "hr",
+            "i",
+            "img",
+            "li",
+            "ol",
+            "p",
+            "pre",
+            "span",
+            "strong",
+            "table",
+            "tbody",
+            "td",
+            "tfoot",
+            "th",
+            "thead",
+            "tr",
+            "u",
+            "ul",
         ]))
         .generic_attributes(HashSet::from(["title"]))
         .add_tag_attributes("img", ["src", "alt", "width", "height"])
         .link_rel(Some("noopener noreferrer"))
         .url_relative(ammonia::UrlRelative::PassThrough)
-        .url_schemes(HashSet::from(["http", "https", "mailto"]))
+        .url_schemes(HashSet::from(["cid", "http", "https", "mailto"]))
         .clean(&html)
         .to_string()
+}
+
+/// Splits sanitized HTML into Pango-safe markup and image placeholders while
+/// retaining basic inline formatting across image boundaries. GTK's text
+/// buffer can replace each placeholder with a paintable, which keeps inline
+/// images in the same position as the email authored them.
+pub fn html_fragments(html: &str) -> Vec<HtmlFragment> {
+    let safe = sanitize_html(html);
+    let mut fragments = Vec::new();
+    let mut text = String::new();
+    let mut active = Vec::<(String, String, String)>::new();
+    let mut cursor = 0;
+
+    while cursor < safe.len() {
+        if safe.as_bytes().get(cursor) == Some(&b'<') {
+            let Some(end_offset) = safe[cursor..].find('>') else {
+                text.push_str(&safe[cursor..]);
+                break;
+            };
+            let end = cursor + end_offset;
+            flush_fragment_text(&mut fragments, &mut text, &active);
+            let raw_tag = &safe[cursor + 1..end];
+            let tag = raw_tag.trim();
+            let closing = tag.starts_with('/');
+            let name = tag
+                .trim_start_matches('/')
+                .trim_end_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if !closing && name == "img" {
+                let src = attribute_value(&safe[cursor..=end], "src")
+                    .map(|value| decode_entities(&value))
+                    .unwrap_or_default();
+                let alt = attribute_value(&safe[cursor..=end], "alt")
+                    .map(|value| decode_entities(&value))
+                    .unwrap_or_default();
+                if image_source_allowed(&src) {
+                    fragments.push(HtmlFragment::Image { src, alt });
+                } else if !alt.is_empty() {
+                    text.push_str(&alt);
+                }
+            } else {
+                append_html_tag(&mut fragments, &mut active, tag, &name, closing);
+            }
+            cursor = end + 1;
+            continue;
+        }
+
+        let end = safe[cursor..]
+            .find('<')
+            .map(|offset| cursor + offset)
+            .unwrap_or(safe.len());
+        text.push_str(&safe[cursor..end]);
+        cursor = end;
+    }
+    flush_fragment_text(&mut fragments, &mut text, &active);
+    fragments
+}
+
+fn image_source_allowed(src: &str) -> bool {
+    (src.starts_with("http://") || src.starts_with("https://") || src.starts_with("cid:"))
+        && src.len() <= 4096
+        && !src.chars().any(char::is_whitespace)
+}
+
+fn flush_fragment_text(
+    fragments: &mut Vec<HtmlFragment>,
+    text: &mut String,
+    active: &[(String, String, String)],
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut markup = String::new();
+    for (_, opening, _) in active {
+        markup.push_str(opening);
+    }
+    append_pango_text(&mut markup, text);
+    for (_, _, closing) in active.iter().rev() {
+        markup.push_str(closing);
+    }
+    push_markup_fragment(fragments, markup);
+    text.clear();
+}
+
+fn push_markup_fragment(fragments: &mut Vec<HtmlFragment>, markup: String) {
+    if markup.is_empty() {
+        return;
+    }
+    if let Some(HtmlFragment::Markup(previous)) = fragments.last_mut() {
+        previous.push_str(&markup);
+    } else {
+        fragments.push(HtmlFragment::Markup(markup));
+    }
+}
+
+fn push_block_break(fragments: &mut Vec<HtmlFragment>) {
+    if fragments.last().is_some_and(
+        |fragment| matches!(fragment, HtmlFragment::Markup(markup) if markup.ends_with('\n')),
+    ) {
+        return;
+    }
+    push_markup_fragment(fragments, "\n".into());
+}
+
+fn append_html_tag(
+    fragments: &mut Vec<HtmlFragment>,
+    active: &mut Vec<(String, String, String)>,
+    tag: &str,
+    name: &str,
+    closing: bool,
+) {
+    if closing {
+        if matches!(
+            name,
+            "a" | "b"
+                | "strong"
+                | "i"
+                | "em"
+                | "u"
+                | "code"
+                | "pre"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+        ) && let Some(index) = active.iter().rposition(|(known, _, _)| known == name)
+        {
+            active.remove(index);
+        }
+        if matches!(
+            name,
+            "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        ) {
+            push_block_break(fragments);
+        } else if name == "td" || name == "th" {
+            push_markup_fragment(fragments, "  ".into());
+        }
+        return;
+    }
+
+    match name {
+        "br" => push_markup_fragment(fragments, "\n".into()),
+        "hr" => push_markup_fragment(fragments, "\n────────\n".into()),
+        "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            if !fragments.is_empty() {
+                push_block_break(fragments);
+            }
+            if matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                active.push((name.to_string(), "<b>".into(), "</b>".into()));
+            }
+        }
+        "blockquote" => push_markup_fragment(fragments, "\n│ ".into()),
+        "td" | "th" => {
+            if !fragments.is_empty() {
+                push_markup_fragment(fragments, "  ".into());
+            }
+        }
+        "b" | "strong" => active.push((name.into(), "<b>".into(), "</b>".into())),
+        "i" | "em" => active.push((name.into(), "<i>".into(), "</i>".into())),
+        "u" => active.push((name.into(), "<u>".into(), "</u>".into())),
+        "code" | "pre" => active.push((name.into(), "<tt>".into(), "</tt>".into())),
+        "a" => {
+            if let Some(href) = href_from_tag(tag) {
+                active.push((
+                    name.into(),
+                    format!("<a href=\"{}\">", glib::markup_escape_text(&href)),
+                    "</a>".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Returns only network image URLs from already-sanitised HTML. Local files,
@@ -581,5 +795,43 @@ mod tests {
             remote_image_urls(&safe),
             vec!["https://images.example/logo.png"]
         );
+    }
+
+    #[test]
+    fn keeps_safe_images_in_document_order_for_native_rendering() {
+        let fragments = html_fragments(
+            r#"<p>Hello <strong>there</strong><img src="https://images.example/logo.png" alt="Logo"> after</p>"#,
+        );
+        assert!(matches!(
+            fragments.as_slice(),
+            [
+                HtmlFragment::Markup(before),
+                HtmlFragment::Image { src, alt },
+                HtmlFragment::Markup(after),
+            ] if before.contains("Hello ")
+                && before.contains("<b>there</b>")
+                && src == "https://images.example/logo.png"
+                && alt == "Logo"
+                && after.contains("after")
+        ));
+    }
+
+    #[test]
+    fn keeps_cid_images_but_rejects_other_image_sources() {
+        let fragments = html_fragments(
+            r#"<p>Start<img src="cid:logo@example.com"><img src="file:///tmp/logo.png" alt="Local">End</p>"#,
+        );
+        assert!(fragments.iter().any(|fragment| matches!(
+            fragment,
+            HtmlFragment::Image { src, .. } if src == "cid:logo@example.com"
+        )));
+        assert!(fragments.iter().any(|fragment| matches!(
+            fragment,
+            HtmlFragment::Markup(markup) if markup.contains("Local")
+        )));
+        assert!(!fragments.iter().any(|fragment| matches!(
+            fragment,
+            HtmlFragment::Image { src, .. } if src.starts_with("file:")
+        )));
     }
 }

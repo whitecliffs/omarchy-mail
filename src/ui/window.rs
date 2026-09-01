@@ -7,6 +7,7 @@ use crate::models::{
 use crate::preferences;
 use crate::theme;
 use adw::prelude::*;
+use chrono::Datelike;
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1341,32 +1342,57 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     }
 
     let layout = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    layout.set_hexpand(true);
+    layout.set_size_request(0, -1);
     let indicator = gtk::Label::new(Some(if message.unread { "●" } else { " " }));
     indicator.add_css_class("mail-unread-dot");
     indicator.set_valign(gtk::Align::Start);
+    indicator.set_size_request(12, -1);
     layout.append(&indicator);
 
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
     text.set_hexpand(true);
+    text.set_size_request(0, -1);
     let sender = gtk::Label::new(Some(&message.sender_name));
     sender.set_xalign(0.0);
+    sender.set_single_line_mode(true);
+    sender.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    sender.set_width_chars(1);
+    sender.set_size_request(0, -1);
     sender.add_css_class("mail-sender");
     text.append(&sender);
+
+    let summary = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    summary.set_hexpand(true);
+    summary.set_size_request(0, -1);
     let subject = gtk::Label::new(Some(&message.subject));
     subject.set_xalign(0.0);
+    subject.set_hexpand(true);
+    subject.set_single_line_mode(true);
     subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subject.set_width_chars(1);
+    subject.set_size_request(0, -1);
     subject.add_css_class("mail-subject");
-    text.append(&subject);
+    summary.append(&subject);
     let preview = gtk::Label::new(Some(&message.preview));
     preview.set_xalign(0.0);
+    preview.set_hexpand(true);
+    preview.set_single_line_mode(true);
     preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    preview.set_width_chars(1);
+    preview.set_size_request(0, -1);
     preview.add_css_class("mail-preview");
-    text.append(&preview);
+    summary.append(&preview);
+    text.append(&summary);
     layout.append(&text);
 
     let trailing = gtk::Box::new(gtk::Orientation::Vertical, 4);
     trailing.set_valign(gtk::Align::Start);
-    let date = gtk::Label::new(Some(&message.received_at));
+    trailing.set_size_request(96, -1);
+    let date = gtk::Label::new(Some(&format_message_date(&message.received_at)));
+    date.set_single_line_mode(true);
+    date.set_halign(gtk::Align::End);
+    date.set_xalign(1.0);
     date.add_css_class("mail-date");
     trailing.append(&date);
     let markers = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1396,6 +1422,37 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     layout.append(&trailing);
     row.set_child(Some(&layout));
     (row, star)
+}
+
+fn format_message_date(value: &str) -> String {
+    format_message_date_at(value, chrono::Local::now().date_naive())
+}
+
+fn format_message_date_at(value: &str, today: chrono::NaiveDate) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    let local = parsed.with_timezone(&chrono::Local);
+    let date = local.date_naive();
+    if date == today {
+        format!("Today, {}", local.format("%H:%M"))
+    } else if date == today - chrono::Duration::days(1) {
+        "Yesterday".into()
+    } else if date.year() == today.year() {
+        local.format("%-d %b").to_string()
+    } else {
+        local.format("%-d %b %Y").to_string()
+    }
+}
+
+fn format_message_datetime(value: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    parsed
+        .with_timezone(&chrono::Local)
+        .format("%a, %-d %B %Y at %H:%M")
+        .to_string()
 }
 
 fn open_message_menu(state: Rc<AppState>, row: &gtk::ListBoxRow, message_id: i64, x: f64, y: f64) {
@@ -1584,7 +1641,7 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         let email = gtk::Label::new(Some(&sender_address));
         email.add_css_class("mail-reader-meta");
         sender_line.append(&email);
-        let date = gtk::Label::new(Some(&message.received_at));
+        let date = gtk::Label::new(Some(&format_message_datetime(&message.received_at)));
         date.add_css_class("mail-reader-meta");
         date.set_hexpand(true);
         date.set_xalign(1.0);
@@ -1595,6 +1652,12 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         recipients.set_xalign(0.0);
         recipients.add_css_class("mail-reader-meta");
         content.append(&recipients);
+
+        if let Some(body_html) = message.body_html.as_deref() {
+            if let Some(notice) = remote_image_block_notice(state, &message, body_html) {
+                content.append(&notice);
+            }
+        }
 
         let pending_send = if message.folder == "Outbox" {
             message.id.checked_neg().and_then(|send_id| {
@@ -1709,7 +1772,11 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
                 .iter()
                 .filter(|related| related.id != message.id)
             {
-                let title = format!("{}  ·  {}", related.sender_name, related.received_at);
+                let title = format!(
+                    "{}  ·  {}",
+                    related.sender_name,
+                    format_message_datetime(&related.received_at)
+                );
                 let expander = gtk::Expander::new(Some(&title));
                 expander.add_css_class("mail-conversation-expander");
                 expander.set_margin_bottom(8);
@@ -1854,36 +1921,32 @@ fn append_outbox_controls(content: &gtk::Box, state: &Rc<AppState>, send: &Pendi
 }
 
 fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Message) {
-    let body = gtk::Label::new(None);
-    body.set_xalign(0.0);
-    body.set_yalign(0.0);
-    body.set_wrap(true);
-    body.set_selectable(true);
-    body.add_css_class("mail-reader-body");
-    let body_html = message
-        .body_html
-        .as_deref()
-        .or_else(|| message.body.contains('<').then_some(message.body.as_str()));
-    if let Some(body_html) = body_html {
-        body.set_use_markup(true);
-        body.set_markup(&crate::mail::mime::html_to_pango(body_html));
-        body.connect_activate_link(|_, uri| {
-            let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
-            glib::Propagation::Stop
-        });
+    if let Some(body_html) = message.body_html.as_deref() {
+        append_html_content(content, state, message, body_html);
     } else {
-        body.set_text(&message.body);
-    }
-    content.append(&body);
-
-    if let Some(body_html) = body_html {
-        append_remote_images(content, state, message, body_html);
+        let body = gtk::TextView::new();
+        body.set_wrap_mode(gtk::WrapMode::WordChar);
+        body.set_editable(false);
+        body.set_cursor_visible(false);
+        body.set_hexpand(true);
+        body.set_left_margin(0);
+        body.set_right_margin(0);
+        body.set_top_margin(0);
+        body.set_bottom_margin(0);
+        body.add_css_class("mail-reader-body");
+        body.buffer().set_text(&message.body);
+        content.append(&body);
     }
 
     let inline_images = message
         .attachments
         .iter()
-        .filter(|attachment| is_inline_image(attachment))
+        .filter(|attachment| {
+            is_inline_image(attachment)
+                && !message.body_html.as_deref().is_some_and(|html| {
+                    html_references_content_id(html, attachment.content_id.as_deref())
+                })
+        })
         .collect::<Vec<_>>();
     if !inline_images.is_empty() {
         let images = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -1969,113 +2032,194 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
     }
 }
 
-fn append_remote_images(
+fn append_html_content(
     content: &gtk::Box,
     state: &Rc<AppState>,
     message: &Message,
     body_html: &str,
 ) {
-    let urls = crate::mail::mime::remote_image_urls(body_html);
-    if urls.is_empty() {
-        return;
+    let body = gtk::TextView::new();
+    body.set_wrap_mode(gtk::WrapMode::WordChar);
+    body.set_editable(false);
+    body.set_cursor_visible(false);
+    body.set_hexpand(true);
+    body.set_left_margin(0);
+    body.set_right_margin(0);
+    body.set_top_margin(0);
+    body.set_bottom_margin(0);
+    body.set_pixels_above_lines(2);
+    body.set_pixels_below_lines(2);
+    body.add_css_class("mail-reader-body");
+
+    let buffer = body.buffer();
+    let remote_allowed = remote_images_allowed(state, message);
+    for fragment in crate::mail::mime::html_fragments(body_html) {
+        match fragment {
+            crate::mail::mime::HtmlFragment::Markup(markup) => {
+                let mut end = buffer.end_iter();
+                buffer.insert_markup(&mut end, &markup);
+            }
+            crate::mail::mime::HtmlFragment::Image { src, alt } => {
+                if let Some(attachment) = inline_attachment_for_source(message, &src) {
+                    if attachment_available(attachment) {
+                        queue_inline_image(
+                            &buffer,
+                            gio::File::for_path(&attachment.cache_path),
+                            &alt,
+                        );
+                    } else {
+                        insert_image_alt(&buffer, &alt);
+                    }
+                } else if remote_allowed {
+                    queue_inline_image(&buffer, gio::File::for_uri(&src), &alt);
+                } else {
+                    insert_image_alt(&buffer, &alt);
+                }
+            }
+        }
     }
+    content.append(&body);
+}
+
+fn remote_images_allowed(state: &Rc<AppState>, message: &Message) -> bool {
     let sender_allowed = state
         .preferences
         .borrow()
         .remote_images_allowed_for_sender(&message.sender_email);
-    let allowed = !state.preferences.borrow().block_remote_images
+    !state.preferences.borrow().block_remote_images
         || sender_allowed
-        || state.allowed_remote_images.borrow().contains(&message.id);
-    let images = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    images.set_margin_top(20);
-    images.add_css_class("mail-inline-images");
-    let heading = gtk::Label::new(Some(if allowed {
-        "Remote images"
-    } else {
-        "Remote images blocked"
-    }));
+        || state.allowed_remote_images.borrow().contains(&message.id)
+}
+
+fn remote_image_block_notice(
+    state: &Rc<AppState>,
+    message: &Message,
+    body_html: &str,
+) -> Option<gtk::Box> {
+    let urls = crate::mail::mime::remote_image_urls(body_html);
+    if urls.is_empty() || remote_images_allowed(state, message) {
+        return None;
+    }
+
+    let notice = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    notice.set_margin_top(14);
+    notice.set_margin_bottom(2);
+    notice.add_css_class("mail-remote-image-notice");
+
+    let heading = gtk::Label::new(Some("Remote images blocked"));
     heading.set_xalign(0.0);
     heading.add_css_class("mail-reader-meta");
-    images.append(&heading);
+    notice.append(&heading);
+    let details = gtk::Label::new(Some(&format!(
+        "{} image{} hidden to protect your privacy.",
+        urls.len(),
+        if urls.len() == 1 { " is" } else { "s are" }
+    )));
+    details.set_xalign(0.0);
+    details.set_wrap(true);
+    details.add_css_class("mail-empty-body");
+    notice.append(&details);
 
-    if !allowed {
-        let details = gtk::Label::new(Some(&format!(
-            "{} image{} hidden to protect your privacy.",
-            urls.len(),
-            if urls.len() == 1 { " is" } else { "s are" }
-        )));
-        details.set_xalign(0.0);
-        details.set_wrap(true);
-        details.add_css_class("mail-empty-body");
-        images.append(&details);
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let load = gtk::Button::with_label("Load for this message");
-        let state_for_message = state.clone();
-        let message_id = message.id;
-        load.connect_clicked(move |_| {
-            state_for_message
-                .allowed_remote_images
-                .borrow_mut()
-                .insert(message_id);
-            rerender_selected_reader(&state_for_message);
-        });
-        actions.append(&load);
-        let always = gtk::Button::with_label("Always allow from sender");
-        let state_for_sender = state.clone();
-        let sender_email = message.sender_email.clone();
-        always.connect_clicked(move |_| {
-            let result = {
-                let mut preferences = state_for_sender.preferences.borrow_mut();
-                preferences.allow_remote_images_for_sender(&sender_email);
-                preferences::save(&preferences)
-            };
-            if let Err(error) = result {
-                set_status(
-                    &state_for_sender,
-                    &format!("Couldn’t save image preference: {error}"),
-                );
-            }
-            rerender_selected_reader(&state_for_sender);
-        });
-        actions.append(&always);
-        images.append(&actions);
-        content.append(&images);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let load = gtk::Button::with_label("Load for this message");
+    let state_for_message = state.clone();
+    let message_id = message.id;
+    load.connect_clicked(move |_| {
+        state_for_message
+            .allowed_remote_images
+            .borrow_mut()
+            .insert(message_id);
+        rerender_selected_reader(&state_for_message);
+    });
+    actions.append(&load);
+    let always = gtk::Button::with_label("Always allow from sender");
+    let state_for_sender = state.clone();
+    let sender_email = message.sender_email.clone();
+    always.connect_clicked(move |_| {
+        let result = {
+            let mut preferences = state_for_sender.preferences.borrow_mut();
+            preferences.allow_remote_images_for_sender(&sender_email);
+            preferences::save(&preferences)
+        };
+        if let Err(error) = result {
+            set_status(
+                &state_for_sender,
+                &format!("Couldn’t save image preference: {error}"),
+            );
+        }
+        rerender_selected_reader(&state_for_sender);
+    });
+    actions.append(&always);
+    notice.append(&actions);
+
+    Some(notice)
+}
+
+fn inline_attachment_for_source<'a>(
+    message: &'a Message,
+    source: &str,
+) -> Option<&'a AttachmentInfo> {
+    let content_id = source.strip_prefix("cid:")?.trim_matches(['<', '>']);
+    message.attachments.iter().find(|attachment| {
+        attachment
+            .content_id
+            .as_deref()
+            .is_some_and(|known| known.eq_ignore_ascii_case(content_id))
+    })
+}
+
+fn html_references_content_id(html: &str, content_id: Option<&str>) -> bool {
+    let Some(content_id) = content_id else {
+        return false;
+    };
+    let content_id = content_id.trim_matches(['<', '>']);
+    html.to_ascii_lowercase()
+        .contains(&format!("cid:{}", content_id.to_ascii_lowercase()))
+}
+
+fn insert_image_alt(buffer: &gtk::TextBuffer, alt: &str) {
+    if alt.trim().is_empty() {
         return;
     }
+    let mut end = buffer.end_iter();
+    buffer.insert_markup(&mut end, &glib::markup_escape_text(alt));
+}
 
-    for url in urls {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let picture = gtk::Picture::new();
-        picture.set_alternative_text(Some("Remote image"));
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_can_shrink(true);
-        picture.set_halign(gtk::Align::Start);
-        picture.set_hexpand(true);
-        picture.set_visible(false);
-        let status = gtk::Label::new(Some("Loading remote image…"));
-        status.set_xalign(0.0);
-        status.add_css_class("mail-empty-body");
-        row.append(&picture);
-        row.append(&status);
-        images.append(&row);
-
-        let file = gio::File::for_uri(&url);
-        file.load_bytes_async(None::<&gio::Cancellable>, move |result| match result {
+fn queue_inline_image(buffer: &gtk::TextBuffer, file: gio::File, alt: &str) {
+    let mut end = buffer.end_iter();
+    let offset = end.offset();
+    buffer.insert(&mut end, "\u{FFFC}");
+    let start = buffer.iter_at_offset(offset);
+    let mark = buffer.create_mark(None, &start, true);
+    let buffer_for_image = buffer.clone();
+    let alt = alt.to_string();
+    file.load_bytes_async(None::<&gio::Cancellable>, move |result| {
+        let texture = match result {
             Ok((bytes, _)) if bytes.len() <= 8 * 1024 * 1024 => {
-                match gdk::Texture::from_bytes(&bytes) {
-                    Ok(texture) => {
-                        picture.set_paintable(Some(&texture));
-                        picture.set_visible(true);
-                        status.set_visible(false);
-                    }
-                    Err(_) => status.set_text("Remote image could not be displayed."),
-                }
+                gdk::Texture::from_bytes(&bytes).ok()
             }
-            Ok(_) => status.set_text("Remote image is too large to display."),
-            Err(_) => status.set_text("Remote image is unavailable."),
-        });
+            _ => None,
+        };
+        replace_inline_image(&buffer_for_image, &mark, texture.as_ref(), &alt);
+    });
+}
+
+fn replace_inline_image(
+    buffer: &gtk::TextBuffer,
+    mark: &gtk::TextMark,
+    texture: Option<&gdk::Texture>,
+    alt: &str,
+) {
+    let mut start = buffer.iter_at_mark(mark);
+    let mut end = start.clone();
+    end.forward_char();
+    buffer.delete(&mut start, &mut end);
+    if let Some(texture) = texture {
+        buffer.insert_paintable(&mut start, texture);
+    } else if !alt.trim().is_empty() {
+        buffer.insert_markup(&mut start, &glib::markup_escape_text(alt));
     }
-    content.append(&images);
+    buffer.delete_mark(mark);
 }
 
 fn rerender_selected_reader(state: &Rc<AppState>) {
@@ -4699,6 +4843,35 @@ mod tests {
                 bcc: "archive@example.com".into(),
             }
         );
+    }
+
+    #[test]
+    fn formats_message_dates_for_list_density() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        assert_eq!(
+            format_message_date_at("2026-09-01T09:04:00+01:00", today),
+            "Today, 09:04"
+        );
+        assert_eq!(
+            format_message_date_at("2026-08-31T21:04:00+01:00", today),
+            "Yesterday"
+        );
+        assert_eq!(
+            format_message_date_at("2026-01-02T11:30:00+01:00", today),
+            "2 Jan"
+        );
+        assert_eq!(
+            format_message_date_at("2025-12-31T11:30:00+00:00", today),
+            "31 Dec 2025"
+        );
+        assert_eq!(format_message_date_at("not-a-date", today), "not-a-date");
+    }
+
+    #[test]
+    fn formats_reader_dates_with_localized_full_context() {
+        let formatted = format_message_datetime("2026-09-01T09:04:00+00:00");
+        assert!(formatted.contains("1 September 2026 at"));
+        assert!(formatted.ends_with(":04"));
     }
 
     #[test]
