@@ -1,4 +1,4 @@
-use crate::models::{Account, SecurityMode};
+use crate::models::{Account, PendingSend, SecurityMode};
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart, header::ContentType};
 use lettre::{Message as LettreMessage, SmtpTransport, Transport};
 use std::fs;
@@ -15,6 +15,24 @@ pub enum SmtpError {
     Io(#[from] std::io::Error),
 }
 
+impl SmtpError {
+    /// Network and transient SMTP failures are safe to retry from the
+    /// outbox. Authentication/server response failures remain visible for
+    /// manual correction instead of looping forever.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(error) => {
+                (error.is_transient()
+                    || error.is_timeout()
+                    || error.is_transport_shutdown()
+                    || (!error.is_response() && !error.is_tls() && !error.is_client()))
+                    && !error.is_permanent()
+            }
+            Self::Message(_) | Self::Io(_) => false,
+        }
+    }
+}
+
 pub fn send_text_with_attachments(
     account: &Account,
     password: &str,
@@ -24,7 +42,30 @@ pub fn send_text_with_attachments(
     body: &str,
     attachments: &[PathBuf],
 ) -> Result<(), SmtpError> {
-    let message = build_message(account, to, cc, subject, body, attachments)?;
+    let named_attachments = attachments
+        .iter()
+        .map(|path| {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(safe_attachment_filename)
+                .unwrap_or_else(|| "attachment".into());
+            (filename, path.clone())
+        })
+        .collect::<Vec<_>>();
+    send_named_attachments(account, password, to, cc, subject, body, &named_attachments)
+}
+
+fn send_named_attachments(
+    account: &Account,
+    password: &str,
+    to: &str,
+    cc: &[String],
+    subject: &str,
+    body: &str,
+    attachments: &[(String, PathBuf)],
+) -> Result<(), SmtpError> {
+    let message = build_message_with_names(account, to, cc, subject, body, attachments)?;
     let credentials = lettre::transport::smtp::authentication::Credentials::new(
         account.outgoing.username.clone(),
         password.to_string(),
@@ -47,13 +88,39 @@ pub fn send_text_with_attachments(
     Ok(())
 }
 
-fn build_message(
+pub fn send_pending(
+    account: &Account,
+    password: &str,
+    send: &PendingSend,
+) -> Result<(), SmtpError> {
+    let attachments = send
+        .attachments
+        .iter()
+        .map(|attachment| {
+            (
+                safe_attachment_filename(&attachment.filename),
+                PathBuf::from(&attachment.path),
+            )
+        })
+        .collect::<Vec<_>>();
+    send_named_attachments(
+        account,
+        password,
+        &send.to,
+        &send.cc,
+        &send.subject,
+        &send.body,
+        &attachments,
+    )
+}
+
+fn build_message_with_names(
     account: &Account,
     to: &str,
     cc: &[String],
     subject: &str,
     body: &str,
-    attachments: &[PathBuf],
+    attachments: &[(String, PathBuf)],
 ) -> Result<LettreMessage, SmtpError> {
     let sender = account
         .email
@@ -87,14 +154,9 @@ fn build_message(
         builder.body(body.to_string())?
     } else {
         let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
-        for path in attachments {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("attachment")
-                .replace(['/', '\\'], "_");
+        for (filename, path) in attachments {
             let bytes = fs::read(path)?;
-            let attachment = Attachment::new(filename).body(
+            let attachment = Attachment::new(filename.clone()).body(
                 bytes,
                 ContentType::parse("application/octet-stream")
                     .expect("application/octet-stream is a valid MIME type"),
@@ -104,6 +166,16 @@ fn build_message(
         builder.multipart(multipart)?
     };
     Ok(message)
+}
+
+fn safe_attachment_filename(filename: &str) -> String {
+    let value = filename.replace(['/', '\\'], "_");
+    let value = value.trim_matches('.');
+    if value.is_empty() {
+        "attachment".into()
+    } else {
+        value.chars().take(180).collect()
+    }
 }
 
 #[cfg(test)]
@@ -119,12 +191,42 @@ mod tests {
         let path = directory.path().join("notes.txt");
         fs::write(&path, b"attachment body").expect("write attachment");
         let account = Account::new("jim@example.com", "Jim");
-        let message = build_message(&account, "jane@example.com", &[], "Notes", "Hello", &[path])
-            .expect("build message");
+        let message = build_message_with_names(
+            &account,
+            "jane@example.com",
+            &[],
+            "Notes",
+            "Hello",
+            &[("notes.txt".into(), path)],
+        )
+        .expect("build message");
         let raw = message.formatted();
         let formatted = String::from_utf8_lossy(&raw);
 
         assert!(formatted.contains("Content-Disposition: attachment; filename=\"notes.txt\""));
         assert!(formatted.contains("attachment body"));
+    }
+
+    #[test]
+    fn preserves_the_original_name_for_staged_attachments() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("pending-123").join("000-notes.txt");
+        fs::create_dir_all(path.parent().expect("staging directory")).expect("directory");
+        fs::write(&path, b"attachment body").expect("write attachment");
+        let account = Account::new("jim@example.com", "Jim");
+        let message = build_message_with_names(
+            &account,
+            "jane@example.com",
+            &[],
+            "Notes",
+            "Hello",
+            &[("notes.txt".into(), path)],
+        )
+        .expect("build message");
+        let raw = message.formatted();
+        let formatted = String::from_utf8_lossy(&raw);
+
+        assert!(formatted.contains("filename=\"notes.txt\""));
+        assert!(!formatted.contains("filename=\"000-notes.txt\""));
     }
 }

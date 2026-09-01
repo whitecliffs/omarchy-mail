@@ -68,6 +68,28 @@ pub struct PendingAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingSend {
+    pub id: i64,
+    pub account_id: i64,
+    pub to: String,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<OutgoingAttachment>,
+    pub created_at: String,
+    pub attempts: u32,
+    pub retryable: bool,
+    pub next_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentInfo {
     pub filename: String,
     pub content_type: String,

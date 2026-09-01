@@ -1,4 +1,6 @@
-use crate::models::{Account, MailFolder, Message, PendingAction, ServerConfig};
+use crate::models::{
+    Account, MailFolder, Message, OutgoingAttachment, PendingAction, PendingSend, ServerConfig,
+};
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::fs;
@@ -67,6 +69,28 @@ impl Database {
             connection.execute_batch(
                 "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';
                  UPDATE schema_version SET version = 2;",
+            )?;
+        }
+        if version < 3 {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    to_recipients TEXT NOT NULL,
+                    cc_json TEXT NOT NULL DEFAULT '[]',
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    attachments_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    retryable INTEGER NOT NULL DEFAULT 1,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    sent INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS pending_sends_due_idx
+                    ON pending_sends(account_id, sent, retryable, next_attempt_at);
+                UPDATE schema_version SET version = 3;",
             )?;
         }
         Ok(())
@@ -336,6 +360,107 @@ impl Database {
         Ok(())
     }
 
+    pub fn queue_send(&self, send: &PendingSend) -> Result<i64> {
+        let connection = self.connection()?;
+        let cc_json = serde_json::to_string(&send.cc)
+            .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
+        let attachments_json = serde_json::to_string(&send.attachments)
+            .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
+        connection.execute(
+            "INSERT INTO pending_sends(account_id, to_recipients, cc_json, subject, body, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                send.account_id,
+                send.to,
+                cc_json,
+                send.subject,
+                send.body,
+                attachments_json,
+                send.created_at,
+                send.attempts,
+                send.retryable as i64,
+                send.next_attempt_at,
+                send.last_error,
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn pending_sends(&self, account_id: Option<i64>) -> Result<Vec<PendingSend>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, account_id, to_recipients, cc_json, subject, body, attachments_json,
+                    created_at, attempts, retryable, next_attempt_at, last_error
+             FROM pending_sends
+             WHERE sent = 0 AND (?1 IS NULL OR account_id = ?1)
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([account_id], pending_send_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn due_pending_sends(&self, account_id: i64) -> Result<Vec<PendingSend>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, account_id, to_recipients, cc_json, subject, body, attachments_json,
+                    created_at, attempts, retryable, next_attempt_at, last_error
+             FROM pending_sends
+             WHERE sent = 0 AND account_id = ?1 AND retryable = 1
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map(
+            params![account_id, Utc::now().to_rfc3339()],
+            pending_send_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn record_send_failure(
+        &self,
+        send_id: i64,
+        error: &str,
+        retryable: bool,
+        next_attempt_at: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE pending_sends
+             SET attempts = attempts + 1, retryable = ?1, next_attempt_at = ?2, last_error = ?3
+             WHERE id = ?4 AND sent = 0",
+            params![retryable as i64, next_attempt_at, error, send_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_pending_send(&self, send_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE pending_sends
+             SET retryable = 1, next_attempt_at = ?1, last_error = NULL
+             WHERE id = ?2 AND sent = 0",
+            params![Utc::now().to_rfc3339(), send_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_pending_send_sent(&self, send_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE pending_sends SET sent = 1, last_error = NULL WHERE id = ?1",
+            [send_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pending_send(&self, send_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute("DELETE FROM pending_sends WHERE id = ?1", [send_id])?;
+        Ok(())
+    }
+
     pub fn queue_action(
         &self,
         account_id: Option<i64>,
@@ -416,10 +541,40 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSend> {
+    let cc_json: String = row.get(3)?;
+    let attachments_json: String = row.get(6)?;
+    let cc = serde_json::from_str(&cc_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let attachments =
+        serde_json::from_str::<Vec<OutgoingAttachment>>(&attachments_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(PendingSend {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        to: row.get(2)?,
+        cc,
+        subject: row.get(4)?,
+        body: row.get(5)?,
+        attachments,
+        created_at: row.get(7)?,
+        attempts: row.get::<_, i64>(8)?.max(0) as u32,
+        retryable: row.get::<_, i64>(9)? != 0,
+        next_attempt_at: row.get(10)?,
+        last_error: row.get(11)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AuthMethod, SecurityMode};
+    use crate::models::{AuthMethod, OutgoingAttachment, PendingSend, SecurityMode};
     use tempfile::tempdir;
 
     #[test]
@@ -525,6 +680,64 @@ mod tests {
         assert_eq!(folders[0].name, "Inbox");
         assert_eq!(folders[0].unread_count, 4);
         assert_eq!(folders[1].remote_name, "Archive/Receipts");
+    }
+
+    #[test]
+    fn queues_and_updates_an_outgoing_message_without_storing_credentials() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("account");
+        let send = PendingSend {
+            id: 0,
+            account_id,
+            to: "jane@example.com".into(),
+            cc: vec!["team@example.com".into()],
+            subject: "Offline note".into(),
+            body: "This should wait for the network.".into(),
+            attachments: vec![OutgoingAttachment {
+                filename: "notes.txt".into(),
+                path: "/tmp/omarchy-mail-notes.txt".into(),
+            }],
+            created_at: Utc::now().to_rfc3339(),
+            attempts: 1,
+            retryable: true,
+            next_attempt_at: None,
+            last_error: Some("network unavailable".into()),
+        };
+        let id = database.queue_send(&send).expect("queue send");
+        let loaded = database
+            .pending_sends(Some(account_id))
+            .expect("load queued send");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].cc, send.cc);
+        assert_eq!(loaded[0].attachments, send.attachments);
+
+        database
+            .record_send_failure(id, "still offline", true, Some("2999-01-01T00:00:00Z"))
+            .expect("record failure");
+        let delayed = database
+            .due_pending_sends(account_id)
+            .expect("load due sends");
+        assert!(delayed.is_empty());
+        database.retry_pending_send(id).expect("retry send");
+        assert_eq!(
+            database
+                .due_pending_sends(account_id)
+                .expect("load retried sends")
+                .len(),
+            1
+        );
+
+        database.mark_pending_send_sent(id).expect("mark sent");
+        assert!(
+            database
+                .pending_sends(Some(account_id))
+                .expect("load sent sends")
+                .is_empty()
+        );
     }
 
     #[test]

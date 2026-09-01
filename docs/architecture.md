@@ -36,6 +36,10 @@ Service under the `org.omarchy.Mail` service name, with separate
 credentials are written to logs by default. Attachment bytes are disposable
 cache data under `XDG_CACHE_HOME/omarchy-mail/attachments/` and their safe
 filenames and metadata are retained with the cached message in SQLite.
+Queued outgoing messages are durable user data in the `pending_sends` table;
+their selected attachments are copied to
+`XDG_DATA_HOME/omarchy-mail/outbox/` before the queue row is committed. This
+means the original file can move without breaking a later retry.
 
 Each enabled account owns an isolated monitor thread. The monitor performs a
 bounded initial sync, waits for INBOX changes using IMAP IDLE for at most 25
@@ -51,6 +55,11 @@ offers Download and starts a complete RFC822 fetch on a worker. The fetch
 selects the recorded mailbox, verifies UIDVALIDITY, reparses the message, and
 upserts the refreshed metadata through the normal cache path. This keeps cache
 eviction recoverable without making SQLite authoritative over IMAP.
+
+SMTP failures caused by network/transport conditions are retried with capped
+backoff by an account-local outbox monitor. Permanent response or local file
+errors remain visible in Outbox until the user chooses Retry now or Discard;
+credentials are never copied into queued message data.
 
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the

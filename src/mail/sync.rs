@@ -1,6 +1,7 @@
 use crate::database::Database;
-use crate::mail::{credentials, imap};
+use crate::mail::{credentials, imap, outbox, smtp};
 use crate::models::{Account, MailFolder, Message};
+use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -34,6 +35,14 @@ pub struct MessageFetchReport {
     pub error: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct OutboxReport {
+    pub email: String,
+    pub sent: usize,
+    pub remaining: usize,
+    pub error: Option<String>,
+}
+
 pub fn notify_new_mail(account: &str, fetched: usize) {
     if fetched == 0 {
         return;
@@ -47,6 +56,18 @@ pub fn notify_new_mail(account: &str, fetched: usize) {
 
 fn load_imap_password(account: &Account) -> Result<String, String> {
     match credentials::load_auth_material(&account.email, "imap", &account.incoming.auth)
+        .map_err(|error| error.to_string())?
+    {
+        credentials::AuthMaterial::Password(password) => Ok(password),
+        credentials::AuthMaterial::OAuth2AccessToken(_) => Err(
+            "OAuth2 sign-in is reserved for a future provider flow; choose password or an app password for now."
+                .into(),
+        ),
+    }
+}
+
+fn load_smtp_password(account: &Account) -> Result<String, String> {
+    match credentials::load_auth_material(&account.email, "smtp", &account.outgoing.auth)
         .map_err(|error| error.to_string())?
     {
         credentials::AuthMaterial::Password(password) => Ok(password),
@@ -155,6 +176,114 @@ pub fn spawn_account_monitor(
             }
         }
     });
+}
+
+/// Keeps queued sends moving independently of the IMAP monitor. SMTP may
+/// recover before IMAP does, and a small SQLite check every 30 seconds is
+/// cheaper and more reliable than forcing an inbox refresh just to retry mail.
+pub fn spawn_outbox_monitor(
+    account: Account,
+    database: Database,
+    sender: async_channel::Sender<OutboxReport>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let report = retry_pending_sends(&account, &database);
+            if report.sent > 0 || report.error.is_some() {
+                let _ = sender.send_blocking(report);
+            }
+            sleep_with_stop(&stop, Duration::from_secs(30));
+        }
+    });
+}
+
+fn retry_pending_sends(account: &Account, database: &Database) -> OutboxReport {
+    let account_id = account.id;
+    let mut report = OutboxReport {
+        email: account.email.clone(),
+        sent: 0,
+        remaining: 0,
+        error: None,
+    };
+    let Some(account_id) = account_id else {
+        report.error = Some("The account has no local id for queued mail".into());
+        return report;
+    };
+    let sends = match database.due_pending_sends(account_id) {
+        Ok(sends) => sends,
+        Err(error) => {
+            report.error = Some(format!("Could not load queued mail: {error}"));
+            return report;
+        }
+    };
+    if sends.is_empty() {
+        report.remaining = database
+            .pending_sends(Some(account_id))
+            .map(|sends| sends.len())
+            .unwrap_or_default();
+        return report;
+    }
+    let password = match load_smtp_password(account) {
+        Ok(password) => password,
+        Err(error) => {
+            report.error = Some(error);
+            report.remaining = database
+                .pending_sends(Some(account_id))
+                .map(|sends| sends.len())
+                .unwrap_or(sends.len());
+            return report;
+        }
+    };
+
+    for send in sends {
+        match smtp::send_pending(account, &password, &send) {
+            Ok(()) => {
+                let result = database
+                    .mark_pending_send_sent(send.id)
+                    .and_then(|_| database.delete_pending_send(send.id));
+                match result {
+                    Ok(()) => {
+                        outbox::remove_staged_files(&send);
+                        report.sent += 1;
+                    }
+                    Err(error) => {
+                        report.error = Some(format!(
+                            "A queued message was sent but could not be cleared from the outbox: {error}"
+                        ))
+                    }
+                }
+            }
+            Err(error) => {
+                let retryable = error.is_retryable();
+                let next_attempt = retryable.then(|| {
+                    (Utc::now() + retry_delay(send.attempts.saturating_add(1))).to_rfc3339()
+                });
+                if let Err(database_error) = database.record_send_failure(
+                    send.id,
+                    &error.to_string(),
+                    retryable,
+                    next_attempt.as_deref(),
+                ) {
+                    report.error = Some(format!(
+                        "Could not update queued message state: {database_error}"
+                    ));
+                } else if !retryable {
+                    report.error = Some(format!("Outbox needs attention: {error}"));
+                }
+            }
+        }
+    }
+    report.remaining = database
+        .pending_sends(Some(account_id))
+        .map(|sends| sends.len())
+        .unwrap_or_default();
+    report
+}
+
+fn retry_delay(attempts: u32) -> ChronoDuration {
+    let seconds = (1_u64 << attempts.min(8)).min(300);
+    ChronoDuration::seconds(seconds as i64)
 }
 
 fn sleep_with_stop(stop: &AtomicBool, duration: Duration) {

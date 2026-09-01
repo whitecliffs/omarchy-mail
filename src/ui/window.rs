@@ -1,7 +1,8 @@
 use crate::database::Database;
 use crate::mail;
 use crate::models::{
-    Account, AttachmentInfo, AuthMethod, MailFolder, Message, SecurityMode, ServerConfig,
+    Account, AttachmentInfo, AuthMethod, MailFolder, Message, PendingSend, SecurityMode,
+    ServerConfig,
 };
 use crate::theme;
 use adw::prelude::*;
@@ -31,6 +32,8 @@ struct AppState {
     selected_message: RefCell<Option<i64>>,
     monitor_sender: async_channel::Sender<mail::sync::SyncReport>,
     monitor_stops: RefCell<HashMap<i64, Arc<AtomicBool>>>,
+    outbox_sender: async_channel::Sender<mail::sync::OutboxReport>,
+    outbox_stops: RefCell<HashMap<i64, Arc<AtomicBool>>>,
     status: gtk::Label,
     demo_mode: bool,
 }
@@ -56,6 +59,7 @@ pub fn build_window(application: &adw::Application) {
     let folders = database.load_folders().unwrap_or_default();
     let demo_mode = std::env::var("OMARCHY_MAIL_DEMO").as_deref() == Ok("1");
     let (monitor_sender, monitor_receiver) = async_channel::unbounded();
+    let (outbox_sender, outbox_receiver) = async_channel::unbounded();
     let messages = if demo_mode {
         Message::demo_messages()
     } else {
@@ -136,6 +140,8 @@ pub fn build_window(application: &adw::Application) {
         selected_message: RefCell::new(None),
         monitor_sender,
         monitor_stops: RefCell::new(HashMap::new()),
+        outbox_sender,
+        outbox_stops: RefCell::new(HashMap::new()),
         status,
         demo_mode,
     });
@@ -158,6 +164,7 @@ pub fn build_window(application: &adw::Application) {
     connect_keyboard_shortcuts(&state);
     window.present();
     listen_for_monitor_reports(state.clone(), monitor_receiver);
+    listen_for_outbox_reports(state.clone(), outbox_receiver);
     start_account_monitors(state);
 }
 
@@ -334,11 +341,21 @@ fn render_sidebar(state: &Rc<AppState>) {
         .iter()
         .filter(|message| message.unread)
         .count();
+    let outbox_count = if state.demo_mode {
+        0
+    } else {
+        state
+            .database
+            .pending_sends(None)
+            .map(|sends| sends.len())
+            .unwrap_or_default()
+    };
     for (label, icon, count) in [
         ("Inbox", "mail-unread-symbolic", Some(unread)),
         ("Starred", "starred-symbolic", None),
         ("Sent", "mail-send-symbolic", None),
         ("Drafts", "document-save-symbolic", None),
+        ("Outbox", "mail-send-symbolic", Some(outbox_count)),
         ("Archive", "archive-symbolic", None),
         ("Trash", "user-trash-symbolic", None),
     ] {
@@ -414,11 +431,21 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
         .collect::<Vec<_>>();
     let folders = gtk::Box::new(gtk::Orientation::Vertical, 2);
     folders.set_margin_start(24);
-    for name in ["Inbox", "Drafts", "Sent", "Archive", "Spam", "Trash"] {
-        let count = known_folders
-            .iter()
-            .find(|folder| folder.name.eq_ignore_ascii_case(name))
-            .map(|folder| folder.unread_count as usize);
+    for name in [
+        "Inbox", "Drafts", "Sent", "Outbox", "Archive", "Spam", "Trash",
+    ] {
+        let count = if name == "Outbox" {
+            state
+                .database
+                .pending_sends(Some(account_id))
+                .map(|sends| Some(sends.len()))
+                .unwrap_or(Some(0))
+        } else {
+            known_folders
+                .iter()
+                .find(|folder| folder.name.eq_ignore_ascii_case(name))
+                .map(|folder| folder.unread_count as usize)
+        };
         folders.append(&sidebar_action_row(
             &state,
             name,
@@ -508,13 +535,24 @@ fn select_scope(state: &Rc<AppState>, scope: MailScope) {
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
     render_reader(state, None);
-    if let Some((account_id, folder)) = account_scope {
+    if let Some((account_id, folder)) = account_scope.filter(|(_, folder)| folder != "Outbox") {
         sync_folder_for_scope(state, account_id, &folder);
     }
 }
 
 fn load_messages_for_scope(state: &Rc<AppState>) {
     if state.demo_mode {
+        return;
+    }
+    let scope = state.scope.borrow().clone();
+    if let Some(account_id) = match scope {
+        MailScope::Unified(folder) if folder == "Outbox" => Some(None),
+        MailScope::Account { id, folder } if folder == "Outbox" => Some(Some(id)),
+        _ => None,
+    } {
+        state
+            .messages
+            .replace(load_outbox_messages(state, account_id));
         return;
     }
     let scope = state.scope.borrow().clone();
@@ -535,6 +573,77 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
     };
     if let Ok(messages) = result {
         state.messages.replace(messages);
+    }
+}
+
+fn load_outbox_messages(state: &Rc<AppState>, account_id: Option<i64>) -> Vec<Message> {
+    state
+        .database
+        .pending_sends(account_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|send| {
+            state
+                .accounts
+                .borrow()
+                .iter()
+                .find(|account| account.id == Some(send.account_id))
+                .cloned()
+                .map(|account| pending_send_message(&send, &account))
+        })
+        .collect()
+}
+
+fn pending_send_message(send: &PendingSend, account: &Account) -> Message {
+    let recipients = if send.cc.is_empty() {
+        send.to.clone()
+    } else {
+        format!("{}\nCc: {}", send.to, send.cc.join(", "))
+    };
+    let attachments = send
+        .attachments
+        .iter()
+        .map(|attachment| AttachmentInfo {
+            filename: attachment.filename.clone(),
+            content_type: "application/octet-stream".into(),
+            size: std::fs::metadata(&attachment.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+            cache_path: attachment.path.clone(),
+            content_id: None,
+        })
+        .collect::<Vec<_>>();
+    Message {
+        id: -send.id,
+        account_id: Some(send.account_id),
+        folder: "Outbox".into(),
+        remote_uid: None,
+        uidvalidity: None,
+        message_id: None,
+        thread_key: Some(format!("outbox:{}", send.id)),
+        sender_name: account.display_name.clone(),
+        sender_email: account.email.clone(),
+        recipients,
+        subject: if send.subject.trim().is_empty() {
+            "(no subject)".into()
+        } else {
+            send.subject.clone()
+        },
+        preview: send
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect(),
+        body: send.body.clone(),
+        received_at: send.created_at.clone(),
+        unread: false,
+        starred: false,
+        has_attachments: !attachments.is_empty(),
+        attachments,
+        thread_size: 1,
     }
 }
 
@@ -607,7 +716,11 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     let query = raw_query.to_lowercase();
     let scope = state.scope.borrow().clone();
     let filter = *state.filter.borrow();
-    let messages = if raw_query.is_empty() || state.demo_mode {
+    let is_outbox_scope = matches!(
+        &scope,
+        MailScope::Unified(folder) | MailScope::Account { folder, .. } if folder == "Outbox"
+    );
+    let messages = if raw_query.is_empty() || state.demo_mode || is_outbox_scope {
         state.messages.borrow().clone()
     } else {
         state
@@ -644,30 +757,69 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
                     .any(|value| value.to_lowercase().contains(&query)))
         })
         .collect::<Vec<_>>();
+    if visible.is_empty() {
+        let (title, subtitle) = if !raw_query.is_empty() {
+            ("No messages found", "Try a different search.")
+        } else if is_outbox_scope {
+            (
+                "Outbox is clear",
+                "Messages waiting to send will appear here.",
+            )
+        } else if matches!(&scope, MailScope::Unified(folder) if folder == "Inbox") {
+            ("You’re all caught up", "New messages will appear here.")
+        } else {
+            ("No messages yet", "There’s nothing here to show.")
+        };
+        append_empty_message_state(&state.message_list, title, subtitle);
+        return;
+    }
     visible.sort_by(compare_received_newest);
     for message in group_messages(visible).iter() {
         let (row, star) = message_row(message);
         let message_id = message.id;
         let state_for_star = state.clone();
         star.connect_clicked(move |_| {
-            apply_message_action(&state_for_star, message_id, "star");
+            if message_id >= 0 {
+                apply_message_action(&state_for_star, message_id, "star");
+            }
         });
 
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(3);
-        let state_for_menu = state.clone();
-        gesture.connect_pressed(move |gesture, _, x, y| {
-            let Some(widget) = gesture.widget() else {
-                return;
-            };
-            let Ok(row) = widget.downcast::<gtk::ListBoxRow>() else {
-                return;
-            };
-            open_message_menu(state_for_menu.clone(), &row, message_id, x, y);
-        });
-        row.add_controller(gesture);
+        if message_id >= 0 {
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3);
+            let state_for_menu = state.clone();
+            gesture.connect_pressed(move |gesture, _, x, y| {
+                let Some(widget) = gesture.widget() else {
+                    return;
+                };
+                let Ok(row) = widget.downcast::<gtk::ListBoxRow>() else {
+                    return;
+                };
+                open_message_menu(state_for_menu.clone(), &row, message_id, x, y);
+            });
+            row.add_controller(gesture);
+        }
         state.message_list.append(&row);
     }
+}
+
+fn append_empty_message_state(list: &gtk::ListBox, title: &str, subtitle: &str) {
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(false);
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    empty.set_halign(gtk::Align::Center);
+    empty.set_valign(gtk::Align::Center);
+    empty.set_margin_top(72);
+    empty.set_margin_bottom(72);
+    let title_label = gtk::Label::new(Some(title));
+    title_label.add_css_class("mail-empty-title");
+    let subtitle_label = gtk::Label::new(Some(subtitle));
+    subtitle_label.add_css_class("mail-empty-body");
+    empty.append(&title_label);
+    empty.append(&subtitle_label);
+    row.set_child(Some(&empty));
+    list.append(&row);
 }
 
 fn conversation_identity(message: &Message) -> (Option<i64>, String, String) {
@@ -781,10 +933,32 @@ fn start_account_monitor(state: &Rc<AppState>, account: Account) {
         .monitor_stops
         .borrow_mut()
         .insert(account_id, stop.clone());
+    let outbox_account = account.clone();
     mail::sync::spawn_account_monitor(
         account,
         state.database.clone(),
         state.monitor_sender.clone(),
+        stop,
+    );
+    start_account_outbox_monitor(state, outbox_account);
+}
+
+fn start_account_outbox_monitor(state: &Rc<AppState>, account: Account) {
+    let Some(account_id) = account.id else {
+        return;
+    };
+    if state.outbox_stops.borrow().contains_key(&account_id) {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    state
+        .outbox_stops
+        .borrow_mut()
+        .insert(account_id, stop.clone());
+    mail::sync::spawn_outbox_monitor(
+        account,
+        state.database.clone(),
+        state.outbox_sender.clone(),
         stop,
     );
 }
@@ -828,6 +1002,30 @@ fn listen_for_monitor_reports(
                     &state,
                     &format!("{} is up to date · {} cached", report.email, report.fetched),
                 );
+            }
+        }
+    });
+}
+
+fn listen_for_outbox_reports(
+    state: Rc<AppState>,
+    receiver: async_channel::Receiver<mail::sync::OutboxReport>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(report) = receiver.recv().await {
+            if report.sent > 0 {
+                refresh_cached_view(&state);
+                set_status(
+                    &state,
+                    &format!(
+                        "{} queued message{} sent",
+                        report.sent,
+                        if report.sent == 1 { "" } else { "s" }
+                    ),
+                );
+            }
+            if let Some(error) = report.error {
+                set_status(&state, &format!("{} · {error}", report.email));
             }
         }
     });
@@ -880,6 +1078,7 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
         "Star or unstar message",
     );
     star.add_css_class("mail-star");
+    star.set_sensitive(message.id >= 0);
     star.set_widget_name(&format!("star-{}", message.id));
     markers.append(&star);
     if message.has_attachments {
@@ -1068,58 +1267,74 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         recipients.add_css_class("mail-reader-meta");
         content.append(&recipients);
 
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        actions.set_margin_top(20);
-        let reader_message_id = message.id;
-        for (label, icon) in [
-            ("Reply", "mail-reply-sender-symbolic"),
-            ("Reply all", "mail-reply-all-symbolic"),
-            ("Forward", "mail-forward-symbolic"),
-            ("Archive", "archive-symbolic"),
-            ("Delete", "user-trash-symbolic"),
-        ] {
-            let button = icon_button(icon, label);
-            button.set_label(label);
-            button.set_use_underline(false);
-            let state = state.clone();
-            let label_owned = label.to_string();
-            let message_for_compose = message.clone();
-            let action = match label {
-                "Archive" => Some("archive"),
-                "Delete" => Some("trash"),
-                _ => None,
-            };
-            button.connect_clicked(move |_| {
-                if let Some(action) = action {
-                    apply_message_action(&state, reader_message_id, action);
-                } else if label_owned == "Reply" {
-                    open_compose_with_context(
-                        state.clone(),
-                        Some(ComposeContext::Reply {
-                            message: message_for_compose.clone(),
-                            reply_all: false,
-                        }),
-                    );
-                } else if label_owned == "Reply all" {
-                    open_compose_with_context(
-                        state.clone(),
-                        Some(ComposeContext::Reply {
-                            message: message_for_compose.clone(),
-                            reply_all: true,
-                        }),
-                    );
-                } else if label_owned == "Forward" {
-                    open_compose_with_context(
-                        state.clone(),
-                        Some(ComposeContext::Forward(message_for_compose.clone())),
-                    );
-                } else {
-                    set_status(&state, &format!("{label_owned} ready"));
-                }
-            });
-            actions.append(&button);
+        let pending_send = if message.folder == "Outbox" {
+            message.id.checked_neg().and_then(|send_id| {
+                state
+                    .database
+                    .pending_sends(None)
+                    .ok()?
+                    .into_iter()
+                    .find(|send| send.id == send_id)
+            })
+        } else {
+            None
+        };
+        if let Some(send) = pending_send {
+            append_outbox_controls(&content, state, &send);
+        } else {
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            actions.set_margin_top(20);
+            let reader_message_id = message.id;
+            for (label, icon) in [
+                ("Reply", "mail-reply-sender-symbolic"),
+                ("Reply all", "mail-reply-all-symbolic"),
+                ("Forward", "mail-forward-symbolic"),
+                ("Archive", "archive-symbolic"),
+                ("Delete", "user-trash-symbolic"),
+            ] {
+                let button = icon_button(icon, label);
+                button.set_label(label);
+                button.set_use_underline(false);
+                let state = state.clone();
+                let label_owned = label.to_string();
+                let message_for_compose = message.clone();
+                let action = match label {
+                    "Archive" => Some("archive"),
+                    "Delete" => Some("trash"),
+                    _ => None,
+                };
+                button.connect_clicked(move |_| {
+                    if let Some(action) = action {
+                        apply_message_action(&state, reader_message_id, action);
+                    } else if label_owned == "Reply" {
+                        open_compose_with_context(
+                            state.clone(),
+                            Some(ComposeContext::Reply {
+                                message: message_for_compose.clone(),
+                                reply_all: false,
+                            }),
+                        );
+                    } else if label_owned == "Reply all" {
+                        open_compose_with_context(
+                            state.clone(),
+                            Some(ComposeContext::Reply {
+                                message: message_for_compose.clone(),
+                                reply_all: true,
+                            }),
+                        );
+                    } else if label_owned == "Forward" {
+                        open_compose_with_context(
+                            state.clone(),
+                            Some(ComposeContext::Forward(message_for_compose.clone())),
+                        );
+                    } else {
+                        set_status(&state, &format!("{label_owned} ready"));
+                    }
+                });
+                actions.append(&button);
+            }
+            content.append(&actions);
         }
-        content.append(&actions);
 
         let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
         rule.set_margin_top(22);
@@ -1214,6 +1429,74 @@ fn compare_received_newest(left: &Message, right: &Message) -> std::cmp::Orderin
         (Ok(left), Ok(right)) => right.cmp(&left),
         _ => std::cmp::Ordering::Equal,
     }
+}
+
+fn append_outbox_controls(content: &gtk::Box, state: &Rc<AppState>, send: &PendingSend) {
+    let status = gtk::Label::new(Some(if send.retryable {
+        "Waiting to send when the connection is available."
+    } else {
+        "This message needs attention before it can be sent."
+    }));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class(if send.retryable {
+        "mail-status"
+    } else {
+        "mail-danger"
+    });
+    status.set_margin_top(18);
+    content.append(&status);
+    if let Some(error) = &send.last_error {
+        let details = gtk::Label::new(Some(&format!("Last attempt: {error}")));
+        details.set_xalign(0.0);
+        details.set_wrap(true);
+        details.add_css_class("mail-reader-meta");
+        details.set_margin_top(6);
+        content.append(&details);
+    }
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.set_margin_top(18);
+    let retry = gtk::Button::with_label("Retry now");
+    retry.add_css_class("mail-accent-button");
+    let delete = gtk::Button::with_label("Discard");
+    delete.add_css_class("mail-danger");
+    let state_for_retry = state.clone();
+    let retry_id = send.id;
+    retry.connect_clicked(
+        move |_| match state_for_retry.database.retry_pending_send(retry_id) {
+            Ok(()) => {
+                refresh_cached_view(&state_for_retry);
+                set_status(&state_for_retry, "Message queued for retry");
+            }
+            Err(error) => set_status(
+                &state_for_retry,
+                &format!("Couldn’t retry this message: {error}"),
+            ),
+        },
+    );
+    let state_for_delete = state.clone();
+    let send_for_delete = send.clone();
+    delete.connect_clicked(move |_| {
+        match state_for_delete
+            .database
+            .delete_pending_send(send_for_delete.id)
+        {
+            Ok(()) => {
+                mail::outbox::remove_staged_files(&send_for_delete);
+                state_for_delete.selected_message.replace(None);
+                refresh_cached_view(&state_for_delete);
+                set_status(&state_for_delete, "Outbox message discarded");
+            }
+            Err(error) => set_status(
+                &state_for_delete,
+                &format!("Couldn’t discard this message: {error}"),
+            ),
+        }
+    });
+    actions.append(&retry);
+    actions.append(&delete);
+    content.append(&actions);
 }
 
 fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Message) {
@@ -1848,6 +2131,7 @@ fn open_settings(state: Rc<AppState>) {
             button.set_sensitive(false);
             let account_email = account.email.clone();
             let database = state_for_remove.database.clone();
+            let queued_sends = database.pending_sends(Some(account_id)).unwrap_or_default();
             let (sender, receiver) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let result = mail::credentials::delete_password(&account_email, "imap")
@@ -1860,6 +2144,11 @@ fn open_settings(state: Rc<AppState>) {
                         database
                             .delete_account(account_id)
                             .map_err(|error| error.to_string())
+                    })
+                    .map(|_| {
+                        for send in queued_sends {
+                            mail::outbox::remove_staged_files(&send);
+                        }
                     });
                 let _ = sender.send_blocking(result);
             });
@@ -1868,6 +2157,9 @@ fn open_settings(state: Rc<AppState>) {
                 match receiver.recv().await {
                     Ok(Ok(())) => {
                         if let Some(stop) = state.monitor_stops.borrow_mut().remove(&account_id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        if let Some(stop) = state.outbox_stops.borrow_mut().remove(&account_id) {
                             stop.store(true, Ordering::Relaxed);
                         }
                         state
@@ -1922,6 +2214,12 @@ fn open_compose(state: Rc<AppState>) {
 enum ComposeContext {
     Reply { message: Message, reply_all: bool },
     Forward(Message),
+}
+
+#[derive(Debug)]
+enum SendDisposition {
+    Sent,
+    Queued { retryable: bool },
 }
 
 fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext>) {
@@ -2183,6 +2481,10 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             compose_status.set_text("Add an account before sending.");
             return;
         };
+        let Some(account_id) = account.id else {
+            compose_status.set_text("This account is not ready to send mail yet.");
+            return;
+        };
         let cc_values = cc
             .text()
             .split(',')
@@ -2193,11 +2495,12 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         button.set_sensitive(false);
         compose_status.set_text("Sending securely…");
         let (sender, receiver) = async_channel::bounded(1);
+        let database = state_for_send.database.clone();
         std::thread::spawn(move || {
             let result = mail::credentials::load_password(&account.email, "smtp")
                 .map_err(|error| error.to_string())
                 .and_then(|password| {
-                    mail::smtp::send_text_with_attachments(
+                    match mail::smtp::send_text_with_attachments(
                         &account,
                         &password,
                         &to_value,
@@ -2205,8 +2508,30 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                         &subject_value,
                         &body_value,
                         &attachments,
-                    )
-                    .map_err(|error| error.to_string())
+                    ) {
+                        Ok(()) => Ok(SendDisposition::Sent),
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            let retryable = error.is_retryable();
+                            mail::outbox::queue_failed_send(
+                                &database,
+                                account_id,
+                                &to_value,
+                                &cc_values,
+                                &subject_value,
+                                &body_value,
+                                &attachments,
+                                &error_text,
+                                retryable,
+                            )
+                            .map(|_| SendDisposition::Queued { retryable })
+                            .map_err(|queue_error| {
+                                format!(
+                                    "{error_text}; also could not save it to Outbox: {queue_error}"
+                                )
+                            })
+                        }
+                    }
                 });
             let _ = sender.send_blocking(result);
         });
@@ -2217,7 +2542,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let draft_id = draft_id_for_send.clone();
         glib::MainContext::default().spawn_local(async move {
             match receiver.recv().await {
-                Ok(Ok(())) => {
+                Ok(Ok(SendDisposition::Sent)) => {
                     if let Some(draft_id) = draft_id.get() {
                         let database = state.database.clone();
                         std::thread::spawn(move || {
@@ -2225,6 +2550,24 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                         });
                     }
                     set_status(&state, "Message sent");
+                    window.close();
+                }
+                Ok(Ok(SendDisposition::Queued { retryable })) => {
+                    if let Some(draft_id) = draft_id.get() {
+                        let database = state.database.clone();
+                        std::thread::spawn(move || {
+                            let _ = database.delete_message(draft_id);
+                        });
+                    }
+                    refresh_cached_view(&state);
+                    set_status(
+                        &state,
+                        if retryable {
+                            "Message saved to Outbox; it will retry when online"
+                        } else {
+                            "Message saved to Outbox; fix the issue and choose Retry now"
+                        },
+                    );
                     window.close();
                 }
                 Ok(Err(error)) => {
