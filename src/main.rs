@@ -2,6 +2,7 @@ mod app;
 mod database;
 mod mail;
 mod models;
+mod preferences;
 mod theme;
 mod ui;
 

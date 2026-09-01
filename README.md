@@ -84,6 +84,9 @@ isolated Secret Service slots; the account flow accepts either credential type,
 while provider browser authorization is intentionally not hard-coded into the
 source tree. The local database is at
 `$XDG_DATA_HOME/omarchy-mail/mail.db` or `~/.local/share/omarchy-mail/mail.db`.
+Non-secret preferences, including per-account signatures, are stored at
+`$XDG_CONFIG_HOME/omarchy-mail/preferences.json` or
+`~/.config/omarchy-mail/preferences.json`.
 
 ## Theme integration
 

@@ -4,6 +4,7 @@ use crate::models::{
     Account, AttachmentInfo, AuthMethod, MailFolder, Message, PendingSend, SecurityMode,
     ServerConfig,
 };
+use crate::preferences;
 use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
@@ -21,6 +22,7 @@ struct AppState {
     window: adw::ApplicationWindow,
     database: Database,
     accounts: RefCell<Vec<Account>>,
+    preferences: RefCell<preferences::Preferences>,
     folders: RefCell<Vec<MailFolder>>,
     messages: RefCell<Vec<Message>>,
     sidebar: gtk::Box,
@@ -129,6 +131,7 @@ pub fn build_window(application: &adw::Application) {
         window: window.clone(),
         database,
         accounts: RefCell::new(accounts),
+        preferences: RefCell::new(preferences::load()),
         folders: RefCell::new(folders),
         messages: RefCell::new(messages),
         sidebar,
@@ -777,7 +780,12 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         return;
     }
     visible.sort_by(compare_received_newest);
-    for message in group_messages(visible).iter() {
+    let visible = if state.preferences.borrow().conversation_view {
+        group_messages(visible)
+    } else {
+        visible
+    };
+    for message in visible.iter() {
         let (row, star) = message_row(message);
         let message_id = message.id;
         let state_for_star = state.clone();
@@ -2211,20 +2219,60 @@ fn open_settings(state: Rc<AppState>) {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let label = gtk::Label::new(Some(&account.email));
         label.set_xalign(0.0);
-        label.set_hexpand(true);
+        label.set_width_chars(18);
         label.add_css_class("mail-reader-meta");
+        let signature_value = state
+            .preferences
+            .borrow()
+            .signatures
+            .get(&account.email)
+            .cloned()
+            .unwrap_or_default();
+        let signature = gtk::TextView::new();
+        signature.set_wrap_mode(gtk::WrapMode::WordChar);
+        signature.set_size_request(-1, 44);
+        signature.buffer().set_text(&signature_value);
+        signature.add_css_class("mail-settings-signature");
+        signature.set_hexpand(true);
+        signature.set_tooltip_text(Some(
+            "Signature (optional; leave empty to use the account identity)",
+        ));
+        let state_for_signature = state.clone();
+        let email_for_signature = account.email.clone();
+        let signature_for_callback = signature.clone();
+        signature.buffer().connect_changed(move |_| {
+            let result = {
+                let mut preferences = state_for_signature.preferences.borrow_mut();
+                let value = text_view_contents(&signature_for_callback);
+                if value.trim().is_empty() {
+                    preferences.signatures.remove(&email_for_signature);
+                } else {
+                    preferences
+                        .signatures
+                        .insert(email_for_signature.clone(), value);
+                }
+                preferences::save(&preferences)
+            };
+            if let Err(error) = result {
+                set_status(
+                    &state_for_signature,
+                    &format!("Couldn’t save preferences: {error}"),
+                );
+            }
+        });
         let remove = gtk::Button::with_label("Remove");
         remove.add_css_class("mail-danger");
         let state_for_remove = state.clone();
+        let account_email = account.email.clone();
         remove.connect_clicked(move |button| {
             let Some(account_id) = account.id else {
                 set_status(&state_for_remove, "This account has no local id yet");
                 return;
             };
             button.set_sensitive(false);
-            let account_email = account.email.clone();
             let database = state_for_remove.database.clone();
             let queued_sends = database.pending_sends(Some(account_id)).unwrap_or_default();
+            let account_email = account_email.clone();
             let (sender, receiver) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let result = mail::credentials::delete_auth_materials(&account_email, "imap")
@@ -2270,6 +2318,7 @@ fn open_settings(state: Rc<AppState>) {
             });
         });
         row.append(&label);
+        row.append(&signature);
         row.append(&remove);
         account_list.append(&row);
     }
@@ -2280,15 +2329,30 @@ fn open_settings(state: Rc<AppState>) {
     reading.add_css_class("mail-section-label");
     reading.set_margin_top(24);
     root.append(&reading);
-    root.append(&switch_row("Block remote images by default", true));
-    root.append(&switch_row("Group messages into conversations", true));
+    root.append(&preference_switch_row(
+        &state,
+        "Block remote images by default",
+        state.preferences.borrow().block_remote_images,
+        |preferences, active| preferences.block_remote_images = active,
+    ));
+    root.append(&preference_switch_row(
+        &state,
+        "Group messages into conversations",
+        state.preferences.borrow().conversation_view,
+        |preferences, active| preferences.conversation_view = active,
+    ));
 
     let composing = gtk::Label::new(Some("COMPOSING"));
     composing.set_xalign(0.0);
     composing.add_css_class("mail-section-label");
     composing.set_margin_top(24);
     root.append(&composing);
-    root.append(&switch_row("Ask before sending in plain text", false));
+    root.append(&preference_switch_row(
+        &state,
+        "Ask before sending in plain text",
+        state.preferences.borrow().plain_text_warning,
+        |preferences, active| preferences.plain_text_warning = active,
+    ));
 
     let close = gtk::Button::with_label("Done");
     close.set_halign(gtk::Align::End);
@@ -3166,12 +3230,10 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             status_for_signature.set_text("Add an account before inserting a signature.");
             return;
         };
-        let name = if account.display_name.trim().is_empty() {
-            account.email.clone()
-        } else {
-            account.display_name.clone()
-        };
-        let signature = format!("-- \n{name}");
+        let signature = state_for_signature
+            .preferences
+            .borrow()
+            .signature_for(&account);
         let current = text_view_contents(&body_for_signature);
         if current.contains(&signature) {
             status_for_signature.set_text("That signature is already in the message.");
@@ -3538,7 +3600,10 @@ fn form_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     row
 }
 
-fn switch_row(label: &str, active: bool) -> gtk::Box {
+fn preference_switch_row<F>(state: &Rc<AppState>, label: &str, active: bool, setter: F) -> gtk::Box
+where
+    F: Fn(&mut preferences::Preferences, bool) + 'static,
+{
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.set_margin_top(10);
     let text = gtk::Label::new(Some(label));
@@ -3546,6 +3611,17 @@ fn switch_row(label: &str, active: bool) -> gtk::Box {
     text.set_hexpand(true);
     let switcher = gtk::Switch::new();
     switcher.set_active(active);
+    let state = state.clone();
+    switcher.connect_active_notify(move |switcher| {
+        let result = {
+            let mut preferences = state.preferences.borrow_mut();
+            setter(&mut preferences, switcher.is_active());
+            preferences::save(&preferences)
+        };
+        if let Err(error) = result {
+            set_status(&state, &format!("Couldn’t save preferences: {error}"));
+        }
+    });
     row.append(&text);
     row.append(&switcher);
     row

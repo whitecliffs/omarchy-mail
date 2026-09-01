@@ -43,6 +43,10 @@ Service under the `org.omarchy.Mail` service name, with separate
 credentials are written to logs by default. Attachment bytes are disposable
 cache data under `XDG_CACHE_HOME/omarchy-mail/attachments/` and their safe
 filenames and metadata are retained with the cached message in SQLite.
+Non-secret display and composing preferences use
+`XDG_CONFIG_HOME/omarchy-mail/preferences.json`; signatures are keyed by
+account email so changing a server password does not affect them. Missing or
+invalid preferences fall back to privacy-first defaults.
 Queued outgoing messages are durable user data in the `pending_sends` table;
 their selected attachments are copied to
 `XDG_DATA_HOME/omarchy-mail/outbox/` before the queue row is committed. This
