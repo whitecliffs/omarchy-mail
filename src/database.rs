@@ -1,4 +1,4 @@
-use crate::models::{Account, MailFolder, Message, ServerConfig};
+use crate::models::{Account, MailFolder, Message, PendingAction, ServerConfig};
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::fs;
@@ -311,6 +311,38 @@ impl Database {
         Ok(())
     }
 
+    pub fn pending_actions(&self, account_id: i64) -> Result<Vec<PendingAction>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT p.id, p.account_id, p.message_id, p.action, p.payload_json,
+                    m.folder, m.remote_uid, m.uidvalidity
+             FROM pending_actions p
+             LEFT JOIN messages m ON m.id = p.message_id
+             WHERE p.account_id = ?1
+             ORDER BY p.id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok(PendingAction {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                message_id: row.get(2)?,
+                action: row.get(3)?,
+                payload_json: row.get(4)?,
+                folder: row.get(5)?,
+                remote_uid: row.get(6)?,
+                uidvalidity: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn delete_pending_action(&self, action_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute("DELETE FROM pending_actions WHERE id = ?1", [action_id])?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -447,6 +479,44 @@ mod tests {
             })
             .expect("read action");
         assert_eq!(action, "move");
+    }
+
+    #[test]
+    fn loads_action_with_remote_message_identity() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("save account");
+        let mut message = Message::demo_messages().remove(0);
+        message.account_id = Some(account_id);
+        message.remote_uid = Some(42);
+        message.uidvalidity = Some(7);
+        database.upsert_messages(&[message]).expect("save message");
+        database
+            .queue_action(
+                Some(account_id),
+                Some(1),
+                "read",
+                r#"{"value":false,"folder":"Inbox"}"#,
+            )
+            .expect("queue action");
+
+        let actions = database.pending_actions(account_id).expect("load actions");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].remote_uid, Some(42));
+        assert_eq!(actions[0].uidvalidity, Some(7));
+        assert_eq!(actions[0].folder.as_deref(), Some("Inbox"));
+
+        database
+            .delete_pending_action(actions[0].id)
+            .expect("delete action");
+        assert!(
+            database
+                .pending_actions(account_id)
+                .expect("reload actions")
+                .is_empty()
+        );
     }
 
     #[test]

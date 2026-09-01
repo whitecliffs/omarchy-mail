@@ -44,6 +44,18 @@ pub struct MailFolder {
     pub unread_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAction {
+    pub id: i64,
+    pub account_id: i64,
+    pub message_id: Option<i64>,
+    pub action: String,
+    pub payload_json: String,
+    pub folder: Option<String>,
+    pub remote_uid: Option<u32>,
+    pub uidvalidity: Option<u32>,
+}
+
 impl ServerConfig {
     pub fn imap_defaults(domain: &str, username: &str) -> Self {
         Self {

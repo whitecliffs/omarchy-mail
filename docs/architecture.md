@@ -15,8 +15,8 @@ without making the GTK main loop responsible for network activity.
 - `mail/mime.rs` parses MIME messages and sanitises HTML before the UI sees it.
 - `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
   worker threads, with transport-aware IMAP connections, mailbox discovery,
-  bounded folder fetches, reconnect retries, attachments, and per-account
-  error reports.
+  bounded folder fetches, reconnect retries, queued action reconciliation,
+  attachments, and per-account error reports.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the first vertical slice of the desktop experience.
@@ -30,9 +30,11 @@ Service under the `org.omarchy.Mail` service name, with separate
 credentials are written to logs by default.
 
 The database is a cache/state store, not an authority over the IMAP server.
-Remote UID/UIDVALIDITY columns and pending actions are reserved for safe
-reconciliation in the synchronisation worker. Server folder metadata is
-stored separately from message rows so remote names such as
+Remote UID/UIDVALIDITY columns identify queued actions safely; the
+synchronisation worker deletes an action only after the IMAP server accepts
+it. A UIDVALIDITY mismatch leaves the action queued rather than risking a
+change to a recycled UID. Server folder metadata is stored separately from
+message rows so remote names such as
 `[Gmail]/Sent Mail` can be preserved while the UI stays calm. Local drafts
 are stored as messages in the `Drafts` folder and are included in the FTS index.
 

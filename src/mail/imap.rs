@@ -1,8 +1,9 @@
 use crate::mail::mime;
-use crate::models::{Account, Message, SecurityMode};
+use crate::models::{Account, MailFolder, Message, PendingAction, SecurityMode};
 use chrono::Utc;
 use imap::types::{Fetch, Name, NameAttribute};
 use native_tls::TlsConnector;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use thiserror::Error;
@@ -15,6 +16,8 @@ pub enum ImapError {
     Protocol(String),
     #[error("message parsing failed: {0}")]
     Mime(#[from] mime::MimeError),
+    #[error("queued mail action is invalid: {0}")]
+    InvalidAction(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +123,201 @@ pub fn sync_folder(
         }
     };
     Ok(snapshot.messages)
+}
+
+/// Applies local actions that were recorded while the account was offline.
+/// Actions are deliberately removed from the queue only after the server has
+/// acknowledged them. A UIDVALIDITY change therefore leaves the action queued
+/// instead of risking a change to an unrelated, recycled UID.
+pub fn reconcile_actions(
+    account: &Account,
+    password: &str,
+    actions: &[PendingAction],
+    folders: &[MailFolder],
+) -> Result<Vec<i64>, ImapError> {
+    if actions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            reconcile_client(client, account, password, actions, folders)
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            reconcile_client(client, account, password, actions, folders)
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            reconcile_client(client, account, password, actions, folders)
+        }
+    }
+}
+
+fn reconcile_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    password: &str,
+    actions: &[PendingAction],
+    folders: &[MailFolder],
+) -> Result<Vec<i64>, ImapError> {
+    let mut session = client
+        .login(&account.incoming.username, password)
+        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mut applied = Vec::new();
+    let mut ordered_actions = actions.to_vec();
+    // Flags are applied before moves. This preserves the user's intent even
+    // when several actions were recorded for the same message offline and a
+    // copy operation would otherwise assign it a new UID in the destination.
+    ordered_actions.sort_by_key(|action| (action.action == "move", action.id));
+    let mut move_sources = HashMap::new();
+    for action in actions.iter().filter(|action| action.action == "move") {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&action.payload_json) else {
+            continue;
+        };
+        if let (Some(message_id), Some(source_folder)) = (
+            action.message_id,
+            payload
+                .get("source_folder")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            move_sources
+                .entry(message_id)
+                .or_insert_with(|| source_folder.to_string());
+        }
+    }
+
+    for action in &ordered_actions {
+        let Some(remote_uid) = action.remote_uid else {
+            continue;
+        };
+        let payload = serde_json::from_str::<serde_json::Value>(&action.payload_json)
+            .map_err(|error| ImapError::InvalidAction(error.to_string()))?;
+        let uid_set = remote_uid.to_string();
+
+        match action.action.as_str() {
+            "read" | "star" => {
+                let local_folder = payload
+                    .get("folder")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|folder| {
+                        let moved = action
+                            .message_id
+                            .map(|message_id| move_sources.contains_key(&message_id))
+                            .unwrap_or(false);
+                        if moved { None } else { Some(folder) }
+                    })
+                    .or_else(|| {
+                        action
+                            .message_id
+                            .and_then(|message_id| move_sources.get(&message_id))
+                            .map(String::as_str)
+                    })
+                    .or(action.folder.as_deref())
+                    .unwrap_or("Inbox");
+                let remote_folder = remote_name_for_local(folders, account.id, local_folder)
+                    .ok_or_else(|| {
+                        ImapError::InvalidAction(format!("unknown mailbox: {local_folder}"))
+                    })?;
+                let mailbox = session
+                    .select(&remote_folder)
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                if mailbox.uid_validity != action.uidvalidity {
+                    continue;
+                }
+                let value = payload
+                    .get("value")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        ImapError::InvalidAction(format!("missing value for {}", action.action))
+                    })?;
+                let flag = match (action.action.as_str(), value) {
+                    ("read", true) => "+FLAGS (\\Seen)",
+                    ("read", false) => "-FLAGS (\\Seen)",
+                    ("star", true) => "+FLAGS (\\Flagged)",
+                    ("star", false) => "-FLAGS (\\Flagged)",
+                    _ => unreachable!(),
+                };
+                session
+                    .uid_store(&uid_set, flag)
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                applied.push(action.id);
+            }
+            "move" => {
+                let Some(source_folder) = payload
+                    .get("source_folder")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    // Older queue entries did not record the source mailbox;
+                    // keep them queued rather than guessing dangerously.
+                    continue;
+                };
+                let target_folder = payload
+                    .get("folder")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ImapError::InvalidAction("move has no target".into()))?;
+                let source_remote = remote_name_for_local(folders, account.id, source_folder)
+                    .ok_or_else(|| {
+                        ImapError::InvalidAction(format!("unknown mailbox: {source_folder}"))
+                    })?;
+                let target_remote = remote_name_for_local(folders, account.id, target_folder)
+                    .ok_or_else(|| {
+                        ImapError::InvalidAction(format!("unknown mailbox: {target_folder}"))
+                    })?;
+                let mailbox = session
+                    .select(&source_remote)
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                if mailbox.uid_validity != action.uidvalidity {
+                    continue;
+                }
+                session
+                    .uid_copy(&uid_set, &target_remote)
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                session
+                    .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                session
+                    .uid_expunge(&uid_set)
+                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                applied.push(action.id);
+            }
+            other => {
+                return Err(ImapError::InvalidAction(other.to_string()));
+            }
+        }
+    }
+    let _ = session.logout();
+    Ok(applied)
+}
+
+fn remote_name_for_local(
+    folders: &[MailFolder],
+    account_id: Option<i64>,
+    local_name: &str,
+) -> Option<String> {
+    if let Some(folder) = folders.iter().find(|folder| {
+        Some(folder.account_id) == account_id && folder.name.eq_ignore_ascii_case(local_name)
+    }) {
+        return Some(folder.remote_name.clone());
+    }
+    match local_name.to_ascii_lowercase().as_str() {
+        "inbox" => Some("INBOX".into()),
+        "sent" => Some("Sent".into()),
+        "drafts" => Some("Drafts".into()),
+        "archive" => Some("Archive".into()),
+        "trash" => Some("Trash".into()),
+        "spam" => Some("Spam".into()),
+        _ => None,
+    }
 }
 
 fn sync_client<T: Read + Write>(
@@ -234,7 +432,7 @@ fn message_from_fetch(
     let Some(remote_uid) = fetch.uid else {
         return Ok(None);
     };
-    let id = stable_id(account_id, remote_uid, uidvalidity);
+    let id = stable_id(account_id, folder, remote_uid, uidvalidity);
     let thread_key = parsed
         .references
         .last()
@@ -274,8 +472,11 @@ fn message_from_fetch(
     }))
 }
 
-pub fn stable_id(account_id: Option<i64>, uid: u32, uidvalidity: Option<u32>) -> i64 {
+pub fn stable_id(account_id: Option<i64>, folder: &str, uid: u32, uidvalidity: Option<u32>) -> i64 {
     let mut value = account_id.unwrap_or_default() as u64;
+    for byte in folder.as_bytes() {
+        value = value.wrapping_mul(1_000_003).wrapping_add(*byte as u64);
+    }
     value = value.wrapping_mul(1_000_003).wrapping_add(uid as u64);
     value = value
         .wrapping_mul(1_000_003)
@@ -309,12 +510,16 @@ mod tests {
     #[test]
     fn stable_ids_are_repeatable() {
         assert_eq!(
-            stable_id(Some(4), 12, Some(9)),
-            stable_id(Some(4), 12, Some(9))
+            stable_id(Some(4), "Inbox", 12, Some(9)),
+            stable_id(Some(4), "Inbox", 12, Some(9))
         );
         assert_ne!(
-            stable_id(Some(4), 12, Some(9)),
-            stable_id(Some(4), 13, Some(9))
+            stable_id(Some(4), "Inbox", 12, Some(9)),
+            stable_id(Some(4), "Inbox", 13, Some(9))
+        );
+        assert_ne!(
+            stable_id(Some(4), "Inbox", 12, Some(9)),
+            stable_id(Some(4), "Archive", 12, Some(9))
         );
     }
 

@@ -13,7 +13,9 @@ per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, and Omarchy theme integration. Full folder reconciliation, live
 conversation rendering, OAuth2, durable attachment caching/downloads, and a
-full offline outbox remain explicit follow-up milestones.
+full offline outbox remain explicit follow-up milestones. Read/star/move
+actions are queued locally and replayed after reconnect when the recorded
+mailbox UIDVALIDITY still matches the server.
 
 ## Build and preview
 

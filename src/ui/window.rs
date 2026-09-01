@@ -777,28 +777,28 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
     let mut persist = None;
     match action {
         "read" => {
-            let unread = {
+            let (unread, folder) = {
                 let mut messages = state.messages.borrow_mut();
                 let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
                 else {
                     return;
                 };
                 message.unread = !message.unread;
-                message.unread
+                (message.unread, message.folder.clone())
             };
-            persist = Some(("read", unread));
+            persist = Some(("read", unread, folder));
         }
         "star" => {
-            let starred = {
+            let (starred, folder) = {
                 let mut messages = state.messages.borrow_mut();
                 let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
                 else {
                     return;
                 };
                 message.starred = !message.starred;
-                message.starred
+                (message.starred, message.folder.clone())
             };
-            persist = Some(("star", starred));
+            persist = Some(("star", starred, folder));
         }
         "archive" | "trash" => {
             let folder = if action == "archive" {
@@ -806,15 +806,16 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
             } else {
                 "Trash"
             };
-            let account_id = {
+            let (account_id, source_folder) = {
                 let mut messages = state.messages.borrow_mut();
                 let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
                 else {
                     return;
                 };
                 let account_id = message.account_id;
+                let source_folder = message.folder.clone();
                 message.folder = folder.to_string();
-                account_id
+                (account_id, source_folder)
             };
             let database = state.database.clone();
             let folder = folder.to_string();
@@ -824,7 +825,11 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
                     account_id,
                     Some(message_id),
                     "move",
-                    &serde_json::json!({ "folder": folder }).to_string(),
+                    &serde_json::json!({
+                        "folder": folder,
+                        "source_folder": source_folder,
+                    })
+                    .to_string(),
                 );
             });
             set_status(
@@ -840,7 +845,7 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
         }
         _ => {}
     }
-    if let Some((kind, value)) = persist {
+    if let Some((kind, value, folder)) = persist {
         let database = state.database.clone();
         let account_id = state
             .messages
@@ -858,7 +863,7 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
                 account_id,
                 Some(message_id),
                 kind,
-                &serde_json::json!({ "value": value }).to_string(),
+                &serde_json::json!({ "value": value, "folder": folder }).to_string(),
             );
         });
         set_status(state, "Message updated");

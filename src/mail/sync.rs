@@ -44,6 +44,8 @@ pub fn spawn_account_sync(
     thread::spawn(move || {
         let report = match credentials::load_password(&account.email, "imap") {
             Ok(password) => {
+                let reconciliation_error =
+                    reconcile_pending_actions(&account, &password, &database);
                 let mut last_error = None;
                 let mut report = None;
                 for attempt in 0..3 {
@@ -72,14 +74,21 @@ pub fn spawn_account_sync(
                                                 email: account.email.clone(),
                                                 fetched,
                                                 new_messages,
-                                                error: None,
+                                                error: reconciliation_error.clone(),
                                             },
                                             Err(error) => SyncReport {
                                                 account_id: account.id,
                                                 email: account.email.clone(),
                                                 fetched,
                                                 new_messages,
-                                                error: Some(error.to_string()),
+                                                error: Some(
+                                                    match reconciliation_error.as_deref() {
+                                                        Some(reconciliation_error) => format!(
+                                                            "{error}; {reconciliation_error}"
+                                                        ),
+                                                        None => error.to_string(),
+                                                    },
+                                                ),
                                             },
                                         },
                                         None => SyncReport {
@@ -87,7 +96,7 @@ pub fn spawn_account_sync(
                                             email: account.email.clone(),
                                             fetched,
                                             new_messages,
-                                            error: None,
+                                            error: reconciliation_error.clone(),
                                         },
                                     }
                                 }
@@ -127,6 +136,38 @@ pub fn spawn_account_sync(
         };
         let _ = sender.send_blocking(report);
     });
+}
+
+fn reconcile_pending_actions(
+    account: &Account,
+    password: &str,
+    database: &Database,
+) -> Option<String> {
+    let Some(account_id) = account.id else {
+        return None;
+    };
+    let actions = match database.pending_actions(account_id) {
+        Ok(actions) => actions,
+        Err(error) => return Some(format!("Could not load queued mail changes: {error}")),
+    };
+    if actions.is_empty() {
+        return None;
+    }
+    let folders = match database.load_folders() {
+        Ok(folders) => folders,
+        Err(error) => return Some(format!("Could not load mailboxes: {error}")),
+    };
+    match imap::reconcile_actions(account, password, &actions, &folders) {
+        Ok(applied) => {
+            for action_id in applied {
+                if let Err(error) = database.delete_pending_action(action_id) {
+                    return Some(format!("Could not clear queued mail change: {error}"));
+                }
+            }
+            None
+        }
+        Err(error) => Some(format!("Queued mail changes will retry: {error}")),
+    }
 }
 
 pub fn spawn_folder_sync(
