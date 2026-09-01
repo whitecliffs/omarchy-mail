@@ -4,7 +4,7 @@ use crate::models::{Account, AttachmentInfo, MailFolder, Message, SecurityMode, 
 use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -1634,6 +1634,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     body.buffer().set_text(&initial_body);
     root.append(&body);
     let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
     let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     attachment_list.set_hexpand(true);
     root.append(&attachment_list);
@@ -1693,46 +1694,64 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     });
 
     let state_for_draft = state.clone();
-    let database_for_draft = state.database.clone();
+    let draft_id_for_manual = draft_id.clone();
     let account_selector_for_draft = account_selector.clone();
     let to_for_draft = to.clone();
+    let cc_for_draft = cc.clone();
     let subject_for_draft = subject.clone();
     let body_for_draft = body.clone();
     let compose_status_for_draft = compose_status.clone();
     draft.connect_clicked(move |_| {
-        let account_id = state_for_draft
-            .accounts
-            .borrow()
-            .get(account_selector_for_draft.selected() as usize)
-            .and_then(|account| account.id);
-        let recipients = to_for_draft.text().trim().to_string();
-        let subject = subject_for_draft.text().to_string();
-        let body = text_view_contents(&body_for_draft);
-        compose_status_for_draft.set_text("Saving draft…");
-        let (sender, receiver) = async_channel::bounded(1);
-        let database = database_for_draft.clone();
-        std::thread::spawn(move || {
-            let result = database
-                .save_draft(account_id, &recipients, &subject, &body)
-                .map_err(|error| error.to_string());
-            let _ = sender.send_blocking(result);
-        });
-        let compose_status = compose_status_for_draft.clone();
-        glib::MainContext::default().spawn_local(async move {
-            match receiver.recv().await {
-                Ok(Ok(_)) => compose_status.set_text("Draft saved locally"),
-                Ok(Err(error)) => {
-                    compose_status.set_text(&format!("Couldn’t save this draft: {error}"))
-                }
-                Err(_) => compose_status.set_text("The draft worker stopped unexpectedly."),
-            }
-        });
+        save_draft_async(
+            state_for_draft.clone(),
+            draft_id_for_manual.clone(),
+            account_selector_for_draft.clone(),
+            to_for_draft.clone(),
+            cc_for_draft.clone(),
+            subject_for_draft.clone(),
+            body_for_draft.clone(),
+            compose_status_for_draft.clone(),
+            "Saving draft…",
+        );
     });
+
+    let draft_revision = Rc::new(Cell::new(0_u64));
+    let schedule_autosave: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let draft_id = draft_id.clone();
+        let account_selector = account_selector.clone();
+        let to = to.clone();
+        let cc = cc.clone();
+        let subject = subject.clone();
+        let body = body.clone();
+        let status = compose_status.clone();
+        let revision = draft_revision.clone();
+        Rc::new(move || {
+            schedule_draft_autosave(
+                state.clone(),
+                draft_id.clone(),
+                account_selector.clone(),
+                to.clone(),
+                cc.clone(),
+                subject.clone(),
+                body.clone(),
+                status.clone(),
+                revision.clone(),
+            )
+        })
+    };
+    for entry in [&to, &cc, &subject] {
+        let schedule = schedule_autosave.clone();
+        entry.connect_changed(move |_| schedule());
+    }
+    let schedule = schedule_autosave.clone();
+    body.buffer().connect_changed(move |_| schedule());
 
     let state_for_send = state.clone();
     let window_for_send = window.clone();
     let account_selector_for_send = account_selector.clone();
     let attachments_for_send = attachment_paths.clone();
+    let draft_id_for_send = draft_id.clone();
     send.connect_clicked(move |button| {
         let to_value = to.text().trim().to_string();
         if to_value.is_empty() {
@@ -1743,6 +1762,12 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let body_value = text_view_contents(&body);
         let attachments = attachments_for_send.borrow().clone();
         if state_for_send.demo_mode {
+            if let Some(draft_id) = draft_id_for_send.get() {
+                let database = state_for_send.database.clone();
+                std::thread::spawn(move || {
+                    let _ = database.delete_message(draft_id);
+                });
+            }
             set_status(&state_for_send, "Preview message queued");
             window_for_send.close();
             return;
@@ -1788,9 +1813,16 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let window = window_for_send.clone();
         let button = button.clone();
         let compose_status = compose_status.clone();
+        let draft_id = draft_id_for_send.clone();
         glib::MainContext::default().spawn_local(async move {
             match receiver.recv().await {
                 Ok(Ok(())) => {
+                    if let Some(draft_id) = draft_id.get() {
+                        let database = state.database.clone();
+                        std::thread::spawn(move || {
+                            let _ = database.delete_message(draft_id);
+                        });
+                    }
                     set_status(&state, "Message sent");
                     window.close();
                 }
@@ -1808,6 +1840,91 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let _ = attach;
     window.set_content(Some(&root));
     window.present();
+}
+
+fn schedule_draft_autosave(
+    state: Rc<AppState>,
+    draft_id: Rc<Cell<Option<i64>>>,
+    account_selector: gtk::DropDown,
+    to: gtk::Entry,
+    cc: gtk::Entry,
+    subject: gtk::Entry,
+    body: gtk::TextView,
+    status: gtk::Label,
+    revision: Rc<Cell<u64>>,
+) {
+    let token = revision.get().wrapping_add(1);
+    revision.set(token);
+    glib::timeout_add_local_once(Duration::from_secs(2), move || {
+        if revision.get() == token {
+            save_draft_async(
+                state,
+                draft_id,
+                account_selector,
+                to,
+                cc,
+                subject,
+                body,
+                status,
+                "Saving draft…",
+            );
+        }
+    });
+}
+
+fn save_draft_async(
+    state: Rc<AppState>,
+    draft_id: Rc<Cell<Option<i64>>>,
+    account_selector: gtk::DropDown,
+    to: gtk::Entry,
+    cc: gtk::Entry,
+    subject: gtk::Entry,
+    body: gtk::TextView,
+    status: gtk::Label,
+    status_text: &'static str,
+) {
+    let to_value = to.text().trim().to_string();
+    let cc_value = cc.text().trim().to_string();
+    let recipients = match (to_value.is_empty(), cc_value.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => to_value,
+        (true, false) => format!("Cc: {cc_value}"),
+        (false, false) => format!("{to_value}\nCc: {cc_value}"),
+    };
+    let subject = subject.text().to_string();
+    let body = text_view_contents(&body);
+    if recipients.is_empty() && subject.trim().is_empty() && body.trim().is_empty() {
+        return;
+    }
+    let account_id = state
+        .accounts
+        .borrow()
+        .get(account_selector.selected() as usize)
+        .and_then(|account| account.id);
+    let existing_id = draft_id.get();
+    let database = state.database.clone();
+    status.set_text(status_text);
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = match existing_id {
+            Some(existing_id) => {
+                database.update_draft(existing_id, account_id, &recipients, &subject, &body)
+            }
+            None => database.save_draft(account_id, &recipients, &subject, &body),
+        }
+        .map_err(|error| error.to_string());
+        let _ = sender.send_blocking(result);
+    });
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(id)) => {
+                draft_id.set(Some(id));
+                status.set_text("Draft saved locally");
+            }
+            Ok(Err(error)) => status.set_text(&format!("Couldn’t save this draft: {error}")),
+            Err(_) => status.set_text("The draft worker stopped unexpectedly."),
+        }
+    });
 }
 
 fn text_view_contents(view: &gtk::TextView) -> String {

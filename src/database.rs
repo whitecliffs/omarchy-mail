@@ -197,6 +197,37 @@ impl Database {
         Ok(id)
     }
 
+    pub fn update_draft(
+        &self,
+        draft_id: i64,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let connection = self.connection()?;
+        let updated = connection.execute(
+            "UPDATE messages
+             SET account_id = ?1, recipients = ?2, subject = ?3, preview = ?4,
+                 body = ?5, received_at = ?6
+             WHERE id = ?7 AND folder = 'Drafts'",
+            params![
+                account_id,
+                recipients,
+                subject,
+                body.chars().take(160).collect::<String>(),
+                body,
+                Utc::now().to_rfc3339(),
+                draft_id,
+            ],
+        )?;
+        if updated > 0 {
+            return Ok(draft_id);
+        }
+        drop(connection);
+        self.save_draft(account_id, recipients, subject, body)
+    }
+
     pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -577,5 +608,21 @@ mod tests {
         assert_eq!(drafts[0].recipients, "jane@example.com");
         assert_eq!(drafts[0].body, "I will finish this later.");
         assert!(!drafts[0].unread);
+
+        database
+            .update_draft(
+                draft_id,
+                Some(account_id),
+                "jane@example.com",
+                "An updated thought",
+                "I changed my mind.",
+            )
+            .expect("update draft");
+        let drafts = database
+            .list_messages(Some(account_id), "Drafts")
+            .expect("reload drafts");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].subject, "An updated thought");
+        assert_eq!(drafts[0].body, "I changed my mind.");
     }
 }
