@@ -10,9 +10,10 @@ SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
 fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
 actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, local drafts,
-reply/reply-all/forward prefilling, file attachments, compose/settings
-surfaces, lightweight All/Unread/Starred/Attachment filters, safe inline image
-rendering, attachment re-fetch after cache eviction, a durable offline Outbox,
+reply/reply-all/forward prefilling, file attachments, compose/settings surfaces
+with separate Cc/Bcc fields, lightweight All/Unread/Starred/Attachment filters,
+safe inline image rendering, attachment re-fetch after cache eviction, a durable
+offline Outbox,
 and Omarchy theme integration. The cache now reconciles deleted messages and
 server-side mailbox removals using complete UID/UIDVALIDITY snapshots. IMAP
 and SMTP can use provider-issued OAuth2 access tokens through native XOAUTH2

@@ -595,11 +595,13 @@ fn load_outbox_messages(state: &Rc<AppState>, account_id: Option<i64>) -> Vec<Me
 }
 
 fn pending_send_message(send: &PendingSend, account: &Account) -> Message {
-    let recipients = if send.cc.is_empty() {
-        send.to.clone()
-    } else {
-        format!("{}\nCc: {}", send.to, send.cc.join(", "))
-    };
+    let mut recipients = send.to.clone();
+    if !send.cc.is_empty() {
+        recipients.push_str(&format!("\nCc: {}", send.cc.join(", ")));
+    }
+    if !send.bcc.is_empty() {
+        recipients.push_str(&format!("\nBcc: {}", send.bcc.join(", ")));
+    }
     let attachments = send
         .attachments
         .iter()
@@ -2279,7 +2281,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         return;
     }
 
-    let (initial_to, initial_cc, initial_subject, initial_body) = match context {
+    let (initial_to, initial_cc, initial_bcc, initial_subject, initial_body) = match context {
         Some(ComposeContext::Reply { message, reply_all }) => {
             let subject = if message.subject.to_lowercase().starts_with("re:") {
                 message.subject.clone()
@@ -2301,7 +2303,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 "\n\nOn {}, {} wrote:\n{}",
                 message.received_at, message.sender_name, quoted
             );
-            (message.sender_email, cc, subject, body)
+            (message.sender_email, cc, String::new(), subject, body)
         }
         Some(ComposeContext::Forward(message)) => {
             let subject = if message.subject.to_lowercase().starts_with("fwd:") {
@@ -2317,9 +2319,15 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 message.subject,
                 message.body
             );
-            (String::new(), String::new(), subject, body)
+            (String::new(), String::new(), String::new(), subject, body)
         }
-        None => (String::new(), String::new(), String::new(), String::new()),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
     };
 
     let window = adw::Window::builder()
@@ -2339,7 +2347,12 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     title.add_css_class("mail-reader-subject");
     root.append(&title);
     let to = gtk::Entry::builder().placeholder_text("Recipients").build();
-    let cc = gtk::Entry::builder().placeholder_text("Cc / Bcc").build();
+    let cc = gtk::Entry::builder()
+        .placeholder_text("Carbon copy recipients")
+        .build();
+    let bcc = gtk::Entry::builder()
+        .placeholder_text("Blind carbon copy recipients")
+        .build();
     let subject = gtk::Entry::builder().placeholder_text("Subject").build();
     let account_labels = if state.demo_mode && state.accounts.borrow().is_empty() {
         vec!["Preview account <demo@example.com>".to_string()]
@@ -2367,13 +2380,37 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     root.append(&form_row("From", &account_selector));
     to.set_text(&initial_to);
     cc.set_text(&initial_cc);
+    bcc.set_text(&initial_bcc);
     subject.set_text(&initial_subject);
     root.append(&to);
-    root.append(&cc);
+    let recipient_options = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    recipient_options.set_margin_top(6);
+    let cc_toggle = gtk::ToggleButton::with_label("Cc");
+    let bcc_toggle = gtk::ToggleButton::with_label("Bcc");
+    cc_toggle.set_active(!initial_cc.trim().is_empty());
+    bcc_toggle.set_active(!initial_bcc.trim().is_empty());
+    recipient_options.append(&cc_toggle);
+    recipient_options.append(&bcc_toggle);
+    root.append(&recipient_options);
+    let cc_row = form_row("Cc", &cc);
+    let bcc_row = form_row("Bcc", &bcc);
+    cc_row.set_visible(cc_toggle.is_active());
+    bcc_row.set_visible(bcc_toggle.is_active());
+    root.append(&cc_row);
+    root.append(&bcc_row);
     root.append(&subject);
-    for entry in [&to, &cc, &subject] {
+    for entry in [&to, &cc, &bcc, &subject] {
+        entry.set_hexpand(true);
         entry.set_margin_top(8);
     }
+    let cc_row_for_toggle = cc_row.clone();
+    cc_toggle.connect_toggled(move |button| {
+        cc_row_for_toggle.set_visible(button.is_active());
+    });
+    let bcc_row_for_toggle = bcc_row.clone();
+    bcc_toggle.connect_toggled(move |button| {
+        bcc_row_for_toggle.set_visible(button.is_active());
+    });
     let body = gtk::TextView::new();
     body.set_wrap_mode(gtk::WrapMode::WordChar);
     body.set_vexpand(true);
@@ -2448,6 +2485,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let account_selector_for_draft = account_selector.clone();
     let to_for_draft = to.clone();
     let cc_for_draft = cc.clone();
+    let bcc_for_draft = bcc.clone();
     let subject_for_draft = subject.clone();
     let body_for_draft = body.clone();
     let compose_status_for_draft = compose_status.clone();
@@ -2458,6 +2496,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             account_selector_for_draft.clone(),
             to_for_draft.clone(),
             cc_for_draft.clone(),
+            bcc_for_draft.clone(),
             subject_for_draft.clone(),
             body_for_draft.clone(),
             compose_status_for_draft.clone(),
@@ -2472,6 +2511,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let account_selector = account_selector.clone();
         let to = to.clone();
         let cc = cc.clone();
+        let bcc = bcc.clone();
         let subject = subject.clone();
         let body = body.clone();
         let status = compose_status.clone();
@@ -2483,6 +2523,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 account_selector.clone(),
                 to.clone(),
                 cc.clone(),
+                bcc.clone(),
                 subject.clone(),
                 body.clone(),
                 status.clone(),
@@ -2490,7 +2531,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             )
         })
     };
-    for entry in [&to, &cc, &subject] {
+    for entry in [&to, &cc, &bcc, &subject] {
         let schedule = schedule_autosave.clone();
         entry.connect_changed(move |_| schedule());
     }
@@ -2508,8 +2549,28 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             compose_status.set_text("Add at least one recipient.");
             return;
         }
+        if let Err(error) = mail::validate_recipients(&to_value) {
+            compose_status.set_text(&error);
+            return;
+        }
         let subject_value = subject.text().to_string();
         let body_value = text_view_contents(&body);
+        let cc_value = cc.text().trim().to_string();
+        let bcc_value = bcc.text().trim().to_string();
+        let cc_values = match mail::validate_recipients(&cc_value) {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                compose_status.set_text(&error);
+                return;
+            }
+        };
+        let bcc_values = match mail::validate_recipients(&bcc_value) {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                compose_status.set_text(&error);
+                return;
+            }
+        };
         let attachments = attachments_for_send.borrow().clone();
         if state_for_send.demo_mode {
             if let Some(draft_id) = draft_id_for_send.get() {
@@ -2536,13 +2597,6 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             compose_status.set_text("This account is not ready to send mail yet.");
             return;
         };
-        let cc_values = cc
-            .text()
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
         button.set_sensitive(false);
         compose_status.set_text("Sending securely…");
         let (sender, receiver) = async_channel::bounded(1);
@@ -2562,6 +2616,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                     &auth,
                     &to_value,
                     &cc_values,
+                    &bcc_values,
                     &subject_value,
                     &body_value,
                     &attachments,
@@ -2575,6 +2630,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                             account_id,
                             &to_value,
                             &cc_values,
+                            &bcc_values,
                             &subject_value,
                             &body_value,
                             &attachments,
@@ -2647,6 +2703,7 @@ fn schedule_draft_autosave(
     account_selector: gtk::DropDown,
     to: gtk::Entry,
     cc: gtk::Entry,
+    bcc: gtk::Entry,
     subject: gtk::Entry,
     body: gtk::TextView,
     status: gtk::Label,
@@ -2662,6 +2719,7 @@ fn schedule_draft_autosave(
                 account_selector,
                 to,
                 cc,
+                bcc,
                 subject,
                 body,
                 status,
@@ -2677,6 +2735,7 @@ fn save_draft_async(
     account_selector: gtk::DropDown,
     to: gtk::Entry,
     cc: gtk::Entry,
+    bcc: gtk::Entry,
     subject: gtk::Entry,
     body: gtk::TextView,
     status: gtk::Label,
@@ -2684,12 +2743,8 @@ fn save_draft_async(
 ) {
     let to_value = to.text().trim().to_string();
     let cc_value = cc.text().trim().to_string();
-    let recipients = match (to_value.is_empty(), cc_value.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => to_value,
-        (true, false) => format!("Cc: {cc_value}"),
-        (false, false) => format!("{to_value}\nCc: {cc_value}"),
-    };
+    let bcc_value = bcc.text().trim().to_string();
+    let recipients = compose_recipient_summary(&to_value, &cc_value, &bcc_value);
     let subject = subject.text().to_string();
     let body = text_view_contents(&body);
     if recipients.is_empty() && subject.trim().is_empty() && body.trim().is_empty() {
@@ -2724,6 +2779,20 @@ fn save_draft_async(
             Err(_) => status.set_text("The draft worker stopped unexpectedly."),
         }
     });
+}
+
+fn compose_recipient_summary(to: &str, cc: &str, bcc: &str) -> String {
+    let mut fields = Vec::new();
+    if !to.trim().is_empty() {
+        fields.push(to.trim().to_string());
+    }
+    if !cc.trim().is_empty() {
+        fields.push(format!("Cc: {}", cc.trim()));
+    }
+    if !bcc.trim().is_empty() {
+        fields.push(format!("Bcc: {}", bcc.trim()));
+    }
+    fields.join("\n")
 }
 
 fn text_view_contents(view: &gtk::TextView) -> String {
@@ -2826,5 +2895,21 @@ mod tests {
             ..file.clone()
         };
         assert!(same_attachment(&file, &refreshed_file));
+    }
+
+    #[test]
+    fn preserves_compose_recipient_fields_without_leaking_empty_rows() {
+        assert_eq!(
+            compose_recipient_summary(
+                "jane@example.com; team@example.com",
+                "copy@example.com",
+                "archive@example.com"
+            ),
+            "jane@example.com; team@example.com\nCc: copy@example.com\nBcc: archive@example.com"
+        );
+        assert_eq!(
+            compose_recipient_summary("jane@example.com", "", ""),
+            "jane@example.com"
+        );
     }
 }

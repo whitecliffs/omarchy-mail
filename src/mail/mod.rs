@@ -13,6 +13,27 @@ pub fn valid_email(address: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
+/// Splits the compact address-field syntax used by the composer. Commas and
+/// semicolons are both accepted because users commonly paste either form.
+pub fn split_recipients(value: &str) -> Vec<String> {
+    value
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+pub fn validate_recipients(value: &str) -> Result<Vec<String>, String> {
+    let recipients = split_recipients(value);
+    for recipient in &recipients {
+        recipient
+            .parse::<lettre::message::Mailbox>()
+            .map_err(|_| format!("Check this recipient: {recipient}"))?;
+    }
+    Ok(recipients)
+}
+
 pub fn domain_for(address: &str) -> Option<&str> {
     address.trim().split_once('@').map(|(_, domain)| domain)
 }
@@ -52,6 +73,17 @@ mod tests {
         assert!(!valid_email("jim"));
         assert!(!valid_email("@example.com"));
         assert!(!valid_email("jim@example"));
+    }
+
+    #[test]
+    fn splits_and_validates_pasted_recipient_lists() {
+        let recipients = split_recipients("jane@example.com; Team <team@example.com>");
+        assert_eq!(recipients, ["jane@example.com", "Team <team@example.com>"]);
+        assert_eq!(
+            validate_recipients("jane@example.com,team@example.com").expect("recipients"),
+            ["jane@example.com", "team@example.com"]
+        );
+        assert!(validate_recipients("not-an-address").is_err());
     }
 
     #[test]

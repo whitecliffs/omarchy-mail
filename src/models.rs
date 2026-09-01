@@ -79,6 +79,7 @@ pub struct PendingSend {
     pub account_id: i64,
     pub to: String,
     pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
     pub attachments: Vec<OutgoingAttachment>,

@@ -61,7 +61,9 @@ eviction recoverable without making SQLite authoritative over IMAP.
 SMTP failures caused by network/transport conditions are retried with capped
 backoff by an account-local outbox monitor. Permanent response or local file
 errors remain visible in Outbox until the user chooses Retry now or Discard;
-credentials are never copied into queued message data.
+credentials are never copied into queued message data. Cc and Bcc are stored as
+separate recipient lists; lettre keeps Bcc out of the serialized message while
+including it in the SMTP envelope.
 
 IMAP sync asks each selected mailbox for its complete UID set while fetching
 only a bounded recent window of full messages. After a successful upsert, the

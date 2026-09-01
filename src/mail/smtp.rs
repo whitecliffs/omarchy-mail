@@ -40,6 +40,7 @@ pub fn send_text_with_auth(
     auth: &AuthMaterial,
     to: &str,
     cc: &[String],
+    bcc: &[String],
     subject: &str,
     body: &str,
     attachments: &[PathBuf],
@@ -65,6 +66,7 @@ pub fn send_text_with_auth(
         auth_method,
         to,
         cc,
+        bcc,
         subject,
         body,
         &named_attachments,
@@ -77,11 +79,12 @@ fn send_named_attachments(
     auth_method: AuthMethod,
     to: &str,
     cc: &[String],
+    bcc: &[String],
     subject: &str,
     body: &str,
     attachments: &[(String, PathBuf)],
 ) -> Result<(), SmtpError> {
-    let message = build_message_with_names(account, to, cc, subject, body, attachments)?;
+    let message = build_message_with_names(account, to, cc, bcc, subject, body, attachments)?;
     let credentials = lettre::transport::smtp::authentication::Credentials::new(
         account.outgoing.username.clone(),
         secret.to_string(),
@@ -130,6 +133,7 @@ pub fn send_pending_with_auth(
         auth_method,
         &send.to,
         &send.cc,
+        &send.bcc,
         &send.subject,
         &send.body,
         &attachments,
@@ -140,6 +144,7 @@ fn build_message_with_names(
     account: &Account,
     to: &str,
     cc: &[String],
+    bcc: &[String],
     subject: &str,
     body: &str,
     attachments: &[(String, PathBuf)],
@@ -153,24 +158,28 @@ fn build_message_with_names(
         .from(from)
         .subject(subject)
         .header(ContentType::TEXT_PLAIN);
-    for address in to
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    for address in crate::mail::split_recipients(to) {
         builder = builder.to(address
             .parse()
             .map_err(|_| lettre::error::Error::MissingTo)?);
     }
     for address in cc
         .iter()
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .flat_map(|value| crate::mail::split_recipients(value))
     {
         builder = builder.cc(address
             .parse()
             .map_err(|_| lettre::error::Error::MissingTo)?);
+    }
+    for address in bcc
+        .iter()
+        .flat_map(|value| crate::mail::split_recipients(value))
+    {
+        builder = builder.bcc(
+            address
+                .parse()
+                .map_err(|_| lettre::error::Error::MissingTo)?,
+        );
     }
     let message = if attachments.is_empty() {
         builder.body(body.to_string())?
@@ -217,6 +226,7 @@ mod tests {
             &account,
             "jane@example.com",
             &[],
+            &[],
             "Notes",
             "Hello",
             &[("notes.txt".into(), path)],
@@ -240,6 +250,7 @@ mod tests {
             &account,
             "jane@example.com",
             &[],
+            &["archive@example.com".into()],
             "Notes",
             "Hello",
             &[("notes.txt".into(), path)],
@@ -250,5 +261,12 @@ mod tests {
 
         assert!(formatted.contains("filename=\"notes.txt\""));
         assert!(!formatted.contains("filename=\"000-notes.txt\""));
+        assert!(
+            message
+                .envelope()
+                .to()
+                .iter()
+                .any(|address| address.to_string() == "archive@example.com")
+        );
     }
 }

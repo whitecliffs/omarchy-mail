@@ -93,6 +93,13 @@ impl Database {
                     ON pending_sends(account_id, sent, retryable, next_attempt_at);
                 UPDATE schema_version SET version = 3;",
             )?;
+            version = 3;
+        }
+        if version < 4 {
+            connection.execute_batch(
+                "ALTER TABLE pending_sends ADD COLUMN bcc_json TEXT NOT NULL DEFAULT '[]';
+                 UPDATE schema_version SET version = 4;",
+            )?;
         }
         Ok(())
     }
@@ -449,15 +456,18 @@ impl Database {
         let connection = self.connection()?;
         let cc_json = serde_json::to_string(&send.cc)
             .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
+        let bcc_json = serde_json::to_string(&send.bcc)
+            .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
         let attachments_json = serde_json::to_string(&send.attachments)
             .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
         connection.execute(
-            "INSERT INTO pending_sends(account_id, to_recipients, cc_json, subject, body, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO pending_sends(account_id, to_recipients, cc_json, bcc_json, subject, body, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 send.account_id,
                 send.to,
                 cc_json,
+                bcc_json,
                 send.subject,
                 send.body,
                 attachments_json,
@@ -474,8 +484,8 @@ impl Database {
     pub fn pending_sends(&self, account_id: Option<i64>) -> Result<Vec<PendingSend>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, to_recipients, cc_json, subject, body, attachments_json,
-                    created_at, attempts, retryable, next_attempt_at, last_error
+            "SELECT id, account_id, to_recipients, cc_json, bcc_json, subject, body,
+                    attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
              FROM pending_sends
              WHERE sent = 0 AND (?1 IS NULL OR account_id = ?1)
              ORDER BY created_at, id",
@@ -488,8 +498,8 @@ impl Database {
     pub fn due_pending_sends(&self, account_id: i64) -> Result<Vec<PendingSend>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, to_recipients, cc_json, subject, body, attachments_json,
-                    created_at, attempts, retryable, next_attempt_at, last_error
+            "SELECT id, account_id, to_recipients, cc_json, bcc_json, subject, body,
+                    attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
              FROM pending_sends
              WHERE sent = 0 AND account_id = ?1 AND retryable = 1
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
@@ -628,14 +638,18 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 
 fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSend> {
     let cc_json: String = row.get(3)?;
-    let attachments_json: String = row.get(6)?;
+    let bcc_json: String = row.get(4)?;
+    let attachments_json: String = row.get(7)?;
     let cc = serde_json::from_str(&cc_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let bcc = serde_json::from_str(&bcc_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let attachments =
         serde_json::from_str::<Vec<OutgoingAttachment>>(&attachments_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                7,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -645,14 +659,15 @@ fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSen
         account_id: row.get(1)?,
         to: row.get(2)?,
         cc,
-        subject: row.get(4)?,
-        body: row.get(5)?,
+        bcc,
+        subject: row.get(5)?,
+        body: row.get(6)?,
         attachments,
-        created_at: row.get(7)?,
-        attempts: row.get::<_, i64>(8)?.max(0) as u32,
-        retryable: row.get::<_, i64>(9)? != 0,
-        next_attempt_at: row.get(10)?,
-        last_error: row.get(11)?,
+        created_at: row.get(8)?,
+        attempts: row.get::<_, i64>(9)?.max(0) as u32,
+        retryable: row.get::<_, i64>(10)? != 0,
+        next_attempt_at: row.get(11)?,
+        last_error: row.get(12)?,
     })
 }
 
@@ -673,6 +688,46 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, Some(id));
         assert!(!std::fs::read_to_string(database.path()).is_ok());
+    }
+
+    #[test]
+    fn migrates_the_legacy_outbox_with_a_separate_bcc_list() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("mail.db");
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version(version) VALUES (3);
+                 CREATE TABLE pending_sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    to_recipients TEXT NOT NULL,
+                    cc_json TEXT NOT NULL DEFAULT '[]',
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    attachments_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    retryable INTEGER NOT NULL DEFAULT 1,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    sent INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .expect("create v3 schema");
+        drop(connection);
+
+        let database = Database::open(directory.path()).expect("migrate database");
+        let connection = database.connection().expect("open migrated database");
+        let bcc_column: String = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('pending_sends') WHERE name = 'bcc_json'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bcc migration");
+        assert_eq!(bcc_column, "bcc_json");
     }
 
     #[test]
@@ -819,6 +874,7 @@ mod tests {
             account_id,
             to: "jane@example.com".into(),
             cc: vec!["team@example.com".into()],
+            bcc: vec!["archive@example.com".into()],
             subject: "Offline note".into(),
             body: "This should wait for the network.".into(),
             attachments: vec![OutgoingAttachment {
@@ -838,6 +894,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, id);
         assert_eq!(loaded[0].cc, send.cc);
+        assert_eq!(loaded[0].bcc, send.bcc);
         assert_eq!(loaded[0].attachments, send.attachments);
 
         database
