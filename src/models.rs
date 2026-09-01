@@ -206,7 +206,7 @@ impl Message {
                 preview: "A small set of thoughtful improvements for your desktop...".into(),
                 body: "Hello,\n\nA small set of thoughtful improvements for your desktop has arrived. Thank you for helping shape Omarchy.\n\nThe Omarchy team".into(),
                 body_html: Some(
-                    "<p>A small set of thoughtful improvements for your desktop has arrived.</p><p><img src=\"https://example.com/omarchy-mail-preview.png\" alt=\"Release preview\"></p>".into(),
+                    "<table width=\"620\" cellpadding=\"0\" cellspacing=\"0\"><tr><td style=\"padding:24px\"><p><strong>A small set of thoughtful improvements for your desktop has arrived.</strong></p><p>Thank you for helping shape Omarchy.</p><table width=\"540\"><tr><td style=\"padding:16px\"><img src=\"https://example.com/omarchy-mail-preview.png\" alt=\"Release preview\"></td></tr></table><p><a href=\"https://omarchy.org\">Read the release notes</a></p></td></tr></table>".into(),
                 ),
                 received_at: "Today, 11:08".into(),
                 unread: true,

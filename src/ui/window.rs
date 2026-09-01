@@ -1362,28 +1362,22 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     sender.add_css_class("mail-sender");
     text.append(&sender);
 
-    let summary = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    summary.set_hexpand(true);
-    summary.set_size_request(0, -1);
     let subject = gtk::Label::new(Some(&message.subject));
     subject.set_xalign(0.0);
-    subject.set_hexpand(true);
     subject.set_single_line_mode(true);
     subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
     subject.set_width_chars(1);
     subject.set_size_request(0, -1);
     subject.add_css_class("mail-subject");
-    summary.append(&subject);
+    text.append(&subject);
     let preview = gtk::Label::new(Some(&message.preview));
     preview.set_xalign(0.0);
-    preview.set_hexpand(true);
     preview.set_single_line_mode(true);
     preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
     preview.set_width_chars(1);
     preview.set_size_request(0, -1);
     preview.add_css_class("mail-preview");
-    summary.append(&preview);
-    text.append(&summary);
+    text.append(&preview);
     layout.append(&text);
 
     let trailing = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -2038,11 +2032,391 @@ fn append_html_content(
     message: &Message,
     body_html: &str,
 ) {
+    let document = crate::mail::mime::html_document(body_html);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.add_css_class("mail-html-document");
+    if let crate::mail::mime::HtmlNode::Document(children) = &document {
+        append_html_children(&root, state, message, children);
+    }
+    content.append(&root);
+}
+
+fn append_html_children(
+    parent: &gtk::Box,
+    state: &Rc<AppState>,
+    message: &Message,
+    children: &[crate::mail::mime::HtmlNode],
+) {
+    let mut inline_markup = String::new();
+    for child in children {
+        if is_html_block(child) {
+            append_inline_markup(parent, state, message, &mut inline_markup);
+            parent.append(&render_html_block(state, message, child));
+        } else {
+            inline_markup.push_str(&crate::mail::mime::html_node_markup(child));
+        }
+    }
+    append_inline_markup(parent, state, message, &mut inline_markup);
+}
+
+fn append_inline_markup(
+    parent: &gtk::Box,
+    state: &Rc<AppState>,
+    message: &Message,
+    markup: &mut String,
+) {
+    if markup.is_empty() || markup.trim().is_empty() {
+        markup.clear();
+        return;
+    }
+    append_html_inline(parent, state, message, markup);
+    markup.clear();
+}
+
+fn render_html_block(
+    state: &Rc<AppState>,
+    message: &Message,
+    node: &crate::mail::mime::HtmlNode,
+) -> gtk::Widget {
+    let crate::mail::mime::HtmlNode::Element {
+        name,
+        attributes,
+        children,
+    } = node
+    else {
+        let fallback = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        append_html_children(&fallback, state, message, std::slice::from_ref(node));
+        return fallback.upcast();
+    };
+
+    match name.as_str() {
+        "table" => render_html_table(state, message, attributes, children),
+        "tr" => render_html_row(state, message, attributes, children),
+        "td" | "th" => render_html_cell(state, message, name, attributes, children),
+        "ul" | "ol" => render_html_list(state, message, name, attributes, children),
+        "li" => render_html_list_item(state, message, attributes, children),
+        "hr" => {
+            let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+            separator.set_margin_top(8);
+            separator.set_margin_bottom(8);
+            separator.upcast()
+        }
+        "blockquote" => {
+            let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            block.add_css_class("mail-html-blockquote");
+            block.set_margin_start(16);
+            block.set_margin_top(5);
+            block.set_margin_bottom(7);
+            apply_html_box_layout(&block, attributes);
+            append_html_children(&block, state, message, children);
+            block.upcast()
+        }
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            heading.set_margin_top(8);
+            heading.set_margin_bottom(5);
+            apply_html_box_layout(&heading, attributes);
+            append_html_children(&heading, state, message, children);
+            heading.upcast()
+        }
+        "p" => {
+            let paragraph = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            paragraph.set_margin_top(3);
+            paragraph.set_margin_bottom(8);
+            apply_html_box_layout(&paragraph, attributes);
+            append_html_children(&paragraph, state, message, children);
+            paragraph.upcast()
+        }
+        "center" => {
+            let center = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            center.set_halign(gtk::Align::Center);
+            center.set_hexpand(true);
+            apply_html_box_layout(&center, attributes);
+            append_html_children(&center, state, message, children);
+            center.upcast()
+        }
+        _ => {
+            let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            apply_html_box_layout(&block, attributes);
+            append_html_children(&block, state, message, children);
+            block.upcast()
+        }
+    }
+}
+
+fn render_html_table(
+    state: &Rc<AppState>,
+    message: &Message,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+) -> gtk::Widget {
+    let table = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    table.set_hexpand(true);
+    table.add_css_class("mail-html-table");
+    apply_html_box_layout(&table, attributes);
+    append_html_table_rows(&table, state, message, children);
+    table.upcast()
+}
+
+fn append_html_table_rows(
+    table: &gtk::Box,
+    state: &Rc<AppState>,
+    message: &Message,
+    children: &[crate::mail::mime::HtmlNode],
+) {
+    for child in children {
+        if let Some((name, attributes, nested)) = html_element_parts(child) {
+            if name == "tr" {
+                table.append(&render_html_row(state, message, attributes, nested));
+            } else if matches!(name, "tbody" | "thead" | "tfoot" | "table") {
+                append_html_table_rows(table, state, message, nested);
+            }
+        }
+    }
+}
+
+fn render_html_row(
+    state: &Rc<AppState>,
+    message: &Message,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_hexpand(true);
+    row.set_valign(gtk::Align::Start);
+    row.add_css_class("mail-html-row");
+    apply_html_box_layout(&row, attributes);
+    for child in children {
+        if let Some((name, cell_attributes, cell_children)) = html_element_parts(child)
+            && matches!(name, "td" | "th")
+        {
+            row.append(&render_html_cell(
+                state,
+                message,
+                name,
+                cell_attributes,
+                cell_children,
+            ));
+        }
+    }
+    row.upcast()
+}
+
+fn render_html_cell(
+    state: &Rc<AppState>,
+    message: &Message,
+    name: &str,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+) -> gtk::Widget {
+    let cell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    cell.set_hexpand(true);
+    cell.set_valign(gtk::Align::Start);
+    cell.add_css_class("mail-html-cell");
+    if name == "th" {
+        cell.add_css_class("mail-html-header-cell");
+    }
+    apply_html_box_layout(&cell, attributes);
+    append_html_children(&cell, state, message, children);
+    cell.upcast()
+}
+
+fn render_html_list(
+    state: &Rc<AppState>,
+    message: &Message,
+    name: &str,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+) -> gtk::Widget {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.set_margin_top(3);
+    list.set_margin_bottom(8);
+    apply_html_box_layout(&list, attributes);
+    let mut index = 1;
+    for child in children {
+        if let Some((child_name, child_attributes, child_children)) = html_element_parts(child)
+            && child_name == "li"
+        {
+            let item = render_html_list_item_with_marker(
+                state,
+                message,
+                child_attributes,
+                child_children,
+                if name == "ol" {
+                    let marker = format!("{index}. ");
+                    index += 1;
+                    marker
+                } else {
+                    "• ".into()
+                },
+            );
+            list.append(&item);
+        }
+    }
+    list.upcast()
+}
+
+fn render_html_list_item(
+    state: &Rc<AppState>,
+    message: &Message,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+) -> gtk::Widget {
+    render_html_list_item_with_marker(state, message, attributes, children, "• ".into()).upcast()
+}
+
+fn render_html_list_item_with_marker(
+    state: &Rc<AppState>,
+    message: &Message,
+    attributes: &[(String, String)],
+    children: &[crate::mail::mime::HtmlNode],
+    marker: String,
+) -> gtk::Box {
+    let item = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    item.set_hexpand(true);
+    item.set_valign(gtk::Align::Start);
+    let marker_label = gtk::Label::new(Some(&marker));
+    marker_label.set_valign(gtk::Align::Start);
+    item.append(&marker_label);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.set_hexpand(true);
+    apply_html_box_layout(&body, attributes);
+    append_html_children(&body, state, message, children);
+    item.append(&body);
+    item
+}
+
+fn is_html_block(node: &crate::mail::mime::HtmlNode) -> bool {
+    html_element_parts(node).is_some_and(|(name, _, _)| {
+        matches!(
+            name,
+            "blockquote"
+                | "center"
+                | "div"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hr"
+                | "li"
+                | "ol"
+                | "p"
+                | "table"
+                | "tbody"
+                | "td"
+                | "tfoot"
+                | "th"
+                | "thead"
+                | "tr"
+                | "ul"
+        )
+    })
+}
+
+fn html_element_parts(
+    node: &crate::mail::mime::HtmlNode,
+) -> Option<(&str, &[(String, String)], &[crate::mail::mime::HtmlNode])> {
+    match node {
+        crate::mail::mime::HtmlNode::Element {
+            name,
+            attributes,
+            children,
+        } => Some((name, attributes, children)),
+        _ => None,
+    }
+}
+
+fn apply_html_box_layout(widget: &impl IsA<gtk::Widget>, attributes: &[(String, String)]) {
+    let padding = html_style_value(attributes, "padding")
+        .and_then(parse_html_length)
+        .or_else(|| html_attribute(attributes, "cellpadding").and_then(parse_html_length));
+    if let Some(padding) = padding {
+        widget.set_margin_start(padding);
+        widget.set_margin_end(padding);
+        widget.set_margin_top(padding);
+        widget.set_margin_bottom(padding);
+    }
+    let align = html_attribute(attributes, "align")
+        .or_else(|| html_style_value(attributes, "text-align"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match align.as_str() {
+        "center" => widget.set_halign(gtk::Align::Center),
+        "right" | "end" => widget.set_halign(gtk::Align::End),
+        "left" | "start" => widget.set_halign(gtk::Align::Start),
+        _ => {}
+    }
+}
+
+fn html_attribute<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|(attribute, _)| attribute == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn html_style_value<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let style = html_attribute(attributes, "style")?;
+    style.split(';').find_map(|declaration| {
+        let (property, value) = declaration.split_once(':')?;
+        property
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim())
+    })
+}
+
+fn parse_html_length(value: &str) -> Option<i32> {
+    let value = value.trim().strip_suffix("px").unwrap_or(value.trim());
+    if value.contains('%') {
+        return None;
+    }
+    let length = value.parse::<i32>().ok()?;
+    (0..=2400).contains(&length).then_some(length)
+}
+
+fn append_html_inline(content: &gtk::Box, state: &Rc<AppState>, message: &Message, markup: &str) {
+    let fragments = crate::mail::mime::html_fragments(markup);
+    let contains_image = fragments
+        .iter()
+        .any(|fragment| matches!(fragment, crate::mail::mime::HtmlFragment::Image { .. }));
+
+    if !contains_image {
+        let rendered = fragments
+            .into_iter()
+            .filter_map(|fragment| match fragment {
+                crate::mail::mime::HtmlFragment::Markup(markup) => Some(markup),
+                crate::mail::mime::HtmlFragment::Image { .. } => None,
+            })
+            .collect::<String>();
+        if rendered.trim().is_empty() {
+            return;
+        }
+        let body = gtk::Label::new(None);
+        body.set_use_markup(true);
+        body.set_markup(&rendered);
+        body.set_xalign(0.0);
+        body.set_yalign(0.0);
+        body.set_wrap(true);
+        body.set_selectable(true);
+        body.set_hexpand(true);
+        body.set_margin_top(2);
+        body.set_margin_bottom(2);
+        body.add_css_class("mail-reader-body");
+        content.append(&body);
+        return;
+    }
+
     let body = gtk::TextView::new();
     body.set_wrap_mode(gtk::WrapMode::WordChar);
     body.set_editable(false);
     body.set_cursor_visible(false);
     body.set_hexpand(true);
+    body.set_vexpand(false);
+    body.set_size_request(-1, 28);
     body.set_left_margin(0);
     body.set_right_margin(0);
     body.set_top_margin(0);
@@ -2053,7 +2427,7 @@ fn append_html_content(
 
     let buffer = body.buffer();
     let remote_allowed = remote_images_allowed(state, message);
-    for fragment in crate::mail::mime::html_fragments(body_html) {
+    for fragment in fragments {
         match fragment {
             crate::mail::mime::HtmlFragment::Markup(markup) => {
                 let mut end = buffer.end_iter();
@@ -2068,12 +2442,12 @@ fn append_html_content(
                             &alt,
                         );
                     } else {
-                        insert_image_alt(&buffer, &alt);
+                        insert_image_placeholder(&buffer, &alt, "Inline image unavailable");
                     }
                 } else if remote_allowed {
                     queue_inline_image(&buffer, gio::File::for_uri(&src), &alt);
                 } else {
-                    insert_image_alt(&buffer, &alt);
+                    insert_image_placeholder(&buffer, &alt, "Remote image blocked");
                 }
             }
         }
@@ -2177,12 +2551,18 @@ fn html_references_content_id(html: &str, content_id: Option<&str>) -> bool {
         .contains(&format!("cid:{}", content_id.to_ascii_lowercase()))
 }
 
-fn insert_image_alt(buffer: &gtk::TextBuffer, alt: &str) {
-    if alt.trim().is_empty() {
-        return;
-    }
+fn insert_image_placeholder(buffer: &gtk::TextBuffer, alt: &str, label: &str) {
     let mut end = buffer.end_iter();
-    buffer.insert_markup(&mut end, &glib::markup_escape_text(alt));
+    let placeholder = image_placeholder_text(alt, label);
+    buffer.insert_markup(&mut end, &glib::markup_escape_text(&placeholder));
+}
+
+fn image_placeholder_text(alt: &str, label: &str) -> String {
+    if alt.trim().is_empty() {
+        format!("[{label}]")
+    } else {
+        format!("[{label}: {}]", alt.trim())
+    }
 }
 
 fn queue_inline_image(buffer: &gtk::TextBuffer, file: gio::File, alt: &str) {
@@ -2216,8 +2596,9 @@ fn replace_inline_image(
     buffer.delete(&mut start, &mut end);
     if let Some(texture) = texture {
         buffer.insert_paintable(&mut start, texture);
-    } else if !alt.trim().is_empty() {
-        buffer.insert_markup(&mut start, &glib::markup_escape_text(alt));
+    } else {
+        let placeholder = image_placeholder_text(alt, "Image unavailable");
+        buffer.insert_markup(&mut start, &glib::markup_escape_text(&placeholder));
     }
     buffer.delete_mark(mark);
 }

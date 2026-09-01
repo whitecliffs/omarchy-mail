@@ -39,6 +39,17 @@ pub enum HtmlFragment {
     Image { src: String, alt: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtmlNode {
+    Document(Vec<HtmlNode>),
+    Text(String),
+    Element {
+        name: String,
+        attributes: Vec<(String, String)>,
+        children: Vec<HtmlNode>,
+    },
+}
+
 pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
     let mail = parse_mail(raw)?;
     let body = find_body(&mail, false).unwrap_or_default();
@@ -108,13 +119,207 @@ pub fn sanitize_html(html: &str) -> String {
             "u",
             "ul",
         ]))
-        .generic_attributes(HashSet::from(["title"]))
+        .generic_attributes(HashSet::from([
+            "align",
+            "bgcolor",
+            "border",
+            "cellpadding",
+            "cellspacing",
+            "height",
+            "style",
+            "title",
+            "valign",
+            "width",
+        ]))
         .add_tag_attributes("img", ["src", "alt", "width", "height"])
+        .filter_style_properties(HashSet::from([
+            "background-color",
+            "border",
+            "border-radius",
+            "color",
+            "font-size",
+            "font-weight",
+            "margin",
+            "margin-bottom",
+            "margin-left",
+            "margin-right",
+            "margin-top",
+            "padding",
+            "padding-bottom",
+            "padding-left",
+            "padding-right",
+            "padding-top",
+            "text-align",
+            "width",
+        ]))
         .link_rel(Some("noopener noreferrer"))
         .url_relative(ammonia::UrlRelative::PassThrough)
         .url_schemes(HashSet::from(["cid", "http", "https", "mailto"]))
         .clean(&html)
         .to_string()
+}
+
+/// Parses already-sanitised HTML into a small structural tree. This is not a
+/// browser DOM: it deliberately retains only the tags and attributes that the
+/// native reader knows how to lay out safely.
+pub fn html_document(html: &str) -> HtmlNode {
+    let safe = sanitize_html(html);
+    let mut cursor = 0;
+    HtmlNode::Document(parse_html_nodes(&safe, &mut cursor, None))
+}
+
+/// Serializes a node back to safe HTML for the inline GTK text renderer.
+pub fn html_node_markup(node: &HtmlNode) -> String {
+    match node {
+        HtmlNode::Document(children) => children.iter().map(html_node_markup).collect(),
+        HtmlNode::Text(text) => text.clone(),
+        HtmlNode::Element {
+            name,
+            attributes,
+            children,
+        } => {
+            let mut markup = format!("<{name}");
+            for (attribute, value) in attributes {
+                markup.push(' ');
+                markup.push_str(attribute);
+                markup.push_str("=\"");
+                markup.push_str(&escape_html_attribute(value));
+                markup.push_str("\"");
+            }
+            if matches!(
+                name.as_str(),
+                "area" | "br" | "hr" | "img" | "meta" | "source"
+            ) {
+                markup.push_str(">");
+            } else {
+                markup.push('>');
+                for child in children {
+                    markup.push_str(&html_node_markup(child));
+                }
+                markup.push_str("</");
+                markup.push_str(name);
+                markup.push('>');
+            }
+            markup
+        }
+    }
+}
+
+fn parse_html_nodes(input: &str, cursor: &mut usize, closing: Option<&str>) -> Vec<HtmlNode> {
+    let mut nodes = Vec::new();
+    while *cursor < input.len() {
+        if input.as_bytes().get(*cursor) == Some(&b'<') {
+            let Some(relative_end) = input[*cursor..].find('>') else {
+                nodes.push(HtmlNode::Text(input[*cursor..].to_string()));
+                *cursor = input.len();
+                break;
+            };
+            let end = *cursor + relative_end;
+            let raw_tag = &input[*cursor + 1..end];
+            let tag = raw_tag.trim();
+            if tag.starts_with('/') {
+                let name = tag
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                *cursor = end + 1;
+                if closing.is_some_and(|known| known == name) {
+                    break;
+                }
+                continue;
+            }
+            let (name, attributes, self_closing) = parse_html_start_tag(tag);
+            *cursor = end + 1;
+            if name.is_empty() {
+                continue;
+            }
+            let children = if self_closing
+                || matches!(
+                    name.as_str(),
+                    "area" | "br" | "hr" | "img" | "meta" | "source"
+                ) {
+                Vec::new()
+            } else {
+                parse_html_nodes(input, cursor, Some(&name))
+            };
+            nodes.push(HtmlNode::Element {
+                name,
+                attributes,
+                children,
+            });
+            continue;
+        }
+
+        let end = input[*cursor..]
+            .find('<')
+            .map(|offset| *cursor + offset)
+            .unwrap_or(input.len());
+        if end > *cursor {
+            nodes.push(HtmlNode::Text(input[*cursor..end].to_string()));
+        }
+        *cursor = end;
+    }
+    nodes
+}
+
+fn parse_html_start_tag(tag: &str) -> (String, Vec<(String, String)>, bool) {
+    let self_closing = tag.trim_end().ends_with('/');
+    let tag = tag.trim_end_matches('/').trim();
+    let mut parts = tag.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let mut attributes = Vec::new();
+    let mut rest = parts.next().unwrap_or_default().trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let end_name = rest
+            .find(|character: char| character.is_whitespace() || character == '=')
+            .unwrap_or(rest.len());
+        let attribute = rest[..end_name].to_ascii_lowercase();
+        rest = &rest[end_name..];
+        rest = rest.trim_start();
+        let mut value = String::new();
+        if let Some(after_equals) = rest.strip_prefix('=') {
+            rest = after_equals.trim_start();
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                if let Some((quoted, remaining)) = after_quote.split_once('"') {
+                    value = decode_entities(quoted);
+                    rest = remaining;
+                } else {
+                    value = decode_entities(after_quote);
+                    rest = "";
+                }
+            } else if let Some(after_quote) = rest.strip_prefix('\'') {
+                if let Some((quoted, remaining)) = after_quote.split_once('\'') {
+                    value = decode_entities(quoted);
+                    rest = remaining;
+                } else {
+                    value = decode_entities(after_quote);
+                    rest = "";
+                }
+            } else {
+                let end_value = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                value = decode_entities(&rest[..end_value]);
+                rest = &rest[end_value..];
+            }
+        }
+        if !attribute.is_empty() {
+            attributes.push((attribute, value));
+        }
+    }
+    (name, attributes, self_closing)
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Splits sanitized HTML into Pango-safe markup and image placeholders while
@@ -240,6 +445,7 @@ fn append_html_tag(
                 | "u"
                 | "code"
                 | "pre"
+                | "span"
                 | "h1"
                 | "h2"
                 | "h3"
@@ -282,17 +488,79 @@ fn append_html_tag(
         "i" | "em" => active.push((name.into(), "<i>".into(), "</i>".into())),
         "u" => active.push((name.into(), "<u>".into(), "</u>".into())),
         "code" | "pre" => active.push((name.into(), "<tt>".into(), "</tt>".into())),
+        "span" => {
+            if let Some(markup) = pango_style_markup(tag) {
+                active.push((name.into(), markup, "</span>".into()));
+            }
+        }
         "a" => {
-            if let Some(href) = href_from_tag(tag) {
-                active.push((
-                    name.into(),
-                    format!("<a href=\"{}\">", glib::markup_escape_text(&href)),
-                    "</a>".into(),
-                ));
+            if href_from_tag(tag).is_some() {
+                active.push((name.into(), "<u>".into(), "</u>".into()));
             }
         }
         _ => {}
     }
+}
+
+fn pango_style_markup(tag: &str) -> Option<String> {
+    let style = attribute_value(tag, "style")?;
+    let mut attributes = Vec::new();
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match property.as_str() {
+            "color" => {
+                if let Some(color) = safe_css_color(value) {
+                    attributes.push(format!("foreground=\"{color}\""));
+                }
+            }
+            "background-color" => {
+                if let Some(color) = safe_css_color(value) {
+                    attributes.push(format!("background=\"{color}\""));
+                }
+            }
+            "font-weight" if value.eq_ignore_ascii_case("bold") || value == "700" => {
+                attributes.push("weight=\"bold\"".into());
+            }
+            "text-decoration" if value.eq_ignore_ascii_case("underline") => {
+                attributes.push("underline=\"single\"".into());
+            }
+            _ => {}
+        }
+    }
+    (!attributes.is_empty()).then(|| format!("<span {}>", attributes.join(" ")))
+}
+
+fn safe_css_color(value: &str) -> Option<String> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let named = matches!(
+        lower.as_str(),
+        "black"
+            | "blue"
+            | "gray"
+            | "green"
+            | "grey"
+            | "maroon"
+            | "navy"
+            | "olive"
+            | "orange"
+            | "purple"
+            | "red"
+            | "silver"
+            | "teal"
+            | "white"
+            | "yellow"
+    );
+    let hex = value.starts_with('#')
+        && matches!(value.len(), 4 | 7 | 9)
+        && value[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    (named || hex).then(|| value.to_string())
 }
 
 /// Returns only network image URLs from already-sanitised HTML. Local files,
@@ -833,5 +1101,49 @@ mod tests {
             fragment,
             HtmlFragment::Image { src, .. } if src.starts_with("file:")
         )));
+    }
+
+    #[test]
+    fn preserves_safe_table_structure_and_layout_hints() {
+        let document = html_document(
+            r#"<table style="width: 640px; background-image: url(https://tracker.invalid/x)" width="640"><tr><td style="padding: 12px; text-align: center"><strong>Hello</strong></td><td>World</td></tr></table>"#,
+        );
+        let HtmlNode::Document(children) = document else {
+            panic!("expected document node");
+        };
+        let HtmlNode::Element {
+            name,
+            attributes,
+            children: rows,
+        } = &children[0]
+        else {
+            panic!("expected table node");
+        };
+        assert_eq!(name, "table");
+        assert!(
+            attributes
+                .iter()
+                .any(|(name, value)| { name == "width" && value == "640" })
+        );
+        assert!(
+            !attributes
+                .iter()
+                .any(|(name, value)| { name == "style" && value.contains("background-image") })
+        );
+        let HtmlNode::Element {
+            name: section_name,
+            children: section_children,
+            ..
+        } = &rows[0]
+        else {
+            panic!("expected tbody node");
+        };
+        assert_eq!(section_name, "tbody");
+        assert!(matches!(
+            &section_children[0],
+            HtmlNode::Element { name, children, .. }
+                if name == "tr" && children.len() == 2
+        ));
+        assert!(html_node_markup(&section_children[0]).contains("<strong>Hello</strong>"));
     }
 }

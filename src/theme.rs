@@ -113,7 +113,7 @@ window.omarchy-mail-window {{
 .mail-sidebar-row.selected {{ background: @om-selection; color: @om-light-foreground; }}
 .mail-count {{ color: @om-muted; font-size: 0.86em; }}
 .mail-filter-bar {{ background: @om-dark-background; border-bottom: 1px solid alpha(@om-muted, 0.24); }}
-.mail-message-row {{ min-height: 68px; border-bottom: 1px solid alpha(@om-muted, 0.17); padding: 9px 14px; }}
+.mail-message-row {{ min-height: 86px; border-bottom: 1px solid alpha(@om-muted, 0.17); padding: 8px 14px; }}
 .mail-message-row > * {{ min-width: 0; }}
 .mail-message-row:hover {{ background: alpha(@om-lighter-background, 0.42); }}
 .mail-message-row:selected {{ background: @om-selection; }}
@@ -129,6 +129,12 @@ window.omarchy-mail-window {{
 .mail-reader-meta {{ color: @om-muted; }}
 .mail-reader-body {{ color: @om-foreground; font-size: 1.03em; line-height: 1.5; background: transparent; border: none; padding: 0; }}
 .mail-reader-body text {{ color: @om-foreground; background: transparent; }}
+.mail-html-document {{ color: @om-foreground; }}
+.mail-html-table {{ min-width: 0; }}
+.mail-html-row {{ min-width: 0; }}
+.mail-html-cell {{ min-width: 0; }}
+.mail-html-header-cell {{ font-weight: 700; }}
+.mail-html-blockquote {{ border-left: 3px solid alpha(@om-muted, 0.45); color: @om-muted; }}
 .mail-format-button {{ min-width: 30px; min-height: 30px; padding: 3px 8px; }}
 .mail-format-button:hover {{ background: alpha(@om-selection, 0.7); }}
 .mail-settings-signature {{ background: alpha(@om-dark-background, 0.35); border: 1px solid alpha(@om-muted, 0.22); border-radius: 7px; padding: 5px 7px; }}
