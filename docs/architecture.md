@@ -20,6 +20,11 @@ without making the GTK main loop responsible for network activity.
   and sanitises HTML before the UI sees it. Inline image bytes are cached as
   ordinary disposable attachments and rendered by GTK only from that local
   cache; remote URLs and scripts never reach a web runtime.
+- The composer keeps its small rich-text model in GTK text tags, with a plain
+  text body always available as the compatibility part. Optional draft HTML is
+  sanitized at the persistence boundary, and SMTP emits `multipart/alternative`
+  before adding attachments. Link targets are restricted to `http(s)` and
+  `mailto:` schemes; signatures are inserted from the selected account.
 - `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
   worker threads, with transport-aware IMAP connections, mailbox discovery,
   bounded folder fetches, queued action reconciliation, attachment caching,

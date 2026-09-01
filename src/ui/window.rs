@@ -640,6 +640,7 @@ fn pending_send_message(send: &PendingSend, account: &Account) -> Message {
             .take(160)
             .collect(),
         body: send.body.clone(),
+        body_html: send.body_html.clone(),
         received_at: send.created_at.clone(),
         unread: false,
         starred: false,
@@ -1543,9 +1544,13 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
     body.set_wrap(true);
     body.set_selectable(true);
     body.add_css_class("mail-reader-body");
-    if message.body.contains('<') {
+    let body_html = message
+        .body_html
+        .as_deref()
+        .or_else(|| message.body.contains('<').then_some(message.body.as_str()));
+    if let Some(body_html) = body_html {
         body.set_use_markup(true);
-        body.set_markup(&crate::mail::mime::html_to_pango(&message.body));
+        body.set_markup(&crate::mail::mime::html_to_pango(body_html));
         body.connect_activate_link(|_, uri| {
             let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
             glib::Propagation::Stop
@@ -2305,6 +2310,417 @@ enum ComposeContext {
     Draft(Message),
 }
 
+struct ComposerFormatting {
+    tag_table: gtk::TextTagTable,
+    bold: gtk::TextTag,
+    italic: gtk::TextTag,
+    underline: gtk::TextTag,
+    link_tags: RefCell<HashMap<String, gtk::TextTag>>,
+    next_link: Cell<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ComposerMark {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    link: Option<String>,
+}
+
+fn build_composer_formatting(buffer: &gtk::TextBuffer) -> Rc<ComposerFormatting> {
+    let tag_table = buffer.tag_table();
+    let bold = gtk::TextTag::builder()
+        .name("compose-bold")
+        .weight(700)
+        .build();
+    let italic = gtk::TextTag::builder()
+        .name("compose-italic")
+        .style(gtk::pango::Style::Italic)
+        .build();
+    let underline = gtk::TextTag::builder()
+        .name("compose-underline")
+        .underline(gtk::pango::Underline::Single)
+        .build();
+    tag_table.add(&bold);
+    tag_table.add(&italic);
+    tag_table.add(&underline);
+    Rc::new(ComposerFormatting {
+        tag_table,
+        bold,
+        italic,
+        underline,
+        link_tags: RefCell::new(HashMap::new()),
+        next_link: Cell::new(0),
+    })
+}
+
+fn composer_link_tag(formatting: &Rc<ComposerFormatting>, url: &str) -> gtk::TextTag {
+    if let Some(tag) = formatting.link_tags.borrow().get(url) {
+        return tag.clone();
+    }
+    let name = format!("compose-link-{}", formatting.next_link.get());
+    formatting.next_link.set(formatting.next_link.get() + 1);
+    let tag = gtk::TextTag::builder()
+        .name(&name)
+        .underline(gtk::pango::Underline::Single)
+        .build();
+    formatting.tag_table.add(&tag);
+    formatting
+        .link_tags
+        .borrow_mut()
+        .insert(url.to_string(), tag.clone());
+    tag
+}
+
+fn composer_mark(iter: &gtk::TextIter, formatting: &Rc<ComposerFormatting>) -> ComposerMark {
+    let link = iter.tags().into_iter().find_map(|tag| {
+        let name = tag.name()?.to_string();
+        if !name.starts_with("compose-link-") {
+            return None;
+        }
+        formatting
+            .link_tags
+            .borrow()
+            .iter()
+            .find(|(_, candidate)| candidate.name().as_deref() == Some(name.as_str()))
+            .map(|(url, _)| url.clone())
+    });
+    ComposerMark {
+        bold: iter.has_tag(&formatting.bold),
+        italic: iter.has_tag(&formatting.italic),
+        underline: iter.has_tag(&formatting.underline),
+        link,
+    }
+}
+
+fn composer_tags(mark: &ComposerMark, formatting: &Rc<ComposerFormatting>) -> Vec<gtk::TextTag> {
+    let mut tags = Vec::new();
+    if let Some(url) = mark.link.as_deref() {
+        tags.push(composer_link_tag(formatting, url));
+    }
+    if mark.bold {
+        tags.push(formatting.bold.clone());
+    }
+    if mark.italic {
+        tags.push(formatting.italic.clone());
+    }
+    if mark.underline {
+        tags.push(formatting.underline.clone());
+    }
+    tags
+}
+
+fn insert_composer_text(
+    buffer: &gtk::TextBuffer,
+    formatting: &Rc<ComposerFormatting>,
+    mark: &ComposerMark,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let tags = composer_tags(mark, formatting);
+    let tag_refs = tags.iter().collect::<Vec<_>>();
+    let mut end = buffer.end_iter();
+    buffer.insert_with_tags(&mut end, text, &tag_refs);
+}
+
+fn decode_composer_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn composer_href(raw_tag: &str) -> Option<String> {
+    let lower = raw_tag.to_ascii_lowercase();
+    let start = lower.find("href=")? + "href=".len();
+    let value = raw_tag[start..].trim_start();
+    let value = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.split_once('"')?.0
+    } else if let Some(quoted) = value.strip_prefix('\'') {
+        quoted.split_once('\'')?.0
+    } else {
+        value.split_whitespace().next()?
+    };
+    let value = decode_composer_entities(value);
+    (value.starts_with("https://") || value.starts_with("http://") || value.starts_with("mailto:"))
+        .then_some(value)
+}
+
+fn composer_ends_with_newline(buffer: &gtk::TextBuffer) -> bool {
+    let mut end = buffer.end_iter();
+    end.backward_char() && end.char() == '\n'
+}
+
+fn composer_add_line_break(buffer: &gtk::TextBuffer) {
+    if !buffer.start_iter().is_end() && !composer_ends_with_newline(buffer) {
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, "\n");
+    }
+}
+
+fn insert_composer_html(buffer: &gtk::TextBuffer, formatting: &Rc<ComposerFormatting>, html: &str) {
+    let safe = mail::mime::sanitize_html(html);
+    let mut mark = ComposerMark::default();
+    let mut position = 0;
+    while position < safe.len() {
+        let Some(relative_start) = safe[position..].find('<') else {
+            insert_composer_text(
+                buffer,
+                formatting,
+                &mark,
+                &decode_composer_entities(&safe[position..]),
+            );
+            break;
+        };
+        let start = position + relative_start;
+        insert_composer_text(
+            buffer,
+            formatting,
+            &mark,
+            &decode_composer_entities(&safe[position..start]),
+        );
+        let Some(relative_end) = safe[start..].find('>') else {
+            insert_composer_text(
+                buffer,
+                formatting,
+                &mark,
+                &decode_composer_entities(&safe[start..]),
+            );
+            break;
+        };
+        let end = start + relative_end;
+        let raw_tag = &safe[start + 1..end];
+        let normalized = raw_tag.trim().to_ascii_lowercase();
+        let closing = normalized.starts_with('/');
+        let name = normalized
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        match (closing, name) {
+            (_, "br") => {
+                let mut end_iter = buffer.end_iter();
+                buffer.insert(&mut end_iter, "\n");
+            }
+            (false, "a") => mark.link = composer_href(raw_tag),
+            (true, "a") => mark.link = None,
+            (false, "b") | (false, "strong") => mark.bold = true,
+            (true, "b") | (true, "strong") => mark.bold = false,
+            (false, "i") | (false, "em") => mark.italic = true,
+            (true, "i") | (true, "em") => mark.italic = false,
+            (false, "u") => mark.underline = true,
+            (true, "u") => mark.underline = false,
+            (true, "p") | (true, "div") | (true, "li") => composer_add_line_break(buffer),
+            _ => {}
+        }
+        position = end + 1;
+    }
+}
+
+fn composer_html_body(buffer: &gtk::TextBuffer, formatting: &Rc<ComposerFormatting>) -> String {
+    let mut output = String::new();
+    let mut current = ComposerMark::default();
+    let mut iter = buffer.start_iter();
+    while !iter.is_end() {
+        let mark = composer_mark(&iter, formatting);
+        if mark != current {
+            if current.underline {
+                output.push_str("</u>");
+            }
+            if current.italic {
+                output.push_str("</em>");
+            }
+            if current.bold {
+                output.push_str("</strong>");
+            }
+            if current.link.is_some() {
+                output.push_str("</a>");
+            }
+            if mark.link.is_some() {
+                let url = mark.link.as_deref().unwrap_or_default();
+                output.push_str("<a href=\"");
+                output.push_str(&glib::markup_escape_text(url));
+                output.push_str("\">");
+            }
+            if mark.bold {
+                output.push_str("<strong>");
+            }
+            if mark.italic {
+                output.push_str("<em>");
+            }
+            if mark.underline {
+                output.push_str("<u>");
+            }
+            current = mark;
+        }
+        if iter.char() == '\n' {
+            if current.underline {
+                output.push_str("</u>");
+            }
+            if current.italic {
+                output.push_str("</em>");
+            }
+            if current.bold {
+                output.push_str("</strong>");
+            }
+            if current.link.is_some() {
+                output.push_str("</a>");
+            }
+            output.push_str("<br>\n");
+            current = ComposerMark::default();
+        } else {
+            output.push_str(&glib::markup_escape_text(
+                iter.char().encode_utf8(&mut [0; 4]),
+            ));
+        }
+        if !iter.forward_char() {
+            break;
+        }
+    }
+    if current.underline {
+        output.push_str("</u>");
+    }
+    if current.italic {
+        output.push_str("</em>");
+    }
+    if current.bold {
+        output.push_str("</strong>");
+    }
+    if current.link.is_some() {
+        output.push_str("</a>");
+    }
+    if output.trim().is_empty() {
+        String::new()
+    } else {
+        format!("<div>{output}</div>")
+    }
+}
+
+fn composer_contents(
+    body: &gtk::TextView,
+    html_mode: bool,
+    formatting: &Rc<ComposerFormatting>,
+) -> (String, Option<String>) {
+    let plain = text_view_contents(body);
+    let html = html_mode
+        .then(|| mail::mime::sanitize_html(&composer_html_body(&body.buffer(), formatting)))
+        .filter(|html| !html.trim().is_empty());
+    (plain, html)
+}
+
+fn toggle_composer_tag(body: &gtk::TextView, tag: &gtk::TextTag) -> bool {
+    let Some((start, end)) = body.buffer().selection_bounds() else {
+        return false;
+    };
+    if start.offset() == end.offset() {
+        return false;
+    }
+    let mut cursor = start.clone();
+    let mut fully_tagged = true;
+    while cursor.offset() < end.offset() {
+        if !cursor.has_tag(tag) {
+            fully_tagged = false;
+            break;
+        }
+        if !cursor.forward_char() {
+            break;
+        }
+    }
+    if fully_tagged {
+        body.buffer().remove_tag(tag, &start, &end);
+    } else {
+        body.buffer().apply_tag(tag, &start, &end);
+    }
+    true
+}
+
+fn toggle_composer_bullet(body: &gtk::TextView) {
+    let buffer = body.buffer();
+    let Some(insert_mark) = buffer.mark("insert") else {
+        return;
+    };
+    let cursor = buffer.iter_at_mark(&insert_mark);
+    let mut start = cursor.clone();
+    start.set_line_offset(0);
+    let mut end = cursor.clone();
+    end.forward_to_line_end();
+    let line = start.text(&end).to_string();
+    if line.starts_with("• ") {
+        let mut remove_end = start.clone();
+        remove_end.forward_chars(2);
+        buffer.delete(&mut start, &mut remove_end);
+    } else {
+        buffer.insert(&mut start, "• ");
+    }
+}
+
+fn open_composer_link_dialog(
+    parent: &adw::Window,
+    body: &gtk::TextView,
+    formatting: &Rc<ComposerFormatting>,
+    status: &gtk::Label,
+    on_changed: &Rc<dyn Fn()>,
+) {
+    let Some((start, end)) = body.buffer().selection_bounds() else {
+        status.set_text("Select some text before adding a link.");
+        return;
+    };
+    if start.offset() == end.offset() {
+        status.set_text("Select some text before adding a link.");
+        return;
+    }
+    let dialog = gtk::Dialog::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Add link")
+        .build();
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Add link", gtk::ResponseType::Accept);
+    let content = dialog.content_area();
+    content.set_spacing(10);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    let entry = gtk::Entry::builder()
+        .placeholder_text("https://example.com")
+        .build();
+    content.append(&gtk::Label::new(Some("Link address")));
+    content.append(&entry);
+    let buffer = body.buffer();
+    let start_offset = start.offset();
+    let end_offset = end.offset();
+    let formatting = formatting.clone();
+    let status = status.clone();
+    let on_changed = on_changed.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let url = entry.text().trim().to_string();
+            if !(url.starts_with("https://")
+                || url.starts_with("http://")
+                || url.starts_with("mailto:"))
+            {
+                status.set_text("Use an http(s) or mailto link.");
+                return;
+            }
+            let tag = composer_link_tag(&formatting, &url);
+            let start = buffer.iter_at_offset(start_offset);
+            let end = buffer.iter_at_offset(end_offset);
+            buffer.apply_tag(&tag, &start, &end);
+            status.set_text("Link added");
+            on_changed();
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
 #[derive(Debug)]
 enum SendDisposition {
     Sent,
@@ -2325,6 +2741,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         initial_bcc,
         initial_subject,
         initial_body,
+        initial_body_html,
     ) = match context {
         Some(ComposeContext::Reply { message, reply_all }) => {
             let subject = if message.subject.to_lowercase().starts_with("re:") {
@@ -2355,6 +2772,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 String::new(),
                 subject,
                 body,
+                None,
             )
         }
         Some(ComposeContext::Forward(message)) => {
@@ -2379,6 +2797,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 String::new(),
                 subject,
                 body,
+                None,
             )
         }
         Some(ComposeContext::Draft(message)) => {
@@ -2391,6 +2810,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 recipients.bcc,
                 message.subject,
                 message.body,
+                message.body_html,
             )
         }
         None => (
@@ -2401,6 +2821,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             String::new(),
             String::new(),
             String::new(),
+            None,
         ),
     };
     let compose_title = if initial_draft_id.is_some() {
@@ -2507,7 +2928,49 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     body.set_bottom_margin(16);
     body.set_left_margin(12);
     body.set_right_margin(12);
-    body.buffer().set_text(&initial_body);
+    let formatting = build_composer_formatting(&body.buffer());
+    if let Some(html) = initial_body_html.as_deref() {
+        insert_composer_html(&body.buffer(), &formatting, html);
+    } else {
+        body.buffer().set_text(&initial_body);
+    }
+
+    let format_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    format_toolbar.set_margin_top(12);
+    format_toolbar.set_margin_bottom(2);
+    let format_label = gtk::Label::new(Some("Format"));
+    format_label.add_css_class("mail-reader-meta");
+    let format_selector = gtk::DropDown::from_strings(&["Plain text", "HTML"]);
+    format_selector.set_selected(if initial_body_html.is_some() { 1 } else { 0 });
+    let bold = gtk::Button::with_label("B");
+    bold.set_tooltip_text(Some("Bold"));
+    let italic = gtk::Button::with_label("I");
+    italic.set_tooltip_text(Some("Italic"));
+    let underline = gtk::Button::with_label("U");
+    underline.set_tooltip_text(Some("Underline"));
+    let bullet = gtk::Button::with_label("•");
+    bullet.set_tooltip_text(Some("Toggle bullet on this line"));
+    let link = gtk::Button::with_label("Link");
+    link.set_tooltip_text(Some("Add a link to the selected text"));
+    let signature = gtk::Button::with_label("Signature");
+    signature.set_tooltip_text(Some("Insert the selected account's signature"));
+    for button in [&bold, &italic, &underline, &bullet, &link] {
+        button.add_css_class("mail-format-button");
+    }
+    format_toolbar.append(&format_label);
+    format_toolbar.append(&format_selector);
+    format_toolbar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    format_toolbar.append(&bold);
+    format_toolbar.append(&italic);
+    format_toolbar.append(&underline);
+    format_toolbar.append(&bullet);
+    format_toolbar.append(&link);
+    format_toolbar.append(&signature);
+    let format_controls_enabled = initial_body_html.is_some();
+    for button in [&bold, &italic, &underline, &bullet, &link] {
+        button.set_sensitive(format_controls_enabled);
+    }
+    root.append(&format_toolbar);
     root.append(&body);
     let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
     let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(initial_draft_id));
@@ -2577,6 +3040,8 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let bcc_for_draft = bcc.clone();
     let subject_for_draft = subject.clone();
     let body_for_draft = body.clone();
+    let format_selector_for_draft = format_selector.clone();
+    let formatting_for_draft = formatting.clone();
     let compose_status_for_draft = compose_status.clone();
     draft.connect_clicked(move |_| {
         save_draft_async(
@@ -2588,6 +3053,8 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             bcc_for_draft.clone(),
             subject_for_draft.clone(),
             body_for_draft.clone(),
+            format_selector_for_draft.clone(),
+            formatting_for_draft.clone(),
             compose_status_for_draft.clone(),
             "Saving draft…",
         );
@@ -2603,6 +3070,8 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let bcc = bcc.clone();
         let subject = subject.clone();
         let body = body.clone();
+        let format_selector = format_selector.clone();
+        let formatting = formatting.clone();
         let status = compose_status.clone();
         let revision = draft_revision.clone();
         Rc::new(move || {
@@ -2615,11 +3084,108 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 bcc.clone(),
                 subject.clone(),
                 body.clone(),
+                format_selector.clone(),
+                formatting.clone(),
                 status.clone(),
                 revision.clone(),
             )
         })
     };
+    let bold_for_format = bold.clone();
+    let italic_for_format = italic.clone();
+    let underline_for_format = underline.clone();
+    let bullet_for_format = bullet.clone();
+    let link_for_format = link.clone();
+    let schedule_for_format = schedule_autosave.clone();
+    format_selector.connect_selected_notify(move |selector| {
+        let enabled = selector.selected() == 1;
+        bold_for_format.set_sensitive(enabled);
+        italic_for_format.set_sensitive(enabled);
+        underline_for_format.set_sensitive(enabled);
+        bullet_for_format.set_sensitive(enabled);
+        link_for_format.set_sensitive(enabled);
+        schedule_for_format();
+    });
+
+    let body_for_bold = body.clone();
+    let formatting_for_bold = formatting.clone();
+    let schedule_for_bold = schedule_autosave.clone();
+    bold.connect_clicked(move |_| {
+        if toggle_composer_tag(&body_for_bold, &formatting_for_bold.bold) {
+            schedule_for_bold();
+        }
+    });
+    let body_for_italic = body.clone();
+    let formatting_for_italic = formatting.clone();
+    let schedule_for_italic = schedule_autosave.clone();
+    italic.connect_clicked(move |_| {
+        if toggle_composer_tag(&body_for_italic, &formatting_for_italic.italic) {
+            schedule_for_italic();
+        }
+    });
+    let body_for_underline = body.clone();
+    let formatting_for_underline = formatting.clone();
+    let schedule_for_underline = schedule_autosave.clone();
+    underline.connect_clicked(move |_| {
+        if toggle_composer_tag(&body_for_underline, &formatting_for_underline.underline) {
+            schedule_for_underline();
+        }
+    });
+    let body_for_bullet = body.clone();
+    let schedule_for_bullet = schedule_autosave.clone();
+    bullet.connect_clicked(move |_| {
+        toggle_composer_bullet(&body_for_bullet);
+        schedule_for_bullet();
+    });
+    let body_for_link = body.clone();
+    let formatting_for_link = formatting.clone();
+    let window_for_link = window.clone();
+    let status_for_link = compose_status.clone();
+    let schedule_for_link = schedule_autosave.clone();
+    link.connect_clicked(move |_| {
+        open_composer_link_dialog(
+            &window_for_link,
+            &body_for_link,
+            &formatting_for_link,
+            &status_for_link,
+            &schedule_for_link,
+        );
+    });
+    let body_for_signature = body.clone();
+    let state_for_signature = state.clone();
+    let account_selector_for_signature = account_selector.clone();
+    let status_for_signature = compose_status.clone();
+    let schedule_for_signature = schedule_autosave.clone();
+    signature.connect_clicked(move |_| {
+        let account = state_for_signature
+            .accounts
+            .borrow()
+            .get(account_selector_for_signature.selected() as usize)
+            .cloned();
+        let Some(account) = account else {
+            status_for_signature.set_text("Add an account before inserting a signature.");
+            return;
+        };
+        let name = if account.display_name.trim().is_empty() {
+            account.email.clone()
+        } else {
+            account.display_name.clone()
+        };
+        let signature = format!("-- \n{name}");
+        let current = text_view_contents(&body_for_signature);
+        if current.contains(&signature) {
+            status_for_signature.set_text("That signature is already in the message.");
+            return;
+        }
+        let buffer = body_for_signature.buffer();
+        let mut end = buffer.end_iter();
+        if !current.trim().is_empty() {
+            buffer.insert(&mut end, "\n\n");
+        }
+        buffer.insert(&mut end, &signature);
+        status_for_signature.set_text("Signature inserted");
+        schedule_for_signature();
+    });
     for entry in [&to, &cc, &bcc, &subject] {
         let schedule = schedule_autosave.clone();
         entry.connect_changed(move |_| schedule());
@@ -2643,7 +3209,8 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             return;
         }
         let subject_value = subject.text().to_string();
-        let body_value = text_view_contents(&body);
+        let (body_value, body_html) =
+            composer_contents(&body, format_selector.selected() == 1, &formatting);
         let cc_value = cc.text().trim().to_string();
         let bcc_value = bcc.text().trim().to_string();
         let cc_values = match mail::validate_recipients(&cc_value) {
@@ -2708,6 +3275,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                     &bcc_values,
                     &subject_value,
                     &body_value,
+                    body_html.as_deref(),
                     &attachments,
                 ) {
                     Ok(()) => Ok(SendDisposition::Sent),
@@ -2722,6 +3290,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                             &bcc_values,
                             &subject_value,
                             &body_value,
+                            body_html.as_deref(),
                             &attachments,
                             &error_text,
                             retryable,
@@ -2795,6 +3364,8 @@ fn schedule_draft_autosave(
     bcc: gtk::Entry,
     subject: gtk::Entry,
     body: gtk::TextView,
+    format_selector: gtk::DropDown,
+    formatting: Rc<ComposerFormatting>,
     status: gtk::Label,
     revision: Rc<Cell<u64>>,
 ) {
@@ -2811,6 +3382,8 @@ fn schedule_draft_autosave(
                 bcc,
                 subject,
                 body,
+                format_selector,
+                formatting,
                 status,
                 "Saving draft…",
             );
@@ -2827,6 +3400,8 @@ fn save_draft_async(
     bcc: gtk::Entry,
     subject: gtk::Entry,
     body: gtk::TextView,
+    format_selector: gtk::DropDown,
+    formatting: Rc<ComposerFormatting>,
     status: gtk::Label,
     status_text: &'static str,
 ) {
@@ -2835,7 +3410,7 @@ fn save_draft_async(
     let bcc_value = bcc.text().trim().to_string();
     let recipients = compose_recipient_summary(&to_value, &cc_value, &bcc_value);
     let subject = subject.text().to_string();
-    let body = text_view_contents(&body);
+    let (body, body_html) = composer_contents(&body, format_selector.selected() == 1, &formatting);
     if recipients.is_empty() && subject.trim().is_empty() && body.trim().is_empty() {
         return;
     }
@@ -2850,10 +3425,21 @@ fn save_draft_async(
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = match existing_id {
-            Some(existing_id) => {
-                database.update_draft(existing_id, account_id, &recipients, &subject, &body)
-            }
-            None => database.save_draft(account_id, &recipients, &subject, &body),
+            Some(existing_id) => database.update_draft_with_html(
+                existing_id,
+                account_id,
+                &recipients,
+                &subject,
+                &body,
+                body_html.as_deref(),
+            ),
+            None => database.save_draft_with_html(
+                account_id,
+                &recipients,
+                &subject,
+                &body,
+                body_html.as_deref(),
+            ),
         }
         .map_err(|error| error.to_string());
         let _ = sender.send_blocking(result);

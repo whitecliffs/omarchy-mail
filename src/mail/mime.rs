@@ -65,6 +65,7 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
 }
 
 pub fn sanitize_html(html: &str) -> String {
+    let html = strip_dangerous_blocks(html);
     Builder::default()
         .tags(HashSet::from([
             "a", "b", "br", "code", "div", "em", "i", "li", "ol", "p", "pre", "span", "strong",
@@ -73,8 +74,54 @@ pub fn sanitize_html(html: &str) -> String {
         .generic_attributes(HashSet::from(["title"]))
         .link_rel(Some("noopener noreferrer"))
         .url_relative(ammonia::UrlRelative::PassThrough)
-        .clean(html)
+        .clean(&html)
         .to_string()
+}
+
+fn strip_dangerous_blocks(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let dangerous = ["script", "style", "iframe", "object", "embed", "svg"];
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while cursor < html.len() {
+        let Some((start, name)) = dangerous
+            .iter()
+            .filter_map(|name| {
+                lower[cursor..]
+                    .find(&format!("<{name}"))
+                    .map(|offset| (cursor + offset, *name))
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            output.push_str(&html[cursor..]);
+            break;
+        };
+        let after_name = start + 1 + name.len();
+        let valid_boundary = lower
+            .as_bytes()
+            .get(after_name)
+            .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'>');
+        if !valid_boundary {
+            output.push_str(&html[cursor..after_name]);
+            cursor = after_name;
+            continue;
+        }
+        output.push_str(&html[cursor..start]);
+        let Some(open_end_relative) = lower[after_name..].find('>') else {
+            break;
+        };
+        let content_start = after_name + open_end_relative + 1;
+        let close_token = format!("</{name}");
+        let Some(close_relative) = lower[content_start..].find(&close_token) else {
+            break;
+        };
+        let close_start = content_start + close_relative;
+        let Some(close_end_relative) = lower[close_start..].find('>') else {
+            break;
+        };
+        cursor = close_start + close_end_relative + 1;
+    }
+    output
 }
 
 /// Converts already-sanitised HTML into readable text for the GTK reader.
@@ -358,10 +405,11 @@ mod tests {
     #[test]
     fn sanitizes_scripts_and_local_urls() {
         let safe = sanitize_html(
-            r#"<p>Hello</p><script>alert('x')</script><img src="file:///etc/passwd">"#,
-        );
+        r#"<p>Hello</p><script>alert('x')</script><img src="file:///etc/passwd">"#,
+    );
         assert!(safe.contains("Hello"));
         assert!(!safe.contains("script"));
+        assert!(!safe.contains("alert"));
         assert!(!safe.contains("file:///"));
     }
 

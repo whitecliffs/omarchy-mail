@@ -100,6 +100,14 @@ impl Database {
                 "ALTER TABLE pending_sends ADD COLUMN bcc_json TEXT NOT NULL DEFAULT '[]';
                  UPDATE schema_version SET version = 4;",
             )?;
+            version = 4;
+        }
+        if version < 5 {
+            connection.execute_batch(
+                "ALTER TABLE messages ADD COLUMN body_html TEXT;
+                 ALTER TABLE pending_sends ADD COLUMN body_html TEXT;
+                 UPDATE schema_version SET version = 5;",
+            )?;
         }
         Ok(())
     }
@@ -220,11 +228,32 @@ impl Database {
         subject: &str,
         body: &str,
     ) -> Result<i64> {
+        self.save_draft_with_html(account_id, recipients, subject, body, None)
+    }
+
+    pub fn save_draft_with_html(
+        &self,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+        body_html: Option<&str>,
+    ) -> Result<i64> {
+        let body_html = body_html.map(crate::mail::mime::sanitize_html);
         let connection = self.connection()?;
         let id = -Utc::now().timestamp_micros();
         connection.execute(
-            "INSERT INTO messages(id, account_id, folder, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size)\n             VALUES (?1, ?2, 'Drafts', '', '', ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 1)",
-            params![id, account_id, recipients, subject, body.chars().take(160).collect::<String>(), body, Utc::now().to_rfc3339()],
+            "INSERT INTO messages(id, account_id, folder, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size)\n             VALUES (?1, ?2, 'Drafts', '', '', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 1)",
+            params![
+                id,
+                account_id,
+                recipients,
+                subject,
+                body.chars().take(160).collect::<String>(),
+                body,
+                body_html,
+                Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(id)
     }
@@ -237,18 +266,32 @@ impl Database {
         subject: &str,
         body: &str,
     ) -> Result<i64> {
+        self.update_draft_with_html(draft_id, account_id, recipients, subject, body, None)
+    }
+
+    pub fn update_draft_with_html(
+        &self,
+        draft_id: i64,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+        body_html: Option<&str>,
+    ) -> Result<i64> {
+        let body_html = body_html.map(crate::mail::mime::sanitize_html);
         let connection = self.connection()?;
         let updated = connection.execute(
             "UPDATE messages
              SET account_id = ?1, recipients = ?2, subject = ?3, preview = ?4,
-                 body = ?5, received_at = ?6
-             WHERE id = ?7 AND folder = 'Drafts'",
+                 body = ?5, body_html = ?6, received_at = ?7
+             WHERE id = ?8 AND folder = 'Drafts'",
             params![
                 account_id,
                 recipients,
                 subject,
                 body.chars().take(160).collect::<String>(),
                 body,
+                body_html,
                 Utc::now().to_rfc3339(),
                 draft_id,
             ],
@@ -257,7 +300,7 @@ impl Database {
             return Ok(draft_id);
         }
         drop(connection);
-        self.save_draft(account_id, recipients, subject, body)
+        self.save_draft_with_html(account_id, recipients, subject, body, body_html.as_deref())
     }
 
     pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
@@ -274,7 +317,7 @@ impl Database {
                 inserted += 1;
             }
             transaction.execute(
-                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body, attachments_json=excluded.attachments_json",
+                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body, body_html=excluded.body_html, attachments_json=excluded.attachments_json",
                 params![
                     message.id,
                     message.account_id,
@@ -289,6 +332,7 @@ impl Database {
                     message.subject,
                     message.preview,
                     message.body,
+                    message.body_html,
                     message.received_at,
                     message.unread as i64,
                     message.starred as i64,
@@ -315,7 +359,7 @@ impl Database {
     ) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body,\n                    received_at, unread, starred, has_attachments, thread_size, attachments_json\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
+            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html,\n                    received_at, unread, starred, has_attachments, thread_size, attachments_json\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
         )?;
         let rows = statement.query_map(
             params![account_id, folder, starred_only as i64],
@@ -328,7 +372,7 @@ impl Database {
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
+            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.body_html, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
         )?;
         let rows = statement.query_map([query], message_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -461,8 +505,8 @@ impl Database {
         let attachments_json = serde_json::to_string(&send.attachments)
             .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
         connection.execute(
-            "INSERT INTO pending_sends(account_id, to_recipients, cc_json, bcc_json, subject, body, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO pending_sends(account_id, to_recipients, cc_json, bcc_json, subject, body, body_html, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 send.account_id,
                 send.to,
@@ -470,6 +514,7 @@ impl Database {
                 bcc_json,
                 send.subject,
                 send.body,
+                send.body_html,
                 attachments_json,
                 send.created_at,
                 send.attempts,
@@ -485,7 +530,7 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, account_id, to_recipients, cc_json, bcc_json, subject, body,
-                    attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
+                    body_html, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
              FROM pending_sends
              WHERE sent = 0 AND (?1 IS NULL OR account_id = ?1)
              ORDER BY created_at, id",
@@ -499,7 +544,7 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, account_id, to_recipients, cc_json, bcc_json, subject, body,
-                    attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
+                    body_html, attachments_json, created_at, attempts, retryable, next_attempt_at, last_error
              FROM pending_sends
              WHERE sent = 0 AND account_id = ?1 AND retryable = 1
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
@@ -609,9 +654,9 @@ impl Database {
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
-    let attachments_json: String = row.get(18)?;
+    let attachments_json: String = row.get(19)?;
     let attachments = serde_json::from_str(&attachments_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(18, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(19, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(Message {
         id: row.get(0)?,
@@ -627,19 +672,21 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         subject: row.get(10)?,
         preview: row.get(11)?,
         body: row.get(12)?,
-        received_at: row.get(13)?,
-        unread: row.get::<_, i64>(14)? != 0,
-        starred: row.get::<_, i64>(15)? != 0,
-        has_attachments: row.get::<_, i64>(16)? != 0,
+        body_html: row.get(13)?,
+        received_at: row.get(14)?,
+        unread: row.get::<_, i64>(15)? != 0,
+        starred: row.get::<_, i64>(16)? != 0,
+        has_attachments: row.get::<_, i64>(17)? != 0,
         attachments,
-        thread_size: row.get(17)?,
+        thread_size: row.get(18)?,
     })
 }
 
 fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSend> {
     let cc_json: String = row.get(3)?;
     let bcc_json: String = row.get(4)?;
-    let attachments_json: String = row.get(7)?;
+    let body_html: Option<String> = row.get(7)?;
+    let attachments_json: String = row.get(8)?;
     let cc = serde_json::from_str(&cc_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
@@ -649,7 +696,7 @@ fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSen
     let attachments =
         serde_json::from_str::<Vec<OutgoingAttachment>>(&attachments_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                7,
+                8,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -662,12 +709,13 @@ fn pending_send_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSen
         bcc,
         subject: row.get(5)?,
         body: row.get(6)?,
+        body_html,
         attachments,
-        created_at: row.get(8)?,
-        attempts: row.get::<_, i64>(9)?.max(0) as u32,
-        retryable: row.get::<_, i64>(10)? != 0,
-        next_attempt_at: row.get(11)?,
-        last_error: row.get(12)?,
+        created_at: row.get(9)?,
+        attempts: row.get::<_, i64>(10)?.max(0) as u32,
+        retryable: row.get::<_, i64>(11)? != 0,
+        next_attempt_at: row.get(12)?,
+        last_error: row.get(13)?,
     })
 }
 
@@ -699,6 +747,10 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE schema_version (version INTEGER NOT NULL);
                  INSERT INTO schema_version(version) VALUES (3);
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT NOT NULL
+                 );
                  CREATE TABLE pending_sends (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id INTEGER NOT NULL,
@@ -728,6 +780,22 @@ mod tests {
             )
             .expect("bcc migration");
         assert_eq!(bcc_column, "bcc_json");
+        let body_html_column: String = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('messages') WHERE name = 'body_html'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message html migration");
+        assert_eq!(body_html_column, "body_html");
+        let outbox_html_column: String = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('pending_sends') WHERE name = 'body_html'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox html migration");
+        assert_eq!(outbox_html_column, "body_html");
     }
 
     #[test]
@@ -877,6 +945,7 @@ mod tests {
             bcc: vec!["archive@example.com".into()],
             subject: "Offline note".into(),
             body: "This should wait for the network.".into(),
+            body_html: None,
             attachments: vec![OutgoingAttachment {
                 filename: "notes.txt".into(),
                 path: "/tmp/omarchy-mail-notes.txt".into(),
@@ -1029,5 +1098,32 @@ mod tests {
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].subject, "An updated thought");
         assert_eq!(drafts[0].body, "I changed my mind.");
+    }
+
+    #[test]
+    fn round_trips_a_sanitized_html_draft_with_plain_fallback() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let draft_id = database
+            .save_draft_with_html(
+                None,
+                "jane@example.com",
+                "Styled note",
+                "A styled note",
+                Some("<p><strong>A styled note</strong></p><script>bad()</script>"),
+            )
+            .expect("save html draft");
+
+        let draft = database
+            .list_messages(None, "Drafts")
+            .expect("load html draft")
+            .into_iter()
+            .find(|message| message.id == draft_id)
+            .expect("draft row");
+        assert_eq!(draft.body, "A styled note");
+        assert_eq!(
+            draft.body_html.as_deref(),
+            Some("<p><strong>A styled note</strong></p>")
+        );
     }
 }

@@ -632,7 +632,13 @@ fn message_from_fetch(
         .any(|flag| matches!(flag, imap::types::Flag::Seen));
     let (sender_name, sender_email) = split_sender(&parsed.sender);
     let subject = parsed.subject.clone();
-    let preview = preview(&parsed.body);
+    let body_html = parsed.is_html.then(|| parsed.body.clone());
+    let body = if parsed.is_html {
+        mime::html_to_text(&parsed.body)
+    } else {
+        parsed.body.clone()
+    };
+    let preview = preview(&body);
     let attachments = mime::cache_attachments(id, &parsed.attachments);
     Ok(Some(Message {
         id,
@@ -647,7 +653,8 @@ fn message_from_fetch(
         recipients: parsed.recipients,
         subject,
         preview,
-        body: parsed.body,
+        body,
+        body_html,
         received_at,
         unread,
         starred: false,

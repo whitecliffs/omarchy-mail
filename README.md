@@ -12,6 +12,7 @@ actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, resumable local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings surfaces
 with separate Cc/Bcc fields, resumable draft editing, lightweight
+plain-text/HTML composition with safe formatting, links, and account signatures,
 All/Unread/Starred/Attachment filters, safe inline image rendering, attachment
 re-fetch after cache eviction, a durable offline Outbox,
 and Omarchy theme integration. The cache now reconciles deleted messages and
@@ -34,6 +35,11 @@ than a browser runtime. Safe `cid:` inline images are cached and shown as
 native GTK pictures; remote images and scripts remain blocked. Incoming
 attachments are cached under `$XDG_CACHE_HOME/omarchy-mail/attachments/` (or
 `~/.cache/omarchy-mail/`) and can be saved from the reader.
+
+The composer defaults to plain text. HTML mode adds only the small controls
+needed for everyday mail—bold, italic, underline, bullets, links, and a
+signature insert action—and always sends a plain-text alternative as well.
+HTML is sanitized before it is stored in a draft or handed to SMTP.
 
 ## Build and preview
 

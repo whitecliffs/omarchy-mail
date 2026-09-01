@@ -43,6 +43,7 @@ pub fn send_text_with_auth(
     bcc: &[String],
     subject: &str,
     body: &str,
+    body_html: Option<&str>,
     attachments: &[PathBuf],
 ) -> Result<(), SmtpError> {
     let named_attachments = attachments
@@ -69,6 +70,7 @@ pub fn send_text_with_auth(
         bcc,
         subject,
         body,
+        body_html,
         &named_attachments,
     )
 }
@@ -82,9 +84,11 @@ fn send_named_attachments(
     bcc: &[String],
     subject: &str,
     body: &str,
+    body_html: Option<&str>,
     attachments: &[(String, PathBuf)],
 ) -> Result<(), SmtpError> {
-    let message = build_message_with_names(account, to, cc, bcc, subject, body, attachments)?;
+    let message =
+        build_message_with_names(account, to, cc, bcc, subject, body, body_html, attachments)?;
     let credentials = lettre::transport::smtp::authentication::Credentials::new(
         account.outgoing.username.clone(),
         secret.to_string(),
@@ -136,6 +140,7 @@ pub fn send_pending_with_auth(
         &send.bcc,
         &send.subject,
         &send.body,
+        send.body_html.as_deref(),
         &attachments,
     )
 }
@@ -147,6 +152,7 @@ fn build_message_with_names(
     bcc: &[String],
     subject: &str,
     body: &str,
+    body_html: Option<&str>,
     attachments: &[(String, PathBuf)],
 ) -> Result<LettreMessage, SmtpError> {
     let sender = account
@@ -181,10 +187,25 @@ fn build_message_with_names(
                 .map_err(|_| lettre::error::Error::MissingTo)?,
         );
     }
+    let sanitized_html = body_html.map(crate::mail::mime::sanitize_html);
     let message = if attachments.is_empty() {
-        builder.body(body.to_string())?
+        if let Some(html) = sanitized_html.as_deref() {
+            builder.multipart(MultiPart::alternative_plain_html(
+                body.to_string(),
+                html.to_string(),
+            ))?
+        } else {
+            builder.body(body.to_string())?
+        }
     } else {
-        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+        let mut multipart = if let Some(html) = sanitized_html.as_deref() {
+            MultiPart::mixed().multipart(MultiPart::alternative_plain_html(
+                body.to_string(),
+                html.to_string(),
+            ))
+        } else {
+            MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()))
+        };
         for (filename, path) in attachments {
             let bytes = fs::read(path)?;
             let attachment = Attachment::new(filename.clone()).body(
@@ -229,6 +250,7 @@ mod tests {
             &[],
             "Notes",
             "Hello",
+            None,
             &[("notes.txt".into(), path)],
         )
         .expect("build message");
@@ -237,6 +259,28 @@ mod tests {
 
         assert!(formatted.contains("Content-Disposition: attachment; filename=\"notes.txt\""));
         assert!(formatted.contains("attachment body"));
+    }
+
+    #[test]
+    fn builds_plain_and_html_alternatives() {
+        let account = Account::new("jim@example.com", "Jim");
+        let message = build_message_with_names(
+            &account,
+            "jane@example.com",
+            &[],
+            &[],
+            "A styled note",
+            "A styled note",
+            Some("<p><strong>A styled note</strong></p><script>bad()</script>"),
+            &[],
+        )
+        .expect("build message");
+        let bytes = message.formatted();
+        let formatted = String::from_utf8_lossy(&bytes);
+
+        assert!(formatted.contains("multipart/alternative"));
+        assert!(formatted.contains("A styled note"));
+        assert!(!formatted.contains("script"));
     }
 
     #[test]
@@ -253,6 +297,7 @@ mod tests {
             &["archive@example.com".into()],
             "Notes",
             "Hello",
+            None,
             &[("notes.txt".into(), path)],
         )
         .expect("build message");
