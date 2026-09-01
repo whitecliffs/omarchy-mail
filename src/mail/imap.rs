@@ -636,6 +636,10 @@ fn message_from_fetch(
         .flags()
         .iter()
         .any(|flag| matches!(flag, imap::types::Flag::Seen));
+    let starred = fetch
+        .flags()
+        .iter()
+        .any(|flag| matches!(flag, imap::types::Flag::Flagged));
     let (sender_name, sender_email) = split_sender(&parsed.sender);
     let subject = parsed.subject.clone();
     let body_html = parsed.is_html.then(|| parsed.body.clone());
@@ -663,7 +667,7 @@ fn message_from_fetch(
         body_html,
         received_at,
         unread,
-        starred: false,
+        starred,
         has_attachments: !attachments.is_empty(),
         attachments,
         thread_size: 1,
@@ -716,7 +720,11 @@ fn derive_thread_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ServerConfig;
     use imap::Authenticator;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn stable_ids_are_repeatable() {
@@ -784,5 +792,137 @@ mod tests {
             authenticator.process(b"ignored challenge"),
             "user=jim@example.com\x01auth=Bearer token-value\x01\x01"
         );
+    }
+
+    #[test]
+    fn syncs_a_real_plaintext_imap_session_with_folders_and_mime_messages() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake IMAP server");
+        let port = listener.local_addr().expect("server address").port();
+        let server = thread::spawn(move || run_fake_imap_server(listener));
+
+        let mut account = Account::new("jim@example.com", "Jim");
+        account.id = Some(42);
+        account.incoming = ServerConfig {
+            hostname: "127.0.0.1".into(),
+            port,
+            security: SecurityMode::None,
+            username: "jim@example.com".into(),
+            auth: crate::models::AuthMethod::Password,
+        };
+        let snapshot = sync_inbox(
+            &account,
+            &AuthMaterial::Password("test-password".into()),
+            250,
+        )
+        .expect("IMAP sync");
+
+        server
+            .join()
+            .expect("fake IMAP server thread")
+            .expect("IMAP server");
+        assert_eq!(snapshot.uidvalidity, Some(42));
+        assert_eq!(snapshot.all_uids, vec![2, 1]);
+        assert_eq!(snapshot.skipped_messages, 0);
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[0].remote_uid, Some(2));
+        assert_eq!(snapshot.messages[0].subject, "A newsletter with images");
+        assert_eq!(snapshot.messages[1].remote_uid, Some(1));
+        assert_eq!(snapshot.messages[1].subject, "Welcome 😀");
+        assert!(snapshot.messages[1].starred);
+        assert!(snapshot.folders.iter().any(|folder| folder.kind == "sent"));
+    }
+
+    fn run_fake_imap_server(listener: TcpListener) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.write_all(b"* OK Omarchy Mail test server ready\r\n")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let message_one = include_bytes!("../../tests/fixtures/multipart-utf8.eml");
+        let message_two = include_bytes!("../../tests/fixtures/related-remote-image.eml");
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let mut words = line.split_whitespace();
+            let Some(tag) = words.next() else {
+                continue;
+            };
+            let command = words.next().unwrap_or_default().to_ascii_uppercase();
+            match command.as_str() {
+                "LOGIN" => write_tagged(&mut stream, tag, "OK LOGIN completed")?,
+                "LIST" => {
+                    stream.write_all(
+                        b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
+                          * LIST (\\HasNoChildren) \"/\" \"Sent\"\r\n\
+                          * LIST (\\HasNoChildren) \"/\" \"Archive/Receipts\"\r\n",
+                    )?;
+                    write_tagged(&mut stream, tag, "OK LIST completed")?;
+                }
+                "SELECT" => {
+                    stream.write_all(
+                        b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                          * OK [PERMANENTFLAGS (\\* \\Answered \\Flagged \\Deleted \\Seen \\Draft)] Flags\r\n\
+                          * 2 EXISTS\r\n\
+                          * 0 RECENT\r\n\
+                          * OK [UIDVALIDITY 42] UIDs valid\r\n\
+                          * OK [UIDNEXT 3] Predicted next UID\r\n",
+                    )?;
+                    write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
+                }
+                "UID" if line.to_ascii_uppercase().contains("SEARCH") => {
+                    stream.write_all(b"* SEARCH 1 2\r\n")?;
+                    write_tagged(&mut stream, tag, "OK UID SEARCH completed")?;
+                }
+                "UID" if line.to_ascii_uppercase().contains("FETCH") => {
+                    write_fetch(
+                        &mut stream,
+                        2,
+                        2,
+                        "\\Seen",
+                        message_two,
+                        "01-Sep-2026 12:00:00 +0000",
+                    )?;
+                    write_fetch(
+                        &mut stream,
+                        1,
+                        1,
+                        "\\Flagged",
+                        message_one,
+                        "31-Aug-2026 12:00:00 +0000",
+                    )?;
+                    write_tagged(&mut stream, tag, "OK UID FETCH completed")?;
+                }
+                "LOGOUT" => {
+                    stream.write_all(b"* BYE Logging out\r\n")?;
+                    write_tagged(&mut stream, tag, "OK LOGOUT completed")?;
+                    break;
+                }
+                _ => write_tagged(&mut stream, tag, "OK command completed")?,
+            }
+        }
+        Ok(())
+    }
+
+    fn write_tagged(stream: &mut TcpStream, tag: &str, response: &str) -> std::io::Result<()> {
+        writeln!(stream, "{tag} {response}\r")
+    }
+
+    fn write_fetch(
+        stream: &mut TcpStream,
+        sequence: u32,
+        uid: u32,
+        flags: &str,
+        raw: &[u8],
+        internal_date: &str,
+    ) -> std::io::Result<()> {
+        write!(
+            stream,
+            "* {sequence} FETCH (UID {uid} FLAGS ({flags}) INTERNALDATE \"{internal_date}\" RFC822 {{{}}}\r\n",
+            raw.len()
+        )?;
+        stream.write_all(raw)?;
+        stream.write_all(b")\r\n")
     }
 }

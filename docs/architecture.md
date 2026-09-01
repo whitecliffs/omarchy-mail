@@ -106,6 +106,17 @@ Search terms are converted to SQLite FTS5 prefix expressions after quoting
 embedded syntax characters. This keeps the index responsive while ensuring
 operators typed into the search field remain plain search text.
 
+Remote refreshes update message metadata and attachment state without
+discarding an optimistic local read/star toggle. Pending flag actions are
+reapplied after each cache refresh and remain authoritative in the UI until
+the corresponding IMAP operation succeeds.
+
+The protocol boundary has offline socket integration coverage in the IMAP and
+SMTP modules. The tests run the production clients against temporary local
+servers, so login, folder discovery, UID FETCH literals, MIME parsing, SMTP
+authentication, envelope recipients, and Bcc header privacy are checked
+without depending on a live provider.
+
 ## Theme boundary
 
 `packaging/omarchy-mail.css.tpl` is installed as

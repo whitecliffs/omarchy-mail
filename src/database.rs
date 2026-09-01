@@ -374,7 +374,7 @@ impl Database {
                 inserted += 1;
             }
             transaction.execute(
-                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body, body_html=excluded.body_html, attachments_json=excluded.attachments_json",
+                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)\n                 ON CONFLICT(id) DO UPDATE SET\n                     message_id=excluded.message_id, thread_key=excluded.thread_key,\n                     sender_name=excluded.sender_name, sender_email=excluded.sender_email,\n                     recipients=excluded.recipients, subject=excluded.subject, preview=excluded.preview,\n                     body=excluded.body, body_html=excluded.body_html, received_at=excluded.received_at,\n                     unread=excluded.unread, starred=excluded.starred,\n                     has_attachments=excluded.has_attachments, thread_size=excluded.thread_size,\n                     attachments_json=excluded.attachments_json",
                 params![
                     message.id,
                     message.account_id,
@@ -677,6 +677,40 @@ impl Database {
         Ok(())
     }
 
+    /// Restores optimistic read/star state after a server refresh. Pending
+    /// actions are deliberately applied in insertion order so the latest
+    /// offline toggle wins until the IMAP worker acknowledges it.
+    pub fn reapply_pending_actions(&self, account_id: i64) -> Result<usize> {
+        let actions = self.pending_actions(account_id)?;
+        let connection = self.connection()?;
+        let mut changed = 0;
+        for action in actions {
+            let Some(message_id) = action.message_id else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&action.payload_json)
+            else {
+                continue;
+            };
+            let Some(value) = payload.get("value").and_then(serde_json::Value::as_bool) else {
+                continue;
+            };
+            let updated = match action.action.as_str() {
+                "read" => connection.execute(
+                    "UPDATE messages SET unread = ?1 WHERE id = ?2",
+                    params![value as i64, message_id],
+                )?,
+                "star" => connection.execute(
+                    "UPDATE messages SET starred = ?1 WHERE id = ?2",
+                    params![value as i64, message_id],
+                )?,
+                _ => 0,
+            };
+            changed += updated;
+        }
+        Ok(changed)
+    }
+
     pub fn pending_actions(&self, account_id: i64) -> Result<Vec<PendingAction>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -925,6 +959,69 @@ mod tests {
             loaded[0].attachments[0].content_id.as_deref(),
             Some("notes@example.com")
         );
+    }
+
+    #[test]
+    fn refreshes_existing_message_metadata_and_restores_pending_flags() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("account");
+        let mut message = Message::demo_messages().remove(0);
+        message.account_id = Some(account_id);
+        message.has_attachments = false;
+        message.attachments.clear();
+        message.unread = true;
+        message.starred = false;
+        database
+            .upsert_messages(&[message.clone()])
+            .expect("initial message");
+
+        database
+            .queue_action(
+                Some(account_id),
+                Some(message.id),
+                "read",
+                r#"{"value":false,"folder":"Inbox"}"#,
+            )
+            .expect("queue read action");
+        database
+            .queue_action(
+                Some(account_id),
+                Some(message.id),
+                "star",
+                r#"{"value":true,"folder":"Inbox"}"#,
+            )
+            .expect("queue star action");
+
+        message.sender_name = "Updated sender".into();
+        message.subject = "Updated subject".into();
+        message.has_attachments = true;
+        message.attachments = vec![AttachmentInfo {
+            filename: "updated.txt".into(),
+            content_type: "text/plain".into(),
+            size: 7,
+            cache_path: "/tmp/updated.txt".into(),
+            content_id: None,
+        }];
+        message.unread = true;
+        message.starred = false;
+        database
+            .upsert_messages(&[message])
+            .expect("refreshed message");
+        database
+            .reapply_pending_actions(account_id)
+            .expect("restore pending flags");
+
+        let loaded = database
+            .list_messages(Some(account_id), "Inbox")
+            .expect("load refreshed message");
+        assert_eq!(loaded[0].sender_name, "Updated sender");
+        assert_eq!(loaded[0].subject, "Updated subject");
+        assert!(loaded[0].has_attachments);
+        assert!(!loaded[0].unread);
+        assert!(loaded[0].starred);
     }
 
     #[test]

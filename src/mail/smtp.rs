@@ -232,6 +232,11 @@ mod tests {
     use super::*;
     use crate::models::Account;
     use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Sender};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -335,5 +340,114 @@ mod tests {
         assert!(parsed.body.contains("Rich note"));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].bytes, b"round-trip attachment\r\n");
+    }
+
+    #[test]
+    fn sends_through_a_real_plaintext_smtp_session_without_serializing_bcc() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake SMTP server");
+        let port = listener.local_addr().expect("server address").port();
+        let (capture_sender, capture_receiver) = mpsc::channel();
+        let server = thread::spawn(move || run_fake_smtp_server(listener, capture_sender));
+
+        let mut account = Account::new("jim@example.com", "Jim");
+        account.outgoing = crate::models::ServerConfig {
+            hostname: "127.0.0.1".into(),
+            port,
+            security: crate::models::SecurityMode::None,
+            username: "jim@example.com".into(),
+            auth: crate::models::AuthMethod::Password,
+        };
+        send_text_with_auth(
+            &account,
+            &AuthMaterial::Password("test-password".into()),
+            "Jane <jane@example.com>",
+            &["Team <team@example.com>".into()],
+            &["Archive <archive@example.com>".into()],
+            "A socket-level note",
+            "Hello from the SMTP integration fixture.",
+            Some("<p>Hello from the <strong>SMTP</strong> integration fixture.</p>"),
+            &[],
+        )
+        .expect("SMTP send");
+
+        let capture = capture_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SMTP capture");
+        server
+            .join()
+            .expect("fake SMTP server thread")
+            .expect("SMTP server");
+        assert!(
+            capture
+                .recipients
+                .iter()
+                .any(|recipient| recipient.contains("archive@example.com"))
+        );
+        assert!(capture.message.contains("Subject: A socket-level note"));
+        assert!(capture.message.contains("Hello from the SMTP"));
+        assert!(!capture.message.contains("archive@example.com"));
+    }
+
+    #[derive(Debug)]
+    struct SmtpCapture {
+        recipients: Vec<String>,
+        message: String,
+    }
+
+    fn run_fake_smtp_server(
+        listener: TcpListener,
+        capture_sender: Sender<SmtpCapture>,
+    ) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(b"220 Omarchy Mail test SMTP ready\r\n")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut recipients = Vec::new();
+        let mut message = Vec::new();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let command = line.trim_end_matches(['\r', '\n']);
+            let upper = command.to_ascii_uppercase();
+            if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                stream
+                    .write_all(b"250-omarchy.test\r\n250-8BITMIME\r\n250 AUTH PLAIN LOGIN\r\n")?;
+            } else if upper.starts_with("AUTH ") {
+                stream.write_all(b"235 2.7.0 Authentication successful\r\n")?;
+            } else if upper.starts_with("MAIL FROM:") {
+                stream.write_all(b"250 2.1.0 Sender OK\r\n")?;
+            } else if upper.starts_with("RCPT TO:") {
+                recipients.push(command.to_string());
+                stream.write_all(b"250 2.1.5 Recipient OK\r\n")?;
+            } else if upper == "DATA" {
+                stream.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")?;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    if line == ".\r\n" || line == ".\n" {
+                        break;
+                    }
+                    message.extend_from_slice(line.as_bytes());
+                }
+                stream.write_all(b"250 2.0.0 Message accepted\r\n")?;
+            } else if upper == "QUIT" {
+                stream.write_all(b"221 2.0.0 Closing connection\r\n")?;
+                break;
+            } else {
+                stream.write_all(b"250 OK\r\n")?;
+            }
+        }
+
+        let _ = capture_sender.send(SmtpCapture {
+            recipients,
+            message: String::from_utf8_lossy(&message).into_owned(),
+        });
+        Ok(())
     }
 }

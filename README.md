@@ -88,7 +88,10 @@ Omarchy’s launcher without a custom launcher integration.
 
 The test suite includes fixture messages for UTF-8 headers, multipart
 attachments, inline and remote images, truncated MIME, and a serialized SMTP
-round trip. It remains fully offline and does not require real credentials.
+round trip. It also exercises the real IMAP and SMTP socket transports against
+temporary localhost protocol servers, including UIDVALIDITY, flags, folders,
+authentication, recipients, and Bcc handling. It remains fully offline and
+does not require real credentials.
 
 ## Accounts and data
 

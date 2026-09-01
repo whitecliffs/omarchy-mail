@@ -317,6 +317,11 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                         report = Some(match database.upsert_messages(&messages) {
                             Ok(new_messages) => {
                                 let mut cache_error = reconciliation_error.clone();
+                                if let Some(account_id) = account.id
+                                    && let Err(error) = database.reapply_pending_actions(account_id)
+                                {
+                                    append_error(&mut cache_error, error);
+                                }
                                 if let (Some(account_id), Some(uidvalidity)) =
                                     (account.id, uidvalidity)
                                     && let Err(error) = database.reconcile_folder(
@@ -454,6 +459,9 @@ fn sync_standard_folders(
                 match database.upsert_messages(&snapshot.messages) {
                     Ok(new_messages) => {
                         new_total += new_messages;
+                        if let Err(error) = database.reapply_pending_actions(account_id) {
+                            errors.push(format!("{}: {error}", folder.name));
+                        }
                         if let Some(uidvalidity) = snapshot.uidvalidity
                             && let Err(error) = database.reconcile_folder(
                                 account_id,
@@ -549,7 +557,7 @@ pub fn spawn_folder_sync(
                         let skipped_messages = snapshot.skipped_messages;
                         match database.upsert_messages(&snapshot.messages) {
                             Ok(new_messages) => {
-                                let error = snapshot
+                                let mut error = snapshot
                                     .uidvalidity
                                     .and_then(|uidvalidity| {
                                         database
@@ -562,6 +570,12 @@ pub fn spawn_folder_sync(
                                             .err()
                                     })
                                     .map(|error| error.to_string());
+                                if let Some(account_id) = account.id
+                                    && let Err(reapply_error) =
+                                        database.reapply_pending_actions(account_id)
+                                {
+                                    append_error(&mut error, reapply_error);
+                                }
                                 FolderSyncReport {
                                     account_id: account.id,
                                     email: account.email,
