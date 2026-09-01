@@ -39,6 +39,18 @@ pub fn notify_new_mail(account: &str, fetched: usize) {
         .show();
 }
 
+fn load_imap_password(account: &Account) -> Result<String, String> {
+    match credentials::load_auth_material(&account.email, "imap", &account.incoming.auth)
+        .map_err(|error| error.to_string())?
+    {
+        credentials::AuthMaterial::Password(password) => Ok(password),
+        credentials::AuthMaterial::OAuth2AccessToken(_) => Err(
+            "OAuth2 sign-in is reserved for a future provider flow; choose password or an app password for now."
+                .into(),
+        ),
+    }
+}
+
 /// Starts one isolated worker per account. A failing account returns a report
 /// rather than taking down the unified mailbox or another account's worker.
 pub fn spawn_account_sync(
@@ -74,7 +86,7 @@ pub fn spawn_account_monitor(
             let mut report = sync_account_once(&account, &database);
             report.initial = initial_sync;
             if initial_sync && report.error.is_none() {
-                match credentials::load_password(&account.email, "imap") {
+                match load_imap_password(&account) {
                     Ok(password) => match sync_standard_folders(&account, &password, &database) {
                         Ok((fetched, new_messages)) => {
                             report.fetched += fetched;
@@ -101,7 +113,7 @@ pub fn spawn_account_monitor(
             }
             reconnect_backoff = Duration::from_secs(2);
 
-            let password = match credentials::load_password(&account.email, "imap") {
+            let password = match load_imap_password(&account) {
                 Ok(password) => password,
                 Err(error) => {
                     let _ = sender.send_blocking(SyncReport {
@@ -150,7 +162,7 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) {
 }
 
 fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
-    match credentials::load_password(&account.email, "imap") {
+    match load_imap_password(account) {
         Ok(password) => {
             let reconciliation_error = reconcile_pending_actions(account, &password, database);
             let mut last_error = None;
@@ -352,7 +364,7 @@ pub fn spawn_folder_sync(
     sender: async_channel::Sender<FolderSyncReport>,
 ) {
     thread::spawn(move || {
-        let report = match credentials::load_password(&account.email, "imap") {
+        let report = match load_imap_password(&account) {
             Ok(password) => {
                 let mut messages = None;
                 let mut last_error = None;

@@ -1,6 +1,8 @@
 use crate::database::Database;
 use crate::mail;
-use crate::models::{Account, AttachmentInfo, MailFolder, Message, SecurityMode, ServerConfig};
+use crate::models::{
+    Account, AttachmentInfo, AuthMethod, MailFolder, Message, SecurityMode, ServerConfig,
+};
 use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
@@ -1233,14 +1235,53 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
     }
     content.append(&body);
 
-    if !message.attachments.is_empty() {
+    let inline_images = message
+        .attachments
+        .iter()
+        .filter(|attachment| is_inline_image(attachment))
+        .collect::<Vec<_>>();
+    if !inline_images.is_empty() {
+        let images = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        images.set_margin_top(24);
+        images.add_css_class("mail-inline-images");
+        let heading = gtk::Label::new(Some("Inline images"));
+        heading.set_xalign(0.0);
+        heading.add_css_class("mail-reader-meta");
+        images.append(&heading);
+        for attachment in &inline_images {
+            if attachment.cache_path.is_empty() {
+                let unavailable = gtk::Label::new(Some("Inline image unavailable"));
+                unavailable.set_xalign(0.0);
+                unavailable.add_css_class("mail-empty-body");
+                images.append(&unavailable);
+                continue;
+            }
+            let picture = gtk::Picture::for_filename(&attachment.cache_path);
+            picture.add_css_class("mail-inline-image");
+            picture.set_alternative_text(Some(&attachment.filename));
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_can_shrink(true);
+            picture.set_halign(gtk::Align::Start);
+            picture.set_hexpand(true);
+            picture.set_margin_bottom(8);
+            images.append(&picture);
+        }
+        content.append(&images);
+    }
+
+    let file_attachments = message
+        .attachments
+        .iter()
+        .filter(|attachment| !is_inline_image(attachment))
+        .collect::<Vec<_>>();
+    if !file_attachments.is_empty() {
         let attachments = gtk::Box::new(gtk::Orientation::Vertical, 8);
         attachments.set_margin_top(30);
         let heading = gtk::Label::new(Some("Attachments"));
         heading.set_xalign(0.0);
         heading.add_css_class("mail-reader-meta");
         attachments.append(&heading);
-        for attachment in &message.attachments {
+        for attachment in file_attachments {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             row.add_css_class("mail-attachment-chip");
             let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
@@ -1260,7 +1301,7 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
             attachments.append(&row);
         }
         content.append(&attachments);
-    } else if message.has_attachments {
+    } else if message.has_attachments && inline_images.is_empty() {
         let attachments = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         attachments.set_margin_top(30);
         let chip = gtk::Label::new(Some("  attachment unavailable  "));
@@ -1268,6 +1309,14 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
         attachments.append(&chip);
         content.append(&attachments);
     }
+}
+
+fn is_inline_image(attachment: &AttachmentInfo) -> bool {
+    attachment.content_id.is_some()
+        && attachment
+            .content_type
+            .to_ascii_lowercase()
+            .starts_with("image/")
 }
 
 fn format_attachment_label(attachment: &AttachmentInfo) -> String {
@@ -1520,12 +1569,14 @@ fn open_account_dialog(state: Rc<AppState>) {
             port: incoming_port.value_as_int().max(1) as u16,
             security: security_for_index(incoming_security.selected()),
             username: incoming_login.clone(),
+            auth: AuthMethod::Password,
         };
         account.outgoing = ServerConfig {
             hostname: outgoing_host.text().trim().to_string(),
             port: outgoing_port.value_as_int().max(1) as u16,
             security: security_for_index(outgoing_security.selected()),
             username: outgoing_login.clone(),
+            auth: AuthMethod::Password,
         };
         button.set_sensitive(false);
         error.set_text("Saving securely…");

@@ -27,9 +27,10 @@ Archive, Spam, and Trash folders with a bounded cache; custom folders remain
 on-demand.
 
 HTML mail is sanitized and rendered with native GTK/Pango formatting rather
-than a browser runtime. Incoming attachments are cached under
-`$XDG_CACHE_HOME/omarchy-mail/attachments/` (or `~/.cache/omarchy-mail/`) and
-can be saved from the reader.
+than a browser runtime. Safe `cid:` inline images are cached and shown as
+native GTK pictures; remote images and scripts remain blocked. Incoming
+attachments are cached under `$XDG_CACHE_HOME/omarchy-mail/attachments/` (or
+`~/.cache/omarchy-mail/`) and can be saved from the reader.
 
 ## Build and preview
 
@@ -68,7 +69,10 @@ Omarchy’s launcher without a custom launcher integration.
 
 Add accounts through the graphical setup flow. IMAP and SMTP usernames and
 passwords can differ; secrets are stored separately in the Linux Secret
-Service and never in SQLite. The local database is at
+Service and never in SQLite. The account model now separates authentication
+method from transport security, and keyring slots for future OAuth2 tokens
+are isolated from password entries; the provider authorization UI and SASL
+XOAUTH2 transport are a later milestone. The local database is at
 `$XDG_DATA_HOME/omarchy-mail/mail.db` or `~/.local/share/omarchy-mail/mail.db`.
 
 ## Theme integration

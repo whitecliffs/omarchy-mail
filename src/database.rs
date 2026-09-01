@@ -419,7 +419,7 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::SecurityMode;
+    use crate::models::{AuthMethod, SecurityMode};
     use tempfile::tempdir;
 
     #[test]
@@ -458,6 +458,7 @@ mod tests {
             content_type: "text/plain".into(),
             size: 5,
             cache_path: "/tmp/notes.txt".into(),
+            content_id: Some("notes@example.com".into()),
         }];
         database
             .upsert_messages(&[message])
@@ -466,6 +467,10 @@ mod tests {
         let loaded = database.list_messages(None, "Inbox").expect("load message");
         assert_eq!(loaded[0].attachments[0].filename, "notes.txt");
         assert_eq!(loaded[0].attachments[0].size, 5);
+        assert_eq!(
+            loaded[0].attachments[0].content_id.as_deref(),
+            Some("notes@example.com")
+        );
     }
 
     #[test]
@@ -528,6 +533,11 @@ mod tests {
         let encoded = serde_json::to_string(&config).expect("json");
         assert!(!encoded.contains("password"));
         assert_eq!(config.security, SecurityMode::Tls);
+        assert_eq!(config.auth, AuthMethod::Password);
+
+        let legacy = r#"{"hostname":"imap.example.com","port":993,"security":"Tls","username":"jim@example.com"}"#;
+        let legacy_config: ServerConfig = serde_json::from_str(legacy).expect("legacy config");
+        assert_eq!(legacy_config.auth, AuthMethod::Password);
     }
 
     #[test]

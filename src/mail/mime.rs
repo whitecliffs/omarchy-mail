@@ -30,6 +30,7 @@ pub struct Attachment {
     pub filename: String,
     pub content_type: String,
     pub bytes: Vec<u8>,
+    pub content_id: Option<String>,
 }
 
 pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
@@ -182,6 +183,7 @@ pub fn cache_attachments(message_id: i64, attachments: &[Attachment]) -> Vec<Att
                 content_type: attachment.content_type.clone(),
                 size: attachment.bytes.len() as u64,
                 cache_path,
+                content_id: attachment.content_id.clone(),
             }
         })
         .collect()
@@ -294,7 +296,17 @@ fn collect_attachments_inner(mail: &ParsedMail<'_>, attachments: &mut Vec<Attach
             .get_first_value("Content-Disposition")
             .and_then(|value| parse_filename(&value).map(ToOwned::to_owned))
     });
-    if let Some(filename) = filename {
+    let content_id = mail
+        .headers
+        .get_first_value("Content-ID")
+        .and_then(|value| normalize_content_id(&value));
+    let is_inline_image = content_id.is_some()
+        && mail
+            .ctype
+            .mimetype
+            .to_ascii_lowercase()
+            .starts_with("image/");
+    if filename.is_some() || is_inline_image {
         if !mail.subparts.is_empty() {
             for part in &mail.subparts {
                 collect_attachments_inner(part, attachments);
@@ -303,9 +315,10 @@ fn collect_attachments_inner(mail: &ParsedMail<'_>, attachments: &mut Vec<Attach
         }
         if let Ok(bytes) = mail.get_body_raw() {
             attachments.push(Attachment {
-                filename: safe_filename(&filename),
+                filename: safe_filename(filename.as_deref().unwrap_or("inline-image")),
                 content_type: mail.ctype.mimetype.clone(),
                 bytes,
+                content_id,
             });
         }
         return;
@@ -313,6 +326,11 @@ fn collect_attachments_inner(mail: &ParsedMail<'_>, attachments: &mut Vec<Attach
     for part in &mail.subparts {
         collect_attachments_inner(part, attachments);
     }
+}
+
+fn normalize_content_id(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('<').trim_matches('>').trim();
+    (!value.is_empty() && value.len() <= 512).then(|| value.to_string())
 }
 
 fn parse_filename(disposition: &str) -> Option<&str> {
@@ -387,5 +405,30 @@ mod tests {
         assert_eq!(parsed.sender, "Jane <jane@example.com>");
         assert_eq!(parsed.attachments[0].filename, "notes.txt");
         assert_eq!(parsed.attachments[0].bytes, b"notes");
+        assert_eq!(parsed.attachments[0].content_id, None);
+    }
+
+    #[test]
+    fn preserves_inline_image_content_id_without_allowing_remote_images() {
+        let raw = concat!(
+            "Content-Type: multipart/related; boundary=related\r\n\r\n",
+            "--related\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>Hello<img src=\"cid:logo@example.com\"></p>\r\n",
+            "--related\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-ID: <logo@example.com>\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "iVBORw0KGgo=\r\n",
+            "--related--\r\n",
+        );
+        let parsed = parse(raw.as_bytes()).expect("mime parse");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(
+            parsed.attachments[0].content_id.as_deref(),
+            Some("logo@example.com")
+        );
+        assert!(!parsed.body.contains("remote"));
+        assert!(!sanitize_html(&parsed.body).contains("img"));
     }
 }

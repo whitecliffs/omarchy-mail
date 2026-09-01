@@ -11,8 +11,13 @@ without making the GTK main loop responsible for network activity.
   FTS5 indexing, and pending-action storage. Passwords are intentionally not
   represented in its schema.
 - `mail/credentials.rs` stores passwords using the Linux Secret Service via
-  the `keyring` crate.
-- `mail/mime.rs` parses MIME messages and sanitises HTML before the UI sees it.
+  the `keyring` crate and reserves separate keyring slots for OAuth2 access
+  tokens. `AuthMethod` is deliberately separate from TLS transport settings;
+  provider authorization UI and SASL XOAUTH2 are not enabled yet.
+- `mail/mime.rs` parses MIME messages, retains normalized `Content-ID` values,
+  and sanitises HTML before the UI sees it. Inline image bytes are cached as
+  ordinary disposable attachments and rendered by GTK only from that local
+  cache; remote URLs and scripts never reach a web runtime.
 - `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
   worker threads, with transport-aware IMAP connections, mailbox discovery,
   bounded folder fetches, queued action reconciliation, attachment caching,

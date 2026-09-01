@@ -33,6 +33,17 @@ pub struct ServerConfig {
     pub port: u16,
     pub security: SecurityMode,
     pub username: String,
+    #[serde(default)]
+    pub auth: AuthMethod,
+}
+
+/// Authentication is modelled separately from transport security so adding a
+/// provider OAuth flow does not require changing account storage again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AuthMethod {
+    #[default]
+    Password,
+    OAuth2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +73,8 @@ pub struct AttachmentInfo {
     pub content_type: String,
     pub size: u64,
     pub cache_path: String,
+    #[serde(default)]
+    pub content_id: Option<String>,
 }
 
 impl ServerConfig {
@@ -71,6 +84,7 @@ impl ServerConfig {
             port: 993,
             security: SecurityMode::Tls,
             username: username.to_string(),
+            auth: AuthMethod::Password,
         }
     }
 
@@ -80,6 +94,7 @@ impl ServerConfig {
             port: 465,
             security: SecurityMode::Tls,
             username: username.to_string(),
+            auth: AuthMethod::Password,
         }
     }
 }
