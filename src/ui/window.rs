@@ -20,6 +20,7 @@ struct AppState {
     reader: gtk::Box,
     search_entry: gtk::SearchEntry,
     scope: RefCell<MailScope>,
+    filter: RefCell<MailFilter>,
     selected_message: RefCell<Option<i64>>,
     status: gtk::Label,
     demo_mode: bool,
@@ -29,6 +30,14 @@ struct AppState {
 enum MailScope {
     Unified(String),
     Account { id: i64, folder: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailFilter {
+    All,
+    Unread,
+    Starred,
+    Attachments,
 }
 
 pub fn build_window(application: &adw::Application) {
@@ -78,7 +87,7 @@ pub fn build_window(application: &adw::Application) {
 
     let middle = gtk::Box::new(gtk::Orientation::Vertical, 0);
     middle.add_css_class("mail-middle");
-    let (filter_bar, search) = build_filter_bar();
+    let (filter_bar, search, filter_button) = build_filter_bar();
     middle.append(&filter_bar);
     middle.append(&message_scroll);
 
@@ -113,6 +122,7 @@ pub fn build_window(application: &adw::Application) {
         reader,
         search_entry: search.clone(),
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
+        filter: RefCell::new(MailFilter::All),
         selected_message: RefCell::new(None),
         status,
         demo_mode,
@@ -126,6 +136,8 @@ pub fn build_window(application: &adw::Application) {
     search.connect_search_changed(move |entry| {
         render_messages(&state_for_search, entry.text().as_str())
     });
+    let state_for_filter = state.clone();
+    filter_button.connect_clicked(move |button| open_filter_menu(state_for_filter.clone(), button));
     render_sidebar(&state);
     render_messages(&state, "");
     render_reader(&state, None);
@@ -244,7 +256,7 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
     state.window.add_controller(controller);
 }
 
-fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry) {
+fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar.add_css_class("mail-filter-bar");
     bar.set_margin_start(12);
@@ -261,7 +273,36 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry) {
 
     let filter = icon_button("view-filter-symbolic", "Filter messages");
     bar.append(&filter);
-    (bar, search)
+    (bar, search, filter)
+}
+
+fn open_filter_menu(state: Rc<AppState>, button: &gtk::Button) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(button);
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(6);
+    menu.set_margin_bottom(6);
+    menu.set_margin_start(6);
+    menu.set_margin_end(6);
+    for (label, filter) in [
+        ("All messages", MailFilter::All),
+        ("Unread", MailFilter::Unread),
+        ("Starred", MailFilter::Starred),
+        ("With attachments", MailFilter::Attachments),
+    ] {
+        let item = gtk::Button::with_label(label);
+        item.set_has_frame(false);
+        let state_for_item = state.clone();
+        let popover_for_item = popover.clone();
+        item.connect_clicked(move |_| {
+            state_for_item.filter.replace(filter);
+            render_messages(&state_for_item, state_for_item.search_entry.text().as_str());
+            popover_for_item.popdown();
+        });
+        menu.append(&item);
+    }
+    popover.set_child(Some(&menu));
+    popover.popup();
 }
 
 fn render_sidebar(state: &Rc<AppState>) {
@@ -561,6 +602,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     let raw_query = query.trim();
     let query = raw_query.to_lowercase();
     let scope = state.scope.borrow().clone();
+    let filter = *state.filter.borrow();
     let messages = if raw_query.is_empty() || state.demo_mode {
         state.messages.borrow().clone()
     } else {
@@ -578,6 +620,12 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
             }
         };
         in_scope
+            && match filter {
+                MailFilter::All => true,
+                MailFilter::Unread => message.unread,
+                MailFilter::Starred => message.starred,
+                MailFilter::Attachments => message.has_attachments,
+            }
             && (query.is_empty()
                 || [
                     message.sender_name.as_str(),
@@ -593,21 +641,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         let message_id = message.id;
         let state_for_star = state.clone();
         star.connect_clicked(move |_| {
-            let next = {
-                let mut messages = state_for_star.messages.borrow_mut();
-                let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
-                else {
-                    return;
-                };
-                message.starred = !message.starred;
-                message.starred
-            };
-            let database = state_for_star.database.clone();
-            std::thread::spawn(move || {
-                let _ = database.set_starred(message_id, next);
-            });
-            render_sidebar(&state_for_star);
-            render_messages(&state_for_star, state_for_star.search_entry.text().as_str());
+            apply_message_action(&state_for_star, message_id, "star");
         });
 
         let gesture = gtk::GestureClick::new();

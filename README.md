@@ -11,7 +11,8 @@ fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
 actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
-surfaces, and Omarchy theme integration. Full folder reconciliation, live
+surfaces, lightweight All/Unread/Starred/Attachment filters, and Omarchy theme
+integration. Full folder reconciliation, live
 conversation rendering, inline image rendering, OAuth2, attachment re-fetch
 after cache eviction, and a full offline outbox remain explicit follow-up
 milestones. Read/star/move
