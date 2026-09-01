@@ -1,6 +1,6 @@
 use crate::database::Database;
 use crate::mail;
-use crate::models::{Account, MailFolder, Message, SecurityMode, ServerConfig};
+use crate::models::{Account, AttachmentInfo, MailFolder, Message, SecurityMode, ServerConfig};
 use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
@@ -969,23 +969,55 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         rule.set_margin_bottom(24);
         content.append(&rule);
 
-        let body_text = if message.body.contains('<') {
-            crate::mail::mime::html_to_text(&message.body)
-        } else {
-            message.body.clone()
-        };
-        let body = gtk::Label::new(Some(&body_text));
+        let body = gtk::Label::new(None);
         body.set_xalign(0.0);
         body.set_yalign(0.0);
         body.set_wrap(true);
         body.set_selectable(true);
         body.add_css_class("mail-reader-body");
+        if message.body.contains('<') {
+            body.set_use_markup(true);
+            body.set_markup(&crate::mail::mime::html_to_pango(&message.body));
+            body.connect_activate_link(|_, uri| {
+                let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
+                glib::Propagation::Stop
+            });
+        } else {
+            body.set_text(&message.body);
+        }
         content.append(&body);
 
-        if message.has_attachments {
+        if !message.attachments.is_empty() {
+            let attachments = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            attachments.set_margin_top(30);
+            let heading = gtk::Label::new(Some("Attachments"));
+            heading.set_xalign(0.0);
+            heading.add_css_class("mail-reader-meta");
+            attachments.append(&heading);
+            for attachment in &message.attachments {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                row.add_css_class("mail-attachment-chip");
+                let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+                row.append(&icon);
+                let label = gtk::Label::new(Some(&format_attachment_label(attachment)));
+                label.set_xalign(0.0);
+                label.set_hexpand(true);
+                row.append(&label);
+                let save = gtk::Button::with_label("Save");
+                save.set_sensitive(!attachment.cache_path.is_empty());
+                let state_for_attachment = state.clone();
+                let attachment = attachment.clone();
+                save.connect_clicked(move |_| {
+                    save_attachment(state_for_attachment.clone(), attachment.clone())
+                });
+                row.append(&save);
+                attachments.append(&row);
+            }
+            content.append(&attachments);
+        } else if message.has_attachments {
             let attachments = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             attachments.set_margin_top(30);
-            let chip = gtk::Label::new(Some("  attachment  "));
+            let chip = gtk::Label::new(Some("  attachment unavailable  "));
             chip.add_css_class("mail-attachment-chip");
             attachments.append(&chip);
             content.append(&attachments);
@@ -1022,6 +1054,68 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         empty.append(&body);
         state.reader.append(&empty);
     }
+}
+
+fn format_attachment_label(attachment: &AttachmentInfo) -> String {
+    let size = if attachment.size < 1024 {
+        format!("{} B", attachment.size)
+    } else if attachment.size < 1024 * 1024 {
+        format!("{:.1} KB", attachment.size as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", attachment.size as f64 / (1024.0 * 1024.0))
+    };
+    format!("{}  ·  {}", attachment.filename, size)
+}
+
+fn save_attachment(state: Rc<AppState>, attachment: AttachmentInfo) {
+    if attachment.cache_path.is_empty() {
+        set_status(
+            &state,
+            "This attachment is not available in the local cache",
+        );
+        return;
+    }
+    let dialog = gtk::FileDialog::builder()
+        .title("Save attachment")
+        .accept_label("Save")
+        .initial_name(&attachment.filename)
+        .build();
+    let window = state.window.clone();
+    dialog.save(
+        Some(&window),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(file) => {
+                let Some(destination) = file.path() else {
+                    set_status(&state, "That destination is not available locally");
+                    return;
+                };
+                let source = PathBuf::from(&attachment.cache_path);
+                let (sender, receiver) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let result = std::fs::copy(source, destination)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    let _ = sender.send_blocking(result);
+                });
+                let state_for_result = state.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    match receiver.recv().await {
+                        Ok(Ok(())) => set_status(&state_for_result, "Attachment saved"),
+                        Ok(Err(error)) => set_status(
+                            &state_for_result,
+                            &format!("Couldn’t save attachment: {error}"),
+                        ),
+                        Err(_) => {
+                            set_status(&state_for_result, "The save worker stopped unexpectedly.")
+                        }
+                    }
+                });
+            }
+            Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {}
+            Err(error) => set_status(&state, &format!("Couldn’t save attachment: {error}")),
+        },
+    );
 }
 
 fn open_account_dialog(state: Rc<AppState>) {

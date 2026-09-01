@@ -53,13 +53,20 @@ impl Database {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);\n             INSERT INTO schema_version(version)\n             SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_version);",
         )?;
-        let version: i64 =
+        let mut version: i64 =
             connection.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
                 row.get(0)
             })?;
         if version < 1 {
             connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS accounts (\n                    id INTEGER PRIMARY KEY,\n                    email TEXT NOT NULL UNIQUE,\n                    display_name TEXT NOT NULL,\n                    incoming_json TEXT NOT NULL,\n                    outgoing_json TEXT NOT NULL,\n                    enabled INTEGER NOT NULL DEFAULT 1,\n                    notify INTEGER NOT NULL DEFAULT 1\n                );\n                CREATE TABLE IF NOT EXISTS folders (\n                    id INTEGER PRIMARY KEY,\n                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n                    name TEXT NOT NULL,\n                    remote_name TEXT NOT NULL,\n                    kind TEXT NOT NULL,\n                    unread_count INTEGER NOT NULL DEFAULT 0,\n                    UNIQUE(account_id, remote_name)\n                );\n                CREATE TABLE IF NOT EXISTS messages (\n                    id INTEGER PRIMARY KEY,\n                    account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,\n                    folder TEXT NOT NULL,\n                    remote_uid INTEGER,\n                    uidvalidity INTEGER,\n                    message_id TEXT,\n                    thread_key TEXT,\n                    sender_name TEXT NOT NULL,\n                    sender_email TEXT NOT NULL,\n                    recipients TEXT NOT NULL,\n                    subject TEXT NOT NULL,\n                    preview TEXT NOT NULL,\n                    body TEXT NOT NULL,\n                    received_at TEXT NOT NULL,\n                    unread INTEGER NOT NULL DEFAULT 1,\n                    starred INTEGER NOT NULL DEFAULT 0,\n                    has_attachments INTEGER NOT NULL DEFAULT 0,\n                    thread_size INTEGER NOT NULL DEFAULT 1,\n                    UNIQUE(account_id, folder, remote_uid, uidvalidity)\n                );\n                CREATE TABLE IF NOT EXISTS pending_actions (\n                    id INTEGER PRIMARY KEY,\n                    account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,\n                    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,\n                    action TEXT NOT NULL,\n                    payload_json TEXT NOT NULL,\n                    created_at TEXT NOT NULL\n                );\n                CREATE INDEX IF NOT EXISTS messages_received_idx ON messages(received_at DESC);\n                CREATE INDEX IF NOT EXISTS messages_folder_idx ON messages(account_id, folder);\n                CREATE INDEX IF NOT EXISTS messages_unread_idx ON messages(unread);\n                CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(\n                    subject, sender, recipients, body, content='messages', content_rowid='id'\n                );\n                CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN\n                    INSERT INTO message_search(rowid, subject, sender, recipients, body)\n                    VALUES (new.id, new.subject, new.sender_name || ' ' || new.sender_email, new.recipients, new.body);\n                END;\n                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN\n                    INSERT INTO message_search(message_search, rowid, subject, sender, recipients, body)\n                    VALUES ('delete', old.id, old.subject, old.sender_name || ' ' || old.sender_email, old.recipients, old.body);\n                END;\n                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN\n                    INSERT INTO message_search(message_search, rowid, subject, sender, recipients, body)\n                    VALUES ('delete', old.id, old.subject, old.sender_name || ' ' || old.sender_email, old.recipients, old.body);\n                    INSERT INTO message_search(rowid, subject, sender, recipients, body)\n                    VALUES (new.id, new.subject, new.sender_name || ' ' || new.sender_email, new.recipients, new.body);\n                END;\n                UPDATE schema_version SET version = 1;",
+            )?;
+            version = 1;
+        }
+        if version < 2 {
+            connection.execute_batch(
+                "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';
+                 UPDATE schema_version SET version = 2;",
             )?;
         }
         Ok(())
@@ -204,7 +211,7 @@ impl Database {
                 inserted += 1;
             }
             transaction.execute(
-                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body",
+                "INSERT INTO messages(id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)\n                 ON CONFLICT(id) DO UPDATE SET unread=excluded.unread, starred=excluded.starred, body=excluded.body, attachments_json=excluded.attachments_json",
                 params![
                     message.id,
                     message.account_id,
@@ -224,6 +231,8 @@ impl Database {
                     message.starred as i64,
                     message.has_attachments as i64,
                     message.thread_size,
+                    serde_json::to_string(&message.attachments)
+                        .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?,
                 ],
             )?;
         }
@@ -243,7 +252,7 @@ impl Database {
     ) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body,\n                    received_at, unread, starred, has_attachments, thread_size\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
+            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body,\n                    received_at, unread, starred, has_attachments, thread_size, attachments_json\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
         )?;
         let rows = statement.query_map(
             params![account_id, folder, starred_only as i64],
@@ -256,7 +265,7 @@ impl Database {
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
+            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
         )?;
         let rows = statement.query_map([query], message_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -349,6 +358,10 @@ impl Database {
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let attachments_json: String = row.get(18)?;
+    let attachments = serde_json::from_str(&attachments_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(18, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(Message {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -367,6 +380,7 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         unread: row.get::<_, i64>(14)? != 0,
         starred: row.get::<_, i64>(15)? != 0,
         has_attachments: row.get::<_, i64>(16)? != 0,
+        attachments,
         thread_size: row.get(17)?,
     })
 }
@@ -401,6 +415,26 @@ mod tests {
         let found = database.search_messages("garden").expect("search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].sender_name, "Jane Smith");
+    }
+
+    #[test]
+    fn round_trips_attachment_metadata_with_cached_message() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let mut message = Message::demo_messages().remove(0);
+        message.attachments = vec![crate::models::AttachmentInfo {
+            filename: "notes.txt".into(),
+            content_type: "text/plain".into(),
+            size: 5,
+            cache_path: "/tmp/notes.txt".into(),
+        }];
+        database
+            .upsert_messages(&[message])
+            .expect("insert message");
+
+        let loaded = database.list_messages(None, "Inbox").expect("load message");
+        assert_eq!(loaded[0].attachments[0].filename, "notes.txt");
+        assert_eq!(loaded[0].attachments[0].size, 5);
     }
 
     #[test]

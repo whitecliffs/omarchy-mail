@@ -56,6 +56,14 @@ pub struct PendingAction {
     pub uidvalidity: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentInfo {
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    pub cache_path: String,
+}
+
 impl ServerConfig {
     pub fn imap_defaults(domain: &str, username: &str) -> Self {
         Self {
@@ -112,6 +120,7 @@ pub struct Message {
     pub unread: bool,
     pub starred: bool,
     pub has_attachments: bool,
+    pub attachments: Vec<AttachmentInfo>,
     pub thread_size: u32,
 }
 
@@ -136,6 +145,7 @@ impl Message {
                 unread: true,
                 starred: true,
                 has_attachments: true,
+                attachments: Vec::new(),
                 thread_size: 2,
             },
             Self {
@@ -156,6 +166,7 @@ impl Message {
                 unread: true,
                 starred: false,
                 has_attachments: false,
+                attachments: Vec::new(),
                 thread_size: 1,
             },
             Self {
@@ -176,6 +187,7 @@ impl Message {
                 unread: false,
                 starred: false,
                 has_attachments: false,
+                attachments: Vec::new(),
                 thread_size: 3,
             },
             Self {
@@ -196,6 +208,7 @@ impl Message {
                 unread: false,
                 starred: false,
                 has_attachments: true,
+                attachments: Vec::new(),
                 thread_size: 1,
             },
             Self {
@@ -216,6 +229,7 @@ impl Message {
                 unread: false,
                 starred: false,
                 has_attachments: false,
+                attachments: Vec::new(),
                 thread_size: 1,
             },
         ]

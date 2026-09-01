@@ -16,7 +16,7 @@ without making the GTK main loop responsible for network activity.
 - `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
   worker threads, with transport-aware IMAP connections, mailbox discovery,
   bounded folder fetches, reconnect retries, queued action reconciliation,
-  attachments, and per-account error reports.
+  attachment caching, and per-account error reports.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the first vertical slice of the desktop experience.
@@ -27,7 +27,9 @@ Configuration and cache data use `XDG_DATA_HOME/omarchy-mail/mail.db` (or
 `~/.local/share/omarchy-mail/mail.db`). Secret material is held by the Secret
 Service under the `org.omarchy.Mail` service name, with separate
 `imap:<account>` and `smtp:<account>` entries. No message bodies or
-credentials are written to logs by default.
+credentials are written to logs by default. Attachment bytes are disposable
+cache data under `XDG_CACHE_HOME/omarchy-mail/attachments/` and their safe
+filenames and metadata are retained with the cached message in SQLite.
 
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the

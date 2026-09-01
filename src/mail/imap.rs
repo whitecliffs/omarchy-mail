@@ -450,6 +450,7 @@ fn message_from_fetch(
     let (sender_name, sender_email) = split_sender(&parsed.sender);
     let subject = parsed.subject.clone();
     let preview = preview(&parsed.body);
+    let attachments = mime::cache_attachments(id, &parsed.attachments);
     Ok(Some(Message {
         id,
         account_id,
@@ -467,7 +468,8 @@ fn message_from_fetch(
         received_at,
         unread,
         starred: false,
-        has_attachments: !parsed.attachments.is_empty(),
+        has_attachments: !attachments.is_empty(),
+        attachments,
         thread_size: 1,
     }))
 }

@@ -12,10 +12,16 @@ actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, and Omarchy theme integration. Full folder reconciliation, live
-conversation rendering, OAuth2, durable attachment caching/downloads, and a
-full offline outbox remain explicit follow-up milestones. Read/star/move
+conversation rendering, inline image rendering, OAuth2, attachment re-fetch
+after cache eviction, and a full offline outbox remain explicit follow-up
+milestones. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server.
+
+HTML mail is sanitized and rendered with native GTK/Pango formatting rather
+than a browser runtime. Incoming attachments are cached under
+`$XDG_CACHE_HOME/omarchy-mail/attachments/` (or `~/.cache/omarchy-mail/`) and
+can be saved from the reader.
 
 ## Build and preview
 

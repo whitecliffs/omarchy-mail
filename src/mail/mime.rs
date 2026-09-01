@@ -1,6 +1,9 @@
+use crate::models::AttachmentInfo;
 use ammonia::Builder;
 use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
 use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -115,6 +118,159 @@ pub fn html_to_text(html: &str) -> String {
         .to_string()
 }
 
+/// Converts sanitized HTML to the small, safe subset understood by Pango.
+/// This provides useful emphasis, lists, line breaks, and links without
+/// embedding a browser engine in the GTK4 application.
+pub fn html_to_pango(html: &str) -> String {
+    let safe = sanitize_html(html);
+    let mut output = String::with_capacity(safe.len());
+    let mut text = String::new();
+    let mut in_tag = false;
+    let mut tag = String::new();
+    let mut link_open = false;
+
+    for character in safe.chars() {
+        match (in_tag, character) {
+            (false, '<') => {
+                append_pango_text(&mut output, &text);
+                text.clear();
+                in_tag = true;
+                tag.clear();
+            }
+            (true, '>') => {
+                in_tag = false;
+                append_pango_tag(&mut output, &tag, &mut link_open);
+            }
+            (true, character) => tag.push(character),
+            (false, character) => text.push(character),
+        }
+    }
+    append_pango_text(&mut output, &text);
+    output
+}
+
+/// Caches attachment bytes outside the database. The returned metadata is
+/// still useful when the disposable cache is unavailable, and a later sync
+/// can repopulate missing files.
+pub fn cache_attachments(message_id: i64, attachments: &[Attachment]) -> Vec<AttachmentInfo> {
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
+        });
+    let directory = cache_home
+        .join("omarchy-mail")
+        .join("attachments")
+        .join(message_id.to_string());
+    let directory_available = fs::create_dir_all(&directory).is_ok();
+
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            let path = directory.join(format!(
+                "{index:03}-{}",
+                safe_filename(&attachment.filename)
+            ));
+            let cache_path = if directory_available && fs::write(&path, &attachment.bytes).is_ok() {
+                path.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            };
+            AttachmentInfo {
+                filename: safe_filename(&attachment.filename),
+                content_type: attachment.content_type.clone(),
+                size: attachment.bytes.len() as u64,
+                cache_path,
+            }
+        })
+        .collect()
+}
+
+fn append_pango_text(output: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let decoded = decode_entities(text);
+    output.push_str(&glib::markup_escape_text(&decoded));
+}
+
+fn append_pango_tag(output: &mut String, raw_tag: &str, link_open: &mut bool) {
+    let tag = raw_tag.trim();
+    let closing = tag.starts_with('/');
+    let name = tag
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        return;
+    }
+    if closing {
+        match name.as_str() {
+            "b" | "strong" => output.push_str("</b>"),
+            "i" | "em" => output.push_str("</i>"),
+            "u" => output.push_str("</u>"),
+            "code" | "pre" => output.push_str("</tt>"),
+            "a" if *link_open => {
+                output.push_str("</a>");
+                *link_open = false;
+            }
+            "p" | "div" | "li" => output.push('\n'),
+            _ => {}
+        }
+        return;
+    }
+    match name.as_str() {
+        "b" | "strong" => output.push_str("<b>"),
+        "i" | "em" => output.push_str("<i>"),
+        "u" => output.push_str("<u>"),
+        "code" | "pre" => output.push_str("<tt>"),
+        "br" => output.push('\n'),
+        "p" | "div" | "li" => {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        "a" => {
+            if let Some(href) = href_from_tag(tag) {
+                output.push_str("<a href=\"");
+                output.push_str(&glib::markup_escape_text(&href));
+                output.push_str("\">");
+                *link_open = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn href_from_tag(tag: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let start = lower.find("href=")? + "href=".len();
+    let value = tag[start..].trim_start();
+    let value = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.split_once('"')?.0
+    } else if let Some(quoted) = value.strip_prefix('\'') {
+        quoted.split_once('\'')?.0
+    } else {
+        value.split_whitespace().next()?
+    };
+    let value = decode_entities(value);
+    (value.starts_with("https://") || value.starts_with("http://") || value.starts_with("mailto:"))
+        .then_some(value)
+}
+
+fn decode_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 fn find_body(mail: &ParsedMail<'_>, html: bool) -> Option<String> {
     let content_type = mail.ctype.mimetype.to_ascii_lowercase();
     if mail.subparts.is_empty() {
@@ -197,6 +353,16 @@ mod tests {
             html_to_text("<p>Hello <strong>world</strong>.</p><p>Next</p>"),
             "Hello world.\nNext"
         );
+    }
+
+    #[test]
+    fn converts_safe_html_to_native_markup() {
+        let markup = html_to_pango(
+            r#"<p>Hello <strong>world</strong>. <a href="https://example.com">Read more</a></p>"#,
+        );
+        assert!(markup.contains("<b>world</b>"));
+        assert!(markup.contains("<a href=\"https://example.com\">Read more</a>"));
+        assert!(!markup.contains("script"));
     }
 
     #[test]
