@@ -49,6 +49,12 @@ Service under the `org.omarchy.Mail` service name, with separate
 credentials are written to logs by default. Attachment bytes are disposable
 cache data under `XDG_CACHE_HOME/omarchy-mail/attachments/` and their safe
 filenames and metadata are retained with the cached message in SQLite.
+Account editing is intentionally separate from database persistence: the
+Settings editor keeps the email identity stable, writes only changed secrets
+to Secret Service, and updates server metadata in SQLite. Blank credential
+fields never read a password into GTK and preserve an existing keyring entry;
+the IMAP connection check uses either the newly entered secret or the stored
+one on a worker thread.
 Non-secret display and composing preferences use
 `XDG_CONFIG_HOME/omarchy-mail/preferences.json`; signatures are keyed by
 account email so changing a server password does not affect them. Missing or

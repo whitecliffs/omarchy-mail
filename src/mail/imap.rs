@@ -80,6 +80,49 @@ pub fn sync_inbox(
     }
 }
 
+/// Verifies the configured IMAP endpoint and credentials without fetching a
+/// mailbox. This is used by account settings so a user can recover from a
+/// missing keyring entry or correct server details without waiting for the
+/// background monitor to report an error.
+pub fn test_connection(account: &Account, auth: &AuthMaterial) -> Result<(), ImapError> {
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            test_authenticated_client(client, account, auth)
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            test_authenticated_client(client, account, auth)
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            test_authenticated_client(client, account, auth)
+        }
+    }
+}
+
+fn test_authenticated_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    auth: &AuthMaterial,
+) -> Result<(), ImapError> {
+    let mut session = authenticate(client, account, auth)?;
+    session
+        .capabilities()
+        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let _ = session.logout();
+    Ok(())
+}
+
 pub fn sync_folder(
     account: &Account,
     auth: &AuthMaterial,

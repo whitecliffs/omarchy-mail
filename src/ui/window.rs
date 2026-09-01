@@ -2313,6 +2313,446 @@ fn save_attachment(state: Rc<AppState>, attachment: AttachmentInfo) {
     );
 }
 
+struct AccountEditorFields {
+    display_name: gtk::Entry,
+    incoming_host: gtk::Entry,
+    incoming_username: gtk::Entry,
+    incoming_port: gtk::SpinButton,
+    incoming_security: gtk::DropDown,
+    incoming_auth: gtk::DropDown,
+    incoming_secret: gtk::Entry,
+    outgoing_host: gtk::Entry,
+    outgoing_username: gtk::Entry,
+    outgoing_port: gtk::SpinButton,
+    outgoing_security: gtk::DropDown,
+    outgoing_auth: gtk::DropDown,
+    outgoing_secret: gtk::Entry,
+}
+
+impl AccountEditorFields {
+    fn new(account: &Account) -> Self {
+        let display_name = gtk::Entry::builder()
+            .text(&account.display_name)
+            .hexpand(true)
+            .build();
+        let incoming_host = gtk::Entry::builder()
+            .text(&account.incoming.hostname)
+            .hexpand(true)
+            .build();
+        let incoming_username = gtk::Entry::builder()
+            .text(&account.incoming.username)
+            .hexpand(true)
+            .build();
+        let incoming_port = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
+        incoming_port.set_value(account.incoming.port as f64);
+        let incoming_security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
+        incoming_security.set_selected(security_index(&account.incoming.security));
+        let incoming_auth = gtk::DropDown::from_strings(&["Password", "OAuth2 access token"]);
+        incoming_auth.set_selected(auth_index(&account.incoming.auth));
+        let incoming_secret = secret_entry("Leave empty to keep the stored IMAP credential");
+
+        let outgoing_host = gtk::Entry::builder()
+            .text(&account.outgoing.hostname)
+            .hexpand(true)
+            .build();
+        let outgoing_username = gtk::Entry::builder()
+            .text(&account.outgoing.username)
+            .hexpand(true)
+            .build();
+        let outgoing_port = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
+        outgoing_port.set_value(account.outgoing.port as f64);
+        let outgoing_security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
+        outgoing_security.set_selected(security_index(&account.outgoing.security));
+        let outgoing_auth = gtk::DropDown::from_strings(&["Password", "OAuth2 access token"]);
+        outgoing_auth.set_selected(auth_index(&account.outgoing.auth));
+        let outgoing_secret = secret_entry("Leave empty to keep the stored SMTP credential");
+
+        let incoming_secret_for_auth = incoming_secret.clone();
+        incoming_auth.connect_selected_notify(move |auth| {
+            incoming_secret_for_auth.set_placeholder_text(Some(if auth.selected() == 1 {
+                "Leave empty to keep the stored IMAP token"
+            } else {
+                "Leave empty to keep the stored IMAP password"
+            }));
+        });
+        let outgoing_secret_for_auth = outgoing_secret.clone();
+        outgoing_auth.connect_selected_notify(move |auth| {
+            outgoing_secret_for_auth.set_placeholder_text(Some(if auth.selected() == 1 {
+                "Leave empty to keep the stored SMTP token"
+            } else {
+                "Leave empty to keep the stored SMTP password"
+            }));
+        });
+
+        Self {
+            display_name,
+            incoming_host,
+            incoming_username,
+            incoming_port,
+            incoming_security,
+            incoming_auth,
+            incoming_secret,
+            outgoing_host,
+            outgoing_username,
+            outgoing_port,
+            outgoing_security,
+            outgoing_auth,
+            outgoing_secret,
+        }
+    }
+
+    fn view(&self) -> gtk::Box {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&form_row("Display name", &self.display_name));
+
+        let credentials = gtk::Label::new(Some(
+            "Passwords and access tokens are never shown here. Enter a new value only when you want to replace the stored credential.",
+        ));
+        credentials.set_xalign(0.0);
+        credentials.set_wrap(true);
+        credentials.add_css_class("mail-empty-body");
+        credentials.set_margin_top(14);
+        root.append(&credentials);
+        root.append(&form_row("New IMAP credential", &self.incoming_secret));
+        root.append(&form_row("New SMTP credential", &self.outgoing_secret));
+
+        let advanced = gtk::Expander::new(Some("Connection details"));
+        advanced.set_margin_top(14);
+        let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        details.set_margin_top(10);
+        details.append(&form_row("IMAP authentication", &self.incoming_auth));
+        details.append(&form_row("IMAP server", &self.incoming_host));
+        details.append(&form_row("IMAP username", &self.incoming_username));
+        details.append(&form_row("IMAP port", &self.incoming_port));
+        details.append(&form_row("IMAP security", &self.incoming_security));
+        details.append(&form_row("SMTP authentication", &self.outgoing_auth));
+        details.append(&form_row("SMTP server", &self.outgoing_host));
+        details.append(&form_row("SMTP username", &self.outgoing_username));
+        details.append(&form_row("SMTP port", &self.outgoing_port));
+        details.append(&form_row("SMTP security", &self.outgoing_security));
+        advanced.set_child(Some(&details));
+        root.append(&advanced);
+        root
+    }
+
+    fn account(&self, original: &Account) -> Result<Account, String> {
+        let display_name = if self.display_name.text().trim().is_empty() {
+            original
+                .email
+                .split('@')
+                .next()
+                .unwrap_or("Account")
+                .to_string()
+        } else {
+            self.display_name.text().trim().to_string()
+        };
+        let incoming = read_server_config(
+            "IMAP",
+            &self.incoming_host,
+            &self.incoming_username,
+            &self.incoming_port,
+            &self.incoming_security,
+            &self.incoming_auth,
+        )?;
+        let outgoing = read_server_config(
+            "SMTP",
+            &self.outgoing_host,
+            &self.outgoing_username,
+            &self.outgoing_port,
+            &self.outgoing_security,
+            &self.outgoing_auth,
+        )?;
+        Ok(Account {
+            id: original.id,
+            email: original.email.clone(),
+            display_name,
+            incoming,
+            outgoing,
+            enabled: original.enabled,
+            notify: original.notify,
+        })
+    }
+}
+
+fn secret_entry(placeholder: &str) -> gtk::Entry {
+    let entry = gtk::Entry::builder()
+        .placeholder_text(placeholder)
+        .hexpand(true)
+        .build();
+    entry.set_visibility(false);
+    entry
+}
+
+fn auth_index(auth: &AuthMethod) -> u32 {
+    match auth {
+        AuthMethod::Password => 0,
+        AuthMethod::OAuth2 => 1,
+    }
+}
+
+fn security_index(security: &SecurityMode) -> u32 {
+    match security {
+        SecurityMode::Tls => 0,
+        SecurityMode::StartTls => 1,
+        SecurityMode::None => 2,
+    }
+}
+
+fn auth_method_for_index(index: u32) -> AuthMethod {
+    if index == 1 {
+        AuthMethod::OAuth2
+    } else {
+        AuthMethod::Password
+    }
+}
+
+fn security_for_index(index: u32) -> SecurityMode {
+    match index {
+        1 => SecurityMode::StartTls,
+        2 => SecurityMode::None,
+        _ => SecurityMode::Tls,
+    }
+}
+
+fn read_server_config(
+    protocol: &str,
+    host: &gtk::Entry,
+    username: &gtk::Entry,
+    port: &gtk::SpinButton,
+    security: &gtk::DropDown,
+    auth: &gtk::DropDown,
+) -> Result<ServerConfig, String> {
+    let hostname = host.text().trim().to_string();
+    if hostname.is_empty() {
+        return Err(format!("Enter an {protocol} server hostname."));
+    }
+    let username = username.text().trim().to_string();
+    if username.is_empty() {
+        return Err(format!("Enter an {protocol} username."));
+    }
+    Ok(ServerConfig {
+        hostname,
+        port: port.value_as_int().clamp(1, 65535) as u16,
+        security: security_for_index(security.selected()),
+        username,
+        auth: auth_method_for_index(auth.selected()),
+    })
+}
+
+fn auth_material_for_secret(method: &AuthMethod, secret: &str) -> mail::credentials::AuthMaterial {
+    match method {
+        AuthMethod::Password => mail::credentials::AuthMaterial::Password(secret.to_string()),
+        AuthMethod::OAuth2 => {
+            mail::credentials::AuthMaterial::OAuth2AccessToken(secret.to_string())
+        }
+    }
+}
+
+fn open_account_editor(state: Rc<AppState>, original: Account) {
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title("Edit email account")
+        .default_width(620)
+        .default_height(720)
+        .build();
+    window.add_css_class("mail-dialog");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_margin_start(28);
+    root.set_margin_end(28);
+    root.set_margin_top(26);
+    root.set_margin_bottom(26);
+
+    let title = gtk::Label::new(Some("Edit email account"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-reader-subject");
+    root.append(&title);
+    let identity = gtk::Label::new(Some(&format!(
+        "{} · {}",
+        original.email, original.incoming.hostname
+    )));
+    identity.set_xalign(0.0);
+    identity.add_css_class("mail-empty-body");
+    identity.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    root.append(&identity);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let fields = Rc::new(AccountEditorFields::new(&original));
+    let fields_view = fields.view();
+    scrolled.set_child(Some(&fields_view));
+    root.append(&scrolled);
+
+    let status = gtk::Label::new(Some(
+        "The email address is the account identity and cannot be changed here.",
+    ));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("mail-empty-body");
+    status.set_margin_top(14);
+    root.append(&status);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.set_margin_top(18);
+    let cancel = gtk::Button::with_label("Cancel");
+    let check = gtk::Button::with_label("Check IMAP connection");
+    let save = gtk::Button::with_label("Save changes");
+    save.add_css_class("mail-accent-button");
+    actions.append(&cancel);
+    actions.append(&check);
+    actions.append(&save);
+    root.append(&actions);
+    window.set_content(Some(&root));
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+
+    let original_for_check = original.clone();
+    let fields_for_check = fields.clone();
+    let status_for_check = status.clone();
+    check.connect_clicked(move |button| {
+        let account = match fields_for_check.account(&original_for_check) {
+            Ok(account) => account,
+            Err(error) => {
+                status_for_check.set_text(&error);
+                return;
+            }
+        };
+        let supplied_secret = fields_for_check.incoming_secret.text().to_string();
+        let method = account.incoming.auth.clone();
+        let email = account.email.clone();
+        button.set_sensitive(false);
+        status_for_check.set_text("Checking IMAP connection…");
+        let button_for_async = button.clone();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = if supplied_secret.is_empty() {
+                mail::credentials::load_auth_material(&email, "imap", &method).map_err(|error| {
+                    mail::credentials::friendly_load_error("IMAP", &method, &error)
+                })
+            } else {
+                Ok(auth_material_for_secret(&method, &supplied_secret))
+            }
+            .and_then(|auth| {
+                mail::imap::test_connection(&account, &auth).map_err(|error| error.to_string())
+            });
+            let _ = sender.send_blocking(result);
+        });
+        let status = status_for_check.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match receiver.recv().await {
+                Ok(Ok(())) => status.set_text(
+                    "IMAP connection successful. Your settings are accepted by the server.",
+                ),
+                Ok(Err(error)) => status.set_text(&format!("Couldn’t connect to IMAP: {error}")),
+                Err(_) => status.set_text("The connection check stopped unexpectedly."),
+            }
+            button_for_async.set_sensitive(true);
+        });
+    });
+
+    let state_for_save = state.clone();
+    let original_for_save = original.clone();
+    let fields_for_save = fields.clone();
+    let window_for_save = window.clone();
+    let status_for_save = status.clone();
+    save.connect_clicked(move |button| {
+        let updated = match fields_for_save.account(&original_for_save) {
+            Ok(account) => account,
+            Err(error) => {
+                status_for_save.set_text(&error);
+                return;
+            }
+        };
+        let imap_secret = fields_for_save.incoming_secret.text().to_string();
+        let smtp_secret = fields_for_save.outgoing_secret.text().to_string();
+        let database = state_for_save.database.clone();
+        let original_id = original_for_save.id;
+        let email = updated.email.clone();
+        let imap_method = updated.incoming.auth.clone();
+        let smtp_method = updated.outgoing.auth.clone();
+        button.set_sensitive(false);
+        status_for_save.set_text("Saving account securely…");
+        let button_for_async = button.clone();
+        let status_for_async = status_for_save.clone();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = if imap_secret.is_empty() {
+                Ok(())
+            } else {
+                mail::credentials::store_auth_material(&email, "imap", &imap_method, &imap_secret)
+                    .map_err(|error| error.to_string())
+            }
+            .and_then(|_| {
+                if smtp_secret.is_empty() {
+                    Ok(())
+                } else {
+                    mail::credentials::store_auth_material(
+                        &email,
+                        "smtp",
+                        &smtp_method,
+                        &smtp_secret,
+                    )
+                    .map_err(|error| error.to_string())
+                }
+            })
+            .and_then(|_| {
+                database
+                    .save_account(&updated)
+                    .map(|id| {
+                        let mut updated = updated;
+                        updated.id = Some(id);
+                        updated
+                    })
+                    .map_err(|error| error.to_string())
+            });
+            let _ = sender.send_blocking(result);
+        });
+        let state = state_for_save.clone();
+        let window = window_for_save.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match receiver.recv().await {
+                Ok(Ok(updated)) => {
+                    if let Some(account_id) = original_id {
+                        if let Some(stop) = state.monitor_stops.borrow_mut().remove(&account_id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        if let Some(stop) = state.outbox_stops.borrow_mut().remove(&account_id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    let monitor_account = updated.clone();
+                    if let Some(account_id) = updated.id {
+                        state
+                            .accounts
+                            .borrow_mut()
+                            .retain(|stored| stored.id != Some(account_id));
+                    }
+                    state.accounts.borrow_mut().push(updated);
+                    start_account_monitor(&state, monitor_account);
+                    render_sidebar(&state);
+                    window.close();
+                    set_status(&state, "Account updated securely");
+                }
+                Ok(Err(error)) => {
+                    button_for_async.set_sensitive(true);
+                    status_for_async.set_text(&format!("Couldn’t save this account: {error}"));
+                }
+                Err(_) => {
+                    button_for_async.set_sensitive(true);
+                    status_for_async.set_text("The account update worker stopped unexpectedly.");
+                }
+            }
+        });
+    });
+
+    window.present();
+}
+
 fn open_account_dialog(state: Rc<AppState>) {
     let dialog = adw::Window::builder()
         .transient_for(&state.window)
@@ -2650,11 +3090,38 @@ fn open_settings(state: Rc<AppState>) {
     let account_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     account_list.set_margin_top(12);
     for account in state.accounts.borrow().iter().cloned() {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let label = gtk::Label::new(Some(&account.email));
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let identity = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let label = gtk::Label::new(Some(if account.display_name.trim().is_empty() {
+            &account.email
+        } else {
+            &account.display_name
+        }));
         label.set_xalign(0.0);
-        label.set_width_chars(18);
         label.add_css_class("mail-reader-meta");
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let details = gtk::Label::new(Some(&format!(
+            "{} · {} · {}",
+            account.email, account.incoming.hostname, account.outgoing.hostname
+        )));
+        details.set_xalign(0.0);
+        details.add_css_class("mail-empty-body");
+        details.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        identity.append(&label);
+        identity.append(&details);
+        identity.set_hexpand(true);
+        header.append(&identity);
+        let edit = gtk::Button::with_label("Edit");
+        edit.set_tooltip_text(Some("Edit server details or re-enter credentials"));
+        let settings_window_for_edit = window.clone();
+        let state_for_edit = state.clone();
+        let account_for_edit = account.clone();
+        edit.connect_clicked(move |_| {
+            settings_window_for_edit.close();
+            open_account_editor(state_for_edit.clone(), account_for_edit.clone());
+        });
+        header.append(&edit);
         let signature_value = state
             .preferences
             .borrow()
@@ -2760,9 +3227,9 @@ fn open_settings(state: Rc<AppState>) {
                 }
             });
         });
-        row.append(&label);
+        header.append(&remove);
+        row.append(&header);
         row.append(&signature);
-        row.append(&remove);
         account_list.append(&row);
     }
     root.append(&account_list);

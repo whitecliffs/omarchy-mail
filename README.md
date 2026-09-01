@@ -101,7 +101,13 @@ Service and never in SQLite. The account model separates authentication
 method from transport security. Password entries and OAuth2 token entries use
 isolated Secret Service slots; the account flow accepts either credential type,
 while provider browser authorization is intentionally not hard-coded into the
-source tree. The local database is at
+source tree. Open Settings and choose Edit beside an account to review or
+change its display name, IMAP/SMTP servers, ports, security, usernames, or
+authentication method. Credential fields stay blank by design: leave them
+empty to preserve an existing keyring entry, or enter only the missing
+credential to repair it. Check IMAP connection tests the stored or newly
+entered IMAP credential without blocking the UI. The email address remains the
+account identity and is not changed by this editor. The local database is at
 `$XDG_DATA_HOME/omarchy-mail/mail.db` or `~/.local/share/omarchy-mail/mail.db`.
 Non-secret preferences, including per-account signatures, are stored at
 `$XDG_CONFIG_HOME/omarchy-mail/preferences.json` or
@@ -121,6 +127,9 @@ palette for live updates.
 
 ## Troubleshooting
 
+- If an account reports that no IMAP or SMTP password is stored, open Settings,
+  choose Edit, enter the missing credential, and save. The Check IMAP
+  connection action can verify the incoming settings before saving.
 - If account setup cannot save a password, ensure a Secret Service provider is
   running in the user session and retry.
 - If the app starts with fallback colours, inspect
