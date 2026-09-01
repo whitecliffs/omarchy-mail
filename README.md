@@ -12,12 +12,17 @@ actions, server mailbox discovery with on-demand folder fetching, unified and
 per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, lightweight All/Unread/Starred/Attachment filters, and Omarchy theme
-integration. Full folder reconciliation, live
+integration. Complete folder-wide reconciliation, live
 conversation rendering, inline image rendering, OAuth2, attachment re-fetch
 after cache eviction, and a full offline outbox remain explicit follow-up
 milestones. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server.
+
+Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
+refreshes the connection before common server idle limits, falls back to a
+five-minute poll for older servers, and retries transient failures with capped
+backoff.
 
 HTML mail is sanitized and rendered with native GTK/Pango formatting rather
 than a browser runtime. Incoming attachments are cached under

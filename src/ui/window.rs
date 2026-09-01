@@ -5,8 +5,13 @@ use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 struct AppState {
@@ -22,6 +27,8 @@ struct AppState {
     scope: RefCell<MailScope>,
     filter: RefCell<MailFilter>,
     selected_message: RefCell<Option<i64>>,
+    monitor_sender: async_channel::Sender<mail::sync::SyncReport>,
+    monitor_stops: RefCell<HashMap<i64, Arc<AtomicBool>>>,
     status: gtk::Label,
     demo_mode: bool,
 }
@@ -46,6 +53,7 @@ pub fn build_window(application: &adw::Application) {
     let accounts = database.load_accounts().unwrap_or_default();
     let folders = database.load_folders().unwrap_or_default();
     let demo_mode = std::env::var("OMARCHY_MAIL_DEMO").as_deref() == Ok("1");
+    let (monitor_sender, monitor_receiver) = async_channel::unbounded();
     let messages = if demo_mode {
         Message::demo_messages()
     } else {
@@ -124,6 +132,8 @@ pub fn build_window(application: &adw::Application) {
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
         filter: RefCell::new(MailFilter::All),
         selected_message: RefCell::new(None),
+        monitor_sender,
+        monitor_stops: RefCell::new(HashMap::new()),
         status,
         demo_mode,
     });
@@ -145,16 +155,8 @@ pub fn build_window(application: &adw::Application) {
     theme::install();
     connect_keyboard_shortcuts(&state);
     window.present();
-
-    if !state.accounts.borrow().is_empty() {
-        let state_for_startup_sync = state.clone();
-        glib::idle_add_local_once(move || sync_all(state_for_startup_sync, false));
-        let state_for_periodic_sync = state.clone();
-        glib::timeout_add_local(Duration::from_secs(300), move || {
-            sync_all(state_for_periodic_sync.clone(), true);
-            glib::ControlFlow::Continue
-        });
-    }
+    listen_for_monitor_reports(state.clone(), monitor_receiver);
+    start_account_monitors(state);
 }
 
 fn build_header(status: &gtk::Label) -> (adw::HeaderBar, gtk::Button, gtk::Button, gtk::Button) {
@@ -707,6 +709,83 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
                 &state,
                 &format!("Sync needs attention: {}", errors.join(" · ")),
             );
+        }
+    });
+}
+
+fn start_account_monitors(state: Rc<AppState>) {
+    let accounts = state
+        .accounts
+        .borrow()
+        .iter()
+        .filter(|account| account.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    for account in accounts {
+        start_account_monitor(&state, account);
+    }
+}
+
+fn start_account_monitor(state: &Rc<AppState>, account: Account) {
+    let Some(account_id) = account.id else {
+        return;
+    };
+    if state.monitor_stops.borrow().contains_key(&account_id) {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    state
+        .monitor_stops
+        .borrow_mut()
+        .insert(account_id, stop.clone());
+    mail::sync::spawn_account_monitor(
+        account,
+        state.database.clone(),
+        state.monitor_sender.clone(),
+        stop,
+    );
+}
+
+fn listen_for_monitor_reports(
+    state: Rc<AppState>,
+    receiver: async_channel::Receiver<mail::sync::SyncReport>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(report) = receiver.recv().await {
+            let should_notify = !report.initial
+                && report.new_messages > 0
+                && report.error.is_none()
+                && state
+                    .accounts
+                    .borrow()
+                    .iter()
+                    .find(|account| account.id == report.account_id)
+                    .map(|account| account.notify)
+                    .unwrap_or(true);
+            if should_notify {
+                mail::sync::notify_new_mail(&report.email, report.new_messages);
+            }
+
+            if let Ok(folders) = state.database.load_folders() {
+                state.folders.replace(folders);
+            }
+            load_messages_for_scope(&state);
+            render_sidebar(&state);
+            render_messages(&state, state.search_entry.text().as_str());
+
+            if let Some(error) = report.error {
+                set_status(&state, &format!("{}: {error}", report.email));
+            } else if report.new_messages > 0 {
+                set_status(
+                    &state,
+                    &format!("{} · {} new", report.email, report.new_messages),
+                );
+            } else {
+                set_status(
+                    &state,
+                    &format!("{} is up to date · {} cached", report.email, report.fetched),
+                );
+            }
         }
     });
 }
@@ -1379,7 +1458,9 @@ fn open_account_dialog(state: Rc<AppState>) {
         glib::MainContext::default().spawn_local(async move {
             match receiver.recv().await {
                 Ok(Ok(account)) => {
+                    let monitor_account = account.clone();
                     state.accounts.borrow_mut().push(account);
+                    start_account_monitor(&state, monitor_account);
                     dialog.close();
                     render_sidebar(&state);
                     render_reader(&state, None);
@@ -1469,6 +1550,9 @@ fn open_settings(state: Rc<AppState>) {
             glib::MainContext::default().spawn_local(async move {
                 match receiver.recv().await {
                     Ok(Ok(())) => {
+                        if let Some(stop) = state.monitor_stops.borrow_mut().remove(&account_id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
                         state
                             .accounts
                             .borrow_mut()

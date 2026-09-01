@@ -6,6 +6,7 @@ use native_tls::TlsConnector;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -32,6 +33,13 @@ pub struct RemoteFolder {
 pub struct SyncSnapshot {
     pub messages: Vec<Message>,
     pub folders: Vec<RemoteFolder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleOutcome {
+    Changed,
+    TimedOut,
+    Unsupported,
 }
 
 /// Discovers selectable mailboxes and fetches a bounded window from INBOX.
@@ -123,6 +131,75 @@ pub fn sync_folder(
         }
     };
     Ok(snapshot.messages)
+}
+
+/// Waits for the selected inbox to change using IMAP IDLE. The timeout is
+/// intentionally bounded so the caller can periodically refresh the IDLE
+/// connection and recover cleanly from laptop suspend or server idle limits.
+pub fn wait_for_inbox_change(
+    account: &Account,
+    password: &str,
+    timeout: Duration,
+) -> Result<IdleOutcome, ImapError> {
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            idle_client(client, account, password, timeout)
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            idle_client(client, account, password, timeout)
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            idle_client(client, account, password, timeout)
+        }
+    }
+}
+
+fn idle_client<T: Read + Write + imap::extensions::idle::SetReadTimeout>(
+    client: imap::Client<T>,
+    account: &Account,
+    password: &str,
+    timeout: Duration,
+) -> Result<IdleOutcome, ImapError> {
+    let mut session = client
+        .login(&account.incoming.username, password)
+        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let supports_idle = session
+        .capabilities()
+        .map_err(|error| ImapError::Protocol(error.to_string()))?
+        .has_str("IDLE");
+    if !supports_idle {
+        let _ = session.logout();
+        return Ok(IdleOutcome::Unsupported);
+    }
+
+    session
+        .select("INBOX")
+        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let outcome = {
+        let handle = session
+            .idle()
+            .map_err(|error| ImapError::Protocol(error.to_string()))?;
+        handle
+            .wait_with_timeout(timeout)
+            .map_err(|error| ImapError::Protocol(error.to_string()))?
+    };
+    let _ = session.logout();
+    Ok(match outcome {
+        imap::extensions::idle::WaitOutcome::MailboxChanged => IdleOutcome::Changed,
+        imap::extensions::idle::WaitOutcome::TimedOut => IdleOutcome::TimedOut,
+    })
 }
 
 /// Applies local actions that were recorded while the account was offline.

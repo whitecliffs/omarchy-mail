@@ -15,8 +15,9 @@ without making the GTK main loop responsible for network activity.
 - `mail/mime.rs` parses MIME messages and sanitises HTML before the UI sees it.
 - `mail/imap.rs`, `mail/smtp.rs`, and `mail/sync.rs` keep protocol work on
   worker threads, with transport-aware IMAP connections, mailbox discovery,
-  bounded folder fetches, reconnect retries, queued action reconciliation,
-  attachment caching, and per-account error reports.
+  bounded folder fetches, queued action reconciliation, attachment caching,
+  per-account error reports, and long-lived IDLE monitors with a polling
+  fallback and capped reconnect backoff.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the first vertical slice of the desktop experience.
@@ -30,6 +31,13 @@ Service under the `org.omarchy.Mail` service name, with separate
 credentials are written to logs by default. Attachment bytes are disposable
 cache data under `XDG_CACHE_HOME/omarchy-mail/attachments/` and their safe
 filenames and metadata are retained with the cached message in SQLite.
+
+Each enabled account owns an isolated monitor thread. The monitor performs a
+bounded initial sync, waits for INBOX changes using IMAP IDLE for at most 25
+minutes, then reconnects and reconciles again. If IDLE is unavailable it polls
+every five minutes; connection and authentication failures use capped
+exponential backoff. Stop signals are checked between waits so removing an
+account does not start another sync.
 
 The database is a cache/state store, not an authority over the IMAP server.
 Remote UID/UIDVALIDITY columns identify queued actions safely; the
