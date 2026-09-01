@@ -78,7 +78,8 @@ it. A UIDVALIDITY mismatch leaves the action queued rather than risking a
 change to a recycled UID. Server folder metadata is stored separately from
 message rows so remote names such as
 `[Gmail]/Sent Mail` can be preserved while the UI stays calm. Local drafts
-are stored as messages in the `Drafts` folder and are included in the FTS index.
+are stored as messages in the `Drafts` folder, included in the FTS index, and
+reopened by parsing their compact To/Cc/Bcc recipient summary.
 
 ## Theme boundary
 

@@ -1251,10 +1251,20 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
 
         let sender_line = gtk::Box::new(gtk::Orientation::Horizontal, 7);
         sender_line.set_margin_top(16);
-        let sender = gtk::Label::new(Some(&message.sender_name));
+        let sender_name = if message.folder == "Drafts" {
+            "Draft"
+        } else {
+            message.sender_name.as_str()
+        };
+        let sender = gtk::Label::new(Some(sender_name));
         sender.add_css_class("mail-reader-sender");
         sender_line.append(&sender);
-        let email = gtk::Label::new(Some(&format!("<{}>", message.sender_email)));
+        let sender_address = if message.folder == "Drafts" {
+            "saved locally".to_string()
+        } else {
+            format!("<{}>", message.sender_email)
+        };
+        let email = gtk::Label::new(Some(&sender_address));
         email.add_css_class("mail-reader-meta");
         sender_line.append(&email);
         let date = gtk::Label::new(Some(&message.received_at));
@@ -1283,6 +1293,31 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         };
         if let Some(send) = pending_send {
             append_outbox_controls(&content, state, &send);
+        } else if message.folder == "Drafts" {
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            actions.set_margin_top(20);
+
+            let edit = icon_button("document-edit-symbolic", "Continue editing this draft");
+            edit.set_label("Edit draft");
+            edit.set_use_underline(false);
+            let state_for_edit = state.clone();
+            let draft_for_edit = message.clone();
+            edit.connect_clicked(move |_| {
+                open_compose_with_context(
+                    state_for_edit.clone(),
+                    Some(ComposeContext::Draft(draft_for_edit.clone())),
+                );
+            });
+            actions.append(&edit);
+
+            let delete = icon_button("user-trash-symbolic", "Delete this draft");
+            delete.set_label("Delete");
+            delete.set_use_underline(false);
+            let state_for_delete = state.clone();
+            let draft_id = message.id;
+            delete.connect_clicked(move |_| delete_local_message(&state_for_delete, draft_id));
+            actions.append(&delete);
+            content.append(&actions);
         } else {
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             actions.set_margin_top(20);
@@ -2267,6 +2302,7 @@ fn open_compose(state: Rc<AppState>) {
 enum ComposeContext {
     Reply { message: Message, reply_all: bool },
     Forward(Message),
+    Draft(Message),
 }
 
 #[derive(Debug)]
@@ -2281,7 +2317,15 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         return;
     }
 
-    let (initial_to, initial_cc, initial_bcc, initial_subject, initial_body) = match context {
+    let (
+        initial_account_id,
+        initial_draft_id,
+        initial_to,
+        initial_cc,
+        initial_bcc,
+        initial_subject,
+        initial_body,
+    ) = match context {
         Some(ComposeContext::Reply { message, reply_all }) => {
             let subject = if message.subject.to_lowercase().starts_with("re:") {
                 message.subject.clone()
@@ -2303,7 +2347,15 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 "\n\nOn {}, {} wrote:\n{}",
                 message.received_at, message.sender_name, quoted
             );
-            (message.sender_email, cc, String::new(), subject, body)
+            (
+                message.account_id,
+                None,
+                message.sender_email,
+                cc,
+                String::new(),
+                subject,
+                body,
+            )
         }
         Some(ComposeContext::Forward(message)) => {
             let subject = if message.subject.to_lowercase().starts_with("fwd:") {
@@ -2319,9 +2371,31 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 message.subject,
                 message.body
             );
-            (String::new(), String::new(), String::new(), subject, body)
+            (
+                message.account_id,
+                None,
+                String::new(),
+                String::new(),
+                String::new(),
+                subject,
+                body,
+            )
+        }
+        Some(ComposeContext::Draft(message)) => {
+            let recipients = parse_draft_recipients(&message.recipients);
+            (
+                message.account_id,
+                Some(message.id),
+                recipients.to,
+                recipients.cc,
+                recipients.bcc,
+                message.subject,
+                message.body,
+            )
         }
         None => (
+            None,
+            None,
             String::new(),
             String::new(),
             String::new(),
@@ -2329,11 +2403,16 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             String::new(),
         ),
     };
+    let compose_title = if initial_draft_id.is_some() {
+        "Edit draft"
+    } else {
+        "New message"
+    };
 
     let window = adw::Window::builder()
         .transient_for(&state.window)
         .modal(true)
-        .title("New message")
+        .title(compose_title)
         .default_width(760)
         .default_height(620)
         .build();
@@ -2342,7 +2421,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     root.set_margin_end(26);
     root.set_margin_top(24);
     root.set_margin_bottom(24);
-    let title = gtk::Label::new(Some("New message"));
+    let title = gtk::Label::new(Some(compose_title));
     title.set_xalign(0.0);
     title.add_css_class("mail-reader-subject");
     root.append(&title);
@@ -2377,6 +2456,16 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let account_selector = gtk::DropDown::from_strings(&account_label_refs);
     account_selector.set_hexpand(true);
     account_selector.set_selected(0);
+    if let Some(account_id) = initial_account_id {
+        if let Some(index) = state
+            .accounts
+            .borrow()
+            .iter()
+            .position(|account| account.id == Some(account_id))
+        {
+            account_selector.set_selected(index as u32);
+        }
+    }
     root.append(&form_row("From", &account_selector));
     to.set_text(&initial_to);
     cc.set_text(&initial_cc);
@@ -2421,7 +2510,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     body.buffer().set_text(&initial_body);
     root.append(&body);
     let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
-    let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+    let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(initial_draft_id));
     let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     attachment_list.set_hexpand(true);
     root.append(&attachment_list);
@@ -2795,6 +2884,55 @@ fn compose_recipient_summary(to: &str, cc: &str, bcc: &str) -> String {
     fields.join("\n")
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DraftRecipients {
+    to: String,
+    cc: String,
+    bcc: String,
+}
+
+fn parse_draft_recipients(value: &str) -> DraftRecipients {
+    let mut recipients = DraftRecipients::default();
+    for line in value.lines() {
+        let line = line.trim();
+        let (field, address) = line
+            .split_once(':')
+            .map(|(field, address)| (Some(field.trim()), address.trim()))
+            .unwrap_or((None, line));
+        let target = match field.map(str::to_ascii_lowercase).as_deref() {
+            Some("cc") => &mut recipients.cc,
+            Some("bcc") => &mut recipients.bcc,
+            _ => &mut recipients.to,
+        };
+        if address.is_empty() {
+            continue;
+        }
+        if !target.is_empty() {
+            target.push_str("; ");
+        }
+        target.push_str(address);
+    }
+    recipients
+}
+
+fn delete_local_message(state: &Rc<AppState>, message_id: i64) {
+    state
+        .messages
+        .borrow_mut()
+        .retain(|message| message.id != message_id);
+    if *state.selected_message.borrow() == Some(message_id) {
+        state.selected_message.replace(None);
+        render_reader(state, None);
+    }
+    let database = state.database.clone();
+    std::thread::spawn(move || {
+        let _ = database.delete_message(message_id);
+    });
+    set_status(state, "Draft deleted");
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
+}
+
 fn text_view_contents(view: &gtk::TextView) -> String {
     let buffer = view.buffer();
     buffer
@@ -2910,6 +3048,21 @@ mod tests {
         assert_eq!(
             compose_recipient_summary("jane@example.com", "", ""),
             "jane@example.com"
+        );
+    }
+
+    #[test]
+    fn rehydrates_draft_recipient_fields() {
+        let recipients = parse_draft_recipients(
+            "jane@example.com; team@example.com\nCc: copy@example.com\nBcc: archive@example.com",
+        );
+        assert_eq!(
+            recipients,
+            DraftRecipients {
+                to: "jane@example.com; team@example.com".into(),
+                cc: "copy@example.com".into(),
+                bcc: "archive@example.com".into(),
+            }
         );
     }
 }
