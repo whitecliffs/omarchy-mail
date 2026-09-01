@@ -127,6 +127,12 @@ impl Database {
         )?)
     }
 
+    pub fn delete_account(&self, account_id: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
+        Ok(())
+    }
+
     pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;

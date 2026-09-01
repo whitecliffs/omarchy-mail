@@ -73,6 +73,48 @@ pub fn sanitize_html(html: &str) -> String {
         .to_string()
 }
 
+/// Converts already-sanitised HTML into readable text for the GTK reader.
+/// Omarchy's base installation does not ship a GTK4 WebKit runtime, so v1
+/// deliberately keeps the reader dependency-light and never executes markup.
+pub fn html_to_text(html: &str) -> String {
+    let safe = sanitize_html(html);
+    let mut output = String::with_capacity(safe.len());
+    let mut in_tag = false;
+    let mut tag = String::new();
+    for character in safe.chars() {
+        match (in_tag, character) {
+            (false, '<') => {
+                in_tag = true;
+                tag.clear();
+            }
+            (true, '>') => {
+                in_tag = false;
+                let normalized = tag.trim().to_ascii_lowercase();
+                if normalized == "br"
+                    || normalized == "/p"
+                    || normalized == "/div"
+                    || normalized == "/li"
+                {
+                    output.push('\n');
+                }
+            }
+            (true, character) => tag.push(character),
+            (false, character) => output.push(character),
+        }
+    }
+    output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn find_body(mail: &ParsedMail<'_>, html: bool) -> Option<String> {
     let content_type = mail.ctype.mimetype.to_ascii_lowercase();
     if mail.subparts.is_empty() {
@@ -147,6 +189,14 @@ mod tests {
         assert!(safe.contains("Hello"));
         assert!(!safe.contains("script"));
         assert!(!safe.contains("file:///"));
+    }
+
+    #[test]
+    fn turns_safe_html_into_readable_text() {
+        assert_eq!(
+            html_to_text("<p>Hello <strong>world</strong>.</p><p>Next</p>"),
+            "Hello world.\nNext"
+        );
     }
 
     #[test]

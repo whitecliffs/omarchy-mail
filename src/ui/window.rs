@@ -3,6 +3,7 @@ use crate::mail;
 use crate::models::{Account, Message, SecurityMode, ServerConfig};
 use crate::theme;
 use adw::prelude::*;
+use gtk::gdk;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -15,6 +16,8 @@ struct AppState {
     sidebar: gtk::Box,
     message_list: gtk::ListBox,
     reader: gtk::Box,
+    search_entry: gtk::SearchEntry,
+    selected_message: RefCell<Option<i64>>,
     status: gtk::Label,
     demo_mode: bool,
 }
@@ -97,6 +100,8 @@ pub fn build_window(application: &adw::Application) {
         sidebar,
         message_list,
         reader,
+        search_entry: search.clone(),
+        selected_message: RefCell::new(None),
         status,
         demo_mode,
     });
@@ -114,6 +119,7 @@ pub fn build_window(application: &adw::Application) {
     render_reader(&state, None);
 
     theme::install();
+    connect_keyboard_shortcuts(&state);
     window.present();
 
     if !state.accounts.borrow().is_empty() {
@@ -180,6 +186,7 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
             .widget_name()
             .strip_prefix("message-row-")
             .and_then(|id| id.parse::<i64>().ok());
+        state_for_selection.selected_message.replace(id);
         let message = id.and_then(|id| {
             state_for_selection
                 .messages
@@ -191,6 +198,38 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
         render_reader(&state_for_selection, message);
     });
     pane
+}
+
+fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
+    let controller = gtk::EventControllerKey::new();
+    let state_for_key = state.clone();
+    controller.connect_key_pressed(move |_, key, _, modifiers| {
+        let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+        if control && key == gdk::Key::n {
+            open_compose(state_for_key.clone());
+            return glib::Propagation::Stop;
+        }
+        if control && key == gdk::Key::f {
+            state_for_key.search_entry.grab_focus();
+            return glib::Propagation::Stop;
+        }
+        if control && key == gdk::Key::r {
+            sync_all(state_for_key.clone(), true);
+            return glib::Propagation::Stop;
+        }
+        let Some(message_id) = *state_for_key.selected_message.borrow() else {
+            return glib::Propagation::Proceed;
+        };
+        match key {
+            gdk::Key::a => apply_message_action(&state_for_key, message_id, "archive"),
+            gdk::Key::Delete => apply_message_action(&state_for_key, message_id, "trash"),
+            gdk::Key::u => apply_message_action(&state_for_key, message_id, "read"),
+            gdk::Key::s => apply_message_action(&state_for_key, message_id, "star"),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    state.window.add_controller(controller);
 }
 
 fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry) {
@@ -671,7 +710,12 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         rule.set_margin_bottom(24);
         content.append(&rule);
 
-        let body = gtk::Label::new(Some(&message.body));
+        let body_text = if message.body.contains('<') {
+            crate::mail::mime::html_to_text(&message.body)
+        } else {
+            message.body.clone()
+        };
+        let body = gtk::Label::new(Some(&body_text));
         body.set_xalign(0.0);
         body.set_yalign(0.0);
         body.set_wrap(true);
@@ -947,6 +991,60 @@ fn open_settings(state: Rc<AppState>) {
     account_summary.set_xalign(0.0);
     account_summary.add_css_class("mail-empty-body");
     root.append(&account_summary);
+
+    let account_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    account_list.set_margin_top(12);
+    for account in state.accounts.borrow().iter().cloned() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let label = gtk::Label::new(Some(&account.email));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.add_css_class("mail-reader-meta");
+        let remove = gtk::Button::with_label("Remove");
+        remove.add_css_class("mail-danger");
+        let state_for_remove = state.clone();
+        remove.connect_clicked(move |button| {
+            let Some(account_id) = account.id else {
+                set_status(&state_for_remove, "This account has no local id yet");
+                return;
+            };
+            button.set_sensitive(false);
+            let email = account.email.clone();
+            let database = state_for_remove.database.clone();
+            let (sender, receiver) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = mail::credentials::delete_password(&email)
+                    .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        database
+                            .delete_account(account_id)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = sender.send_blocking(result);
+            });
+            let state = state_for_remove.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match receiver.recv().await {
+                    Ok(Ok(())) => {
+                        state
+                            .accounts
+                            .borrow_mut()
+                            .retain(|stored| stored.id != Some(account_id));
+                        render_sidebar(&state);
+                        set_status(&state, "Account removed; local mail cache cleared");
+                    }
+                    Ok(Err(error)) => {
+                        set_status(&state, &format!("Couldn’t remove account: {error}"))
+                    }
+                    Err(_) => set_status(&state, "The account removal worker stopped unexpectedly"),
+                }
+            });
+        });
+        row.append(&label);
+        row.append(&remove);
+        account_list.append(&row);
+    }
+    root.append(&account_list);
 
     let reading = gtk::Label::new(Some("READING"));
     reading.set_xalign(0.0);
