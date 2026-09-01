@@ -81,6 +81,72 @@ pub fn remove_staged_files(send: &PendingSend) {
     }
 }
 
+/// Persists the current composer attachments under XDG data using a stable
+/// per-draft directory. Re-saving replaces that directory atomically, so an
+/// interrupted autosave cannot leave the database pointing at half-copied
+/// files.
+pub fn stage_draft_attachments(
+    draft_id: i64,
+    source_paths: &[PathBuf],
+) -> Result<Vec<OutgoingAttachment>, OutboxError> {
+    let root = draft_root().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the XDG data directory is not available",
+        )
+    })?;
+    fs::create_dir_all(&root)?;
+    let final_directory = root.join(format!("draft-{draft_id}"));
+    if source_paths.is_empty() {
+        remove_draft_files(draft_id);
+        return Ok(Vec::new());
+    }
+    let temporary_directory = root.join(format!(".draft-{draft_id}.tmp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temporary_directory);
+    fs::create_dir(&temporary_directory)?;
+    let result = copy_attachments_to_directory(source_paths, &temporary_directory);
+    let attachments = match result {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary_directory);
+            return Err(error.into());
+        }
+    };
+    let retired_directory = root.join(format!(".draft-{draft_id}.old-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&retired_directory);
+    if final_directory.exists() {
+        fs::rename(&final_directory, &retired_directory)?;
+    }
+    if let Err(error) = fs::rename(&temporary_directory, &final_directory) {
+        if retired_directory.exists() {
+            let _ = fs::rename(&retired_directory, &final_directory);
+        }
+        let _ = fs::remove_dir_all(&temporary_directory);
+        return Err(error.into());
+    }
+    let _ = fs::remove_dir_all(&retired_directory);
+    Ok(attachments
+        .into_iter()
+        .map(|attachment| OutgoingAttachment {
+            path: final_directory
+                .join(Path::new(&attachment.path).file_name().unwrap_or_default())
+                .to_string_lossy()
+                .into_owned(),
+            ..attachment
+        })
+        .collect())
+}
+
+pub fn remove_draft_files(draft_id: i64) {
+    let Some(root) = draft_root() else {
+        return;
+    };
+    let directory = root.join(format!("draft-{draft_id}"));
+    if directory.parent() == Some(root.as_path()) {
+        let _ = fs::remove_dir_all(directory);
+    }
+}
+
 fn stage_attachments(
     source_paths: &[PathBuf],
 ) -> Result<(Option<PathBuf>, Vec<OutgoingAttachment>), OutboxError> {
@@ -117,30 +183,7 @@ fn stage_attachments_in_root(
             )
         })?;
 
-    let result = (|| {
-        let mut attachments = Vec::with_capacity(source_paths.len());
-        for (index, source) in source_paths.iter().enumerate() {
-            let metadata = fs::metadata(source)?;
-            if !metadata.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a regular file", source.display()),
-                ));
-            }
-            let filename = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(safe_filename)
-                .unwrap_or_else(|| "attachment".into());
-            let destination = staging_dir.join(format!("{index:03}-{filename}"));
-            fs::copy(source, &destination)?;
-            attachments.push(OutgoingAttachment {
-                filename,
-                path: destination.to_string_lossy().into_owned(),
-            });
-        }
-        Ok(attachments)
-    })();
+    let result = copy_attachments_to_directory(source_paths, &staging_dir);
     match result {
         Ok(attachments) => Ok((Some(staging_dir), attachments)),
         Err(error) => {
@@ -148,6 +191,34 @@ fn stage_attachments_in_root(
             Err(error.into())
         }
     }
+}
+
+fn copy_attachments_to_directory(
+    source_paths: &[PathBuf],
+    directory: &Path,
+) -> Result<Vec<OutgoingAttachment>, io::Error> {
+    let mut attachments = Vec::with_capacity(source_paths.len());
+    for (index, source) in source_paths.iter().enumerate() {
+        let metadata = fs::metadata(source)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", source.display()),
+            ));
+        }
+        let filename = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(safe_filename)
+            .unwrap_or_else(|| "attachment".into());
+        let destination = directory.join(format!("{index:03}-{filename}"));
+        fs::copy(source, &destination)?;
+        attachments.push(OutgoingAttachment {
+            filename,
+            path: destination.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(attachments)
 }
 
 fn remove_staged_directory(directory: Option<&Path>) {
@@ -163,6 +234,10 @@ fn outbox_root() -> Option<PathBuf> {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
         })?;
     Some(data_home.join("omarchy-mail").join("outbox"))
+}
+
+fn draft_root() -> Option<PathBuf> {
+    outbox_root().map(|root| root.parent().unwrap_or(root.as_path()).join("drafts"))
 }
 
 fn safe_filename(filename: &str) -> String {
@@ -207,5 +282,61 @@ mod tests {
         );
         remove_staged_directory(staging.as_deref());
         assert!(!Path::new(&attachments[0].path).exists());
+    }
+
+    #[test]
+    fn replaces_draft_attachments_in_a_stable_directory() {
+        let directory = tempdir().expect("temporary directory");
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, b"first").expect("first source");
+        fs::write(&second, b"second").expect("second source");
+        let root = directory.path().join("omarchy-mail").join("drafts");
+        fs::create_dir_all(&root).expect("draft root");
+
+        let first_attachments =
+            stage_draft_attachments_in_root(42, &[first], &root).expect("first draft stage");
+        assert_eq!(
+            fs::read(&first_attachments[0].path).expect("first staged"),
+            b"first"
+        );
+        let second_attachments =
+            stage_draft_attachments_in_root(42, &[second], &root).expect("second draft stage");
+        assert_eq!(
+            fs::read(&second_attachments[0].path).expect("second staged"),
+            b"second"
+        );
+        assert!(!Path::new(&first_attachments[0].path).exists());
+        remove_draft_files_in_root(42, &root);
+        assert!(!Path::new(&second_attachments[0].path).exists());
+    }
+
+    fn stage_draft_attachments_in_root(
+        draft_id: i64,
+        source_paths: &[PathBuf],
+        root: &Path,
+    ) -> Result<Vec<OutgoingAttachment>, OutboxError> {
+        let final_directory = root.join(format!("draft-{draft_id}"));
+        let temporary_directory = root.join(format!(".draft-{draft_id}.test-tmp"));
+        let _ = fs::remove_dir_all(&temporary_directory);
+        fs::create_dir(&temporary_directory)?;
+        let attachments = copy_attachments_to_directory(source_paths, &temporary_directory)?;
+        let _ = fs::remove_dir_all(&final_directory);
+        fs::rename(&temporary_directory, &final_directory)?;
+        Ok(attachments
+            .into_iter()
+            .map(|attachment| OutgoingAttachment {
+                path: final_directory
+                    .join(Path::new(&attachment.path).file_name().unwrap_or_default())
+                    .to_string_lossy()
+                    .into_owned(),
+                ..attachment
+            })
+            .collect())
+    }
+
+    fn remove_draft_files_in_root(draft_id: i64, root: &Path) {
+        let directory = root.join(format!("draft-{draft_id}"));
+        let _ = fs::remove_dir_all(directory);
     }
 }

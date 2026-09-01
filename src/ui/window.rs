@@ -27,11 +27,18 @@ struct AppState {
     messages: RefCell<Vec<Message>>,
     sidebar: gtk::Box,
     message_list: gtk::ListBox,
+    middle: gtk::Box,
+    sidebar_scroll: gtk::ScrolledWindow,
     reader: gtk::Box,
+    navigation: gtk::Button,
     search_entry: gtk::SearchEntry,
     scope: RefCell<MailScope>,
-    filter: RefCell<MailFilter>,
+    search_filters: RefCell<SearchFilters>,
     selected_message: RefCell<Option<i64>>,
+    narrow_mode: Cell<bool>,
+    mobile_mode: Cell<bool>,
+    sidebar_revealed: Cell<bool>,
+    allowed_remote_images: RefCell<std::collections::HashSet<i64>>,
     monitor_sender: async_channel::Sender<mail::sync::SyncReport>,
     monitor_stops: RefCell<HashMap<i64, Arc<AtomicBool>>>,
     outbox_sender: async_channel::Sender<mail::sync::OutboxReport>,
@@ -46,12 +53,15 @@ enum MailScope {
     Account { id: i64, folder: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MailFilter {
-    All,
-    Unread,
-    Starred,
-    Attachments,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SearchFilters {
+    unread: bool,
+    starred: bool,
+    attachments: bool,
+    account_id: Option<i64>,
+    folder: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
 }
 
 pub fn build_window(application: &adw::Application) {
@@ -81,7 +91,7 @@ pub fn build_window(application: &adw::Application) {
     status.set_margin_start(12);
     status.set_margin_end(12);
 
-    let (header, compose, refresh, settings) = build_header(&status);
+    let (header, compose, refresh, settings, navigation) = build_header(&status);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.add_css_class("mail-sidebar");
@@ -135,12 +145,19 @@ pub fn build_window(application: &adw::Application) {
         folders: RefCell::new(folders),
         messages: RefCell::new(messages),
         sidebar,
+        middle: middle.clone(),
+        sidebar_scroll,
         message_list,
         reader,
+        navigation: navigation.clone(),
         search_entry: search.clone(),
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
-        filter: RefCell::new(MailFilter::All),
+        search_filters: RefCell::new(SearchFilters::default()),
         selected_message: RefCell::new(None),
+        narrow_mode: Cell::new(false),
+        mobile_mode: Cell::new(false),
+        sidebar_revealed: Cell::new(false),
+        allowed_remote_images: RefCell::new(std::collections::HashSet::new()),
         monitor_sender,
         monitor_stops: RefCell::new(HashMap::new()),
         outbox_sender,
@@ -152,7 +169,7 @@ pub fn build_window(application: &adw::Application) {
     // The middle pane is inserted after the state exists so its selection can
     // route into the reader without keeping a second source of truth.
     content.set_end_child(Some(&build_middle_and_reader(state.clone(), &middle)));
-    connect_header_actions(state.clone(), &compose, &refresh, &settings);
+    connect_header_actions(state.clone(), &compose, &refresh, &settings, &navigation);
     let state_for_search = state.clone();
     search.connect_search_changed(move |entry| {
         render_messages(&state_for_search, entry.text().as_str())
@@ -165,13 +182,28 @@ pub fn build_window(application: &adw::Application) {
 
     theme::install();
     connect_keyboard_shortcuts(&state);
+    let state_for_size = state.clone();
+    let window_for_size = window.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        apply_responsive_layout(&state_for_size, window_for_size.width());
+        glib::ControlFlow::Continue
+    });
+    apply_responsive_layout(&state, window.width());
     window.present();
     listen_for_monitor_reports(state.clone(), monitor_receiver);
     listen_for_outbox_reports(state.clone(), outbox_receiver);
     start_account_monitors(state);
 }
 
-fn build_header(status: &gtk::Label) -> (adw::HeaderBar, gtk::Button, gtk::Button, gtk::Button) {
+fn build_header(
+    status: &gtk::Label,
+) -> (
+    adw::HeaderBar,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+) {
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Omarchy Mail", "Email without the clutter");
     header.set_title_widget(Some(&title));
@@ -179,6 +211,10 @@ fn build_header(status: &gtk::Label) -> (adw::HeaderBar, gtk::Button, gtk::Butto
     let compose = icon_button("mail-message-new-symbolic", "Compose a new message");
     compose.set_widget_name("compose-button");
     header.pack_start(&compose);
+    let navigation = icon_button("sidebar-show-symbolic", "Show folders and accounts");
+    navigation.set_widget_name("navigation-button");
+    navigation.set_visible(false);
+    header.pack_start(&navigation);
 
     let refresh = icon_button("view-refresh-symbolic", "Synchronise mail");
     refresh.set_widget_name("refresh-button");
@@ -187,7 +223,7 @@ fn build_header(status: &gtk::Label) -> (adw::HeaderBar, gtk::Button, gtk::Butto
     settings.set_widget_name("settings-button");
     header.pack_end(&settings);
     header.pack_end(status);
-    (header, compose, refresh, settings)
+    (header, compose, refresh, settings, navigation)
 }
 
 fn connect_header_actions(
@@ -195,11 +231,20 @@ fn connect_header_actions(
     compose: &gtk::Button,
     refresh: &gtk::Button,
     settings: &gtk::Button,
+    navigation: &gtk::Button,
 ) {
     let state_for_compose = state.clone();
     compose.connect_clicked(move |_| open_compose(state_for_compose.clone()));
     let state_for_refresh = state.clone();
     refresh.connect_clicked(move |_| sync_all(state_for_refresh.clone(), true));
+    let state_for_navigation = state.clone();
+    navigation.connect_clicked(move |_| {
+        if state_for_navigation.mobile_mode.get() {
+            let visible = !state_for_navigation.sidebar_revealed.get();
+            state_for_navigation.sidebar_revealed.set(visible);
+            state_for_navigation.sidebar_scroll.set_visible(visible);
+        }
+    });
     let state_for_settings = state;
     settings.connect_clicked(move |_| open_settings(state_for_settings.clone()));
 }
@@ -236,6 +281,28 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
         render_reader(&state_for_selection, message);
     });
     pane
+}
+
+fn apply_responsive_layout(state: &Rc<AppState>, width: i32) {
+    let narrow = width > 0 && width < 980;
+    let mobile = width > 0 && width < 700;
+    if mobile != state.mobile_mode.get() {
+        state.sidebar_revealed.set(false);
+    }
+    state.narrow_mode.set(narrow);
+    state.mobile_mode.set(mobile);
+    state
+        .sidebar_scroll
+        .set_visible(!mobile || state.sidebar_revealed.get());
+    state.navigation.set_visible(mobile);
+    if narrow {
+        let has_selection = state.selected_message.borrow().is_some();
+        state.middle.set_visible(!has_selection);
+        state.reader.set_visible(has_selection);
+    } else {
+        state.middle.set_visible(true);
+        state.reader.set_visible(true);
+    }
 }
 
 fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
@@ -298,23 +365,178 @@ fn open_filter_menu(state: Rc<AppState>, button: &gtk::Button) {
     menu.set_margin_bottom(6);
     menu.set_margin_start(6);
     menu.set_margin_end(6);
-    for (label, filter) in [
-        ("All messages", MailFilter::All),
-        ("Unread", MailFilter::Unread),
-        ("Starred", MailFilter::Starred),
-        ("With attachments", MailFilter::Attachments),
-    ] {
-        let item = gtk::Button::with_label(label);
-        item.set_has_frame(false);
+    let heading = gtk::Label::new(Some("FILTER SEARCH"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("mail-section-label");
+    menu.append(&heading);
+
+    let filter_rows: [(&str, bool, fn(&mut SearchFilters, bool)); 3] = [
+        (
+            "Unread",
+            state.search_filters.borrow().unread,
+            |filters: &mut SearchFilters, active| filters.unread = active,
+        ),
+        (
+            "Starred",
+            state.search_filters.borrow().starred,
+            |filters: &mut SearchFilters, active| filters.starred = active,
+        ),
+        (
+            "With attachments",
+            state.search_filters.borrow().attachments,
+            |filters: &mut SearchFilters, active| filters.attachments = active,
+        ),
+    ];
+    for (label, selected, setter) in filter_rows {
+        let item = gtk::CheckButton::with_label(label);
+        item.set_active(selected);
         let state_for_item = state.clone();
-        let popover_for_item = popover.clone();
-        item.connect_clicked(move |_| {
-            state_for_item.filter.replace(filter);
+        item.connect_toggled(move |item| {
+            setter(
+                &mut state_for_item.search_filters.borrow_mut(),
+                item.is_active(),
+            );
             render_messages(&state_for_item, state_for_item.search_entry.text().as_str());
-            popover_for_item.popdown();
         });
         menu.append(&item);
     }
+
+    let divider = gtk::Separator::new(gtk::Orientation::Horizontal);
+    divider.set_margin_top(5);
+    divider.set_margin_bottom(5);
+    menu.append(&divider);
+
+    let accounts = state.accounts.borrow().clone();
+    let mut account_labels = vec!["All accounts".to_string()];
+    account_labels.extend(accounts.iter().map(|account| {
+        if account.display_name.trim().is_empty() {
+            account.email.clone()
+        } else {
+            format!("{} <{}>", account.display_name, account.email)
+        }
+    }));
+    let account_refs = account_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let account_selector = gtk::DropDown::from_strings(&account_refs);
+    account_selector.set_hexpand(true);
+    if let Some(account_id) = state.search_filters.borrow().account_id {
+        if let Some(index) = accounts
+            .iter()
+            .position(|account| account.id == Some(account_id))
+        {
+            account_selector.set_selected((index + 1) as u32);
+        }
+    }
+    let account_row = form_row("Account", &account_selector);
+    menu.append(&account_row);
+    let state_for_account = state.clone();
+    account_selector.connect_selected_notify(move |selector| {
+        let selected = selector.selected() as usize;
+        state_for_account.search_filters.borrow_mut().account_id = accounts
+            .get(selected.saturating_sub(1))
+            .and_then(|account| account.id);
+        render_messages(
+            &state_for_account,
+            state_for_account.search_entry.text().as_str(),
+        );
+    });
+
+    let mut folder_names = vec!["All folders".to_string()];
+    for folder in [
+        "Inbox", "Sent", "Drafts", "Archive", "Spam", "Trash", "Outbox",
+    ] {
+        folder_names.push(folder.to_string());
+    }
+    for folder in state
+        .folders
+        .borrow()
+        .iter()
+        .map(|folder| folder.name.clone())
+    {
+        if !folder_names
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&folder))
+        {
+            folder_names.push(folder);
+        }
+    }
+    let folder_refs = folder_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let folder_selector = gtk::DropDown::from_strings(&folder_refs);
+    folder_selector.set_hexpand(true);
+    if let Some(folder) = state.search_filters.borrow().folder.as_deref() {
+        if let Some(index) = folder_names.iter().position(|known| known == folder) {
+            folder_selector.set_selected(index as u32);
+        }
+    }
+    let folder_row = form_row("Folder", &folder_selector);
+    menu.append(&folder_row);
+    let state_for_folder = state.clone();
+    folder_selector.connect_selected_notify(move |selector| {
+        state_for_folder.search_filters.borrow_mut().folder = folder_names
+            .get(selector.selected() as usize)
+            .filter(|folder| folder.as_str() != "All folders")
+            .cloned();
+        render_messages(
+            &state_for_folder,
+            state_for_folder.search_entry.text().as_str(),
+        );
+    });
+
+    let date_heading = gtk::Label::new(Some("DATE (YYYY-MM-DD)"));
+    date_heading.set_xalign(0.0);
+    date_heading.add_css_class("mail-section-label");
+    date_heading.set_margin_top(6);
+    menu.append(&date_heading);
+    for (placeholder, field) in [("After date", true), ("Before date", false)] {
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some(placeholder));
+        let current = if field {
+            state
+                .search_filters
+                .borrow()
+                .after
+                .clone()
+                .unwrap_or_default()
+        } else {
+            state
+                .search_filters
+                .borrow()
+                .before
+                .clone()
+                .unwrap_or_default()
+        };
+        entry.set_text(&current);
+        let state_for_date = state.clone();
+        entry.connect_changed(move |entry| {
+            let value = entry.text().trim().to_string();
+            let value = (!value.is_empty()).then_some(value);
+            if field {
+                state_for_date.search_filters.borrow_mut().after = value;
+            } else {
+                state_for_date.search_filters.borrow_mut().before = value;
+            }
+            render_messages(&state_for_date, state_for_date.search_entry.text().as_str());
+        });
+        menu.append(&entry);
+    }
+
+    let clear = gtk::Button::with_label("Clear filters");
+    clear.set_halign(gtk::Align::End);
+    let state_for_clear = state.clone();
+    let popover_for_clear = popover.clone();
+    clear.connect_clicked(move |_| {
+        state_for_clear
+            .search_filters
+            .replace(SearchFilters::default());
+        render_messages(
+            &state_for_clear,
+            state_for_clear.search_entry.text().as_str(),
+        );
+        popover_for_clear.popdown();
+    });
+    menu.append(&clear);
     popover.set_child(Some(&menu));
     popover.popup();
 }
@@ -721,7 +943,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     let raw_query = query.trim();
     let query = raw_query.to_lowercase();
     let scope = state.scope.borrow().clone();
-    let filter = *state.filter.borrow();
+    let filters = state.search_filters.borrow().clone();
     let is_outbox_scope = matches!(
         &scope,
         MailScope::Unified(folder) | MailScope::Account { folder, .. } if folder == "Outbox"
@@ -745,22 +967,8 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
                 }
             };
             in_scope
-                && match filter {
-                    MailFilter::All => true,
-                    MailFilter::Unread => message.unread,
-                    MailFilter::Starred => message.starred,
-                    MailFilter::Attachments => message.has_attachments,
-                }
-                && (query.is_empty()
-                    || [
-                        message.sender_name.as_str(),
-                        message.sender_email.as_str(),
-                        message.recipients.as_str(),
-                        message.subject.as_str(),
-                        message.body.as_str(),
-                    ]
-                    .iter()
-                    .any(|value| value.to_lowercase().contains(&query)))
+                && search_filters_match(message, &filters)
+                && search_text_matches(message, &query)
         })
         .collect::<Vec<_>>();
     if visible.is_empty() {
@@ -811,6 +1019,60 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
             row.add_controller(gesture);
         }
         state.message_list.append(&row);
+    }
+}
+
+fn search_filters_match(message: &Message, filters: &SearchFilters) -> bool {
+    filters
+        .account_id
+        .is_none_or(|account_id| message.account_id == Some(account_id))
+        && filters
+            .folder
+            .as_deref()
+            .is_none_or(|folder| message.folder.eq_ignore_ascii_case(folder))
+        && (!filters.unread || message.unread)
+        && (!filters.starred || message.starred)
+        && (!filters.attachments || message.has_attachments)
+        && filters
+            .after
+            .as_deref()
+            .is_none_or(|date| message_date_matches(message, date, true))
+        && filters
+            .before
+            .as_deref()
+            .is_none_or(|date| message_date_matches(message, date, false))
+}
+
+fn search_text_matches(message: &Message, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let fields = [
+        message.sender_name.as_str(),
+        message.sender_email.as_str(),
+        message.recipients.as_str(),
+        message.subject.as_str(),
+        message.body.as_str(),
+    ]
+    .iter()
+    .map(|value| value.to_ascii_lowercase())
+    .collect::<Vec<_>>();
+    query
+        .split_whitespace()
+        .all(|term| fields.iter().any(|field| field.contains(term)))
+}
+
+fn message_date_matches(message: &Message, value: &str, after: bool) -> bool {
+    let Ok(filter_date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+        return true;
+    };
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&message.received_at) else {
+        return false;
+    };
+    if after {
+        timestamp.date_naive() >= filter_date
+    } else {
+        timestamp.date_naive() <= filter_date
     }
 }
 
@@ -1239,6 +1501,10 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
 }
 
 fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
+    if state.narrow_mode.get() {
+        state.middle.set_visible(message.is_none());
+        state.reader.set_visible(message.is_some());
+    }
     clear(&state.reader);
     if let Some(message) = message {
         let conversation = conversation_messages(state, &message);
@@ -1251,6 +1517,20 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         content.set_margin_end(34);
         content.set_margin_top(30);
         content.set_margin_bottom(34);
+
+        if state.narrow_mode.get() {
+            let back = icon_button("go-previous-symbolic", "Back to messages");
+            back.set_label("Messages");
+            back.set_use_underline(false);
+            back.set_halign(gtk::Align::Start);
+            let state_for_back = state.clone();
+            back.connect_clicked(move |_| {
+                state_for_back.selected_message.replace(None);
+                state_for_back.message_list.unselect_all();
+                render_reader(&state_for_back, None);
+            });
+            content.append(&back);
+        }
 
         let subject = gtk::Label::new(Some(&message.subject));
         subject.set_xalign(0.0);
@@ -1568,6 +1848,10 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
     }
     content.append(&body);
 
+    if let Some(body_html) = body_html {
+        append_remote_images(content, state, message, body_html);
+    }
+
     let inline_images = message
         .attachments
         .iter()
@@ -1655,6 +1939,128 @@ fn append_message_content(content: &gtk::Box, state: &Rc<AppState>, message: &Me
         attachments.append(&chip);
         content.append(&attachments);
     }
+}
+
+fn append_remote_images(
+    content: &gtk::Box,
+    state: &Rc<AppState>,
+    message: &Message,
+    body_html: &str,
+) {
+    let urls = crate::mail::mime::remote_image_urls(body_html);
+    if urls.is_empty() {
+        return;
+    }
+    let sender_allowed = state
+        .preferences
+        .borrow()
+        .remote_images_allowed_for_sender(&message.sender_email);
+    let allowed = !state.preferences.borrow().block_remote_images
+        || sender_allowed
+        || state.allowed_remote_images.borrow().contains(&message.id);
+    let images = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    images.set_margin_top(20);
+    images.add_css_class("mail-inline-images");
+    let heading = gtk::Label::new(Some(if allowed {
+        "Remote images"
+    } else {
+        "Remote images blocked"
+    }));
+    heading.set_xalign(0.0);
+    heading.add_css_class("mail-reader-meta");
+    images.append(&heading);
+
+    if !allowed {
+        let details = gtk::Label::new(Some(&format!(
+            "{} image{} hidden to protect your privacy.",
+            urls.len(),
+            if urls.len() == 1 { " is" } else { "s are" }
+        )));
+        details.set_xalign(0.0);
+        details.set_wrap(true);
+        details.add_css_class("mail-empty-body");
+        images.append(&details);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let load = gtk::Button::with_label("Load for this message");
+        let state_for_message = state.clone();
+        let message_id = message.id;
+        load.connect_clicked(move |_| {
+            state_for_message
+                .allowed_remote_images
+                .borrow_mut()
+                .insert(message_id);
+            rerender_selected_reader(&state_for_message);
+        });
+        actions.append(&load);
+        let always = gtk::Button::with_label("Always allow from sender");
+        let state_for_sender = state.clone();
+        let sender_email = message.sender_email.clone();
+        always.connect_clicked(move |_| {
+            let result = {
+                let mut preferences = state_for_sender.preferences.borrow_mut();
+                preferences.allow_remote_images_for_sender(&sender_email);
+                preferences::save(&preferences)
+            };
+            if let Err(error) = result {
+                set_status(
+                    &state_for_sender,
+                    &format!("Couldn’t save image preference: {error}"),
+                );
+            }
+            rerender_selected_reader(&state_for_sender);
+        });
+        actions.append(&always);
+        images.append(&actions);
+        content.append(&images);
+        return;
+    }
+
+    for url in urls {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let picture = gtk::Picture::new();
+        picture.set_alternative_text(Some("Remote image"));
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_can_shrink(true);
+        picture.set_halign(gtk::Align::Start);
+        picture.set_hexpand(true);
+        picture.set_visible(false);
+        let status = gtk::Label::new(Some("Loading remote image…"));
+        status.set_xalign(0.0);
+        status.add_css_class("mail-empty-body");
+        row.append(&picture);
+        row.append(&status);
+        images.append(&row);
+
+        let file = gio::File::for_uri(&url);
+        file.load_bytes_async(None::<&gio::Cancellable>, move |result| match result {
+            Ok((bytes, _)) if bytes.len() <= 8 * 1024 * 1024 => {
+                match gdk::Texture::from_bytes(&bytes) {
+                    Ok(texture) => {
+                        picture.set_paintable(Some(&texture));
+                        picture.set_visible(true);
+                        status.set_visible(false);
+                    }
+                    Err(_) => status.set_text("Remote image could not be displayed."),
+                }
+            }
+            Ok(_) => status.set_text("Remote image is too large to display."),
+            Err(_) => status.set_text("Remote image is unavailable."),
+        });
+    }
+    content.append(&images);
+}
+
+fn rerender_selected_reader(state: &Rc<AppState>) {
+    let Some(id) = *state.selected_message.borrow() else {
+        return;
+    };
+    let message = state
+        .messages
+        .borrow()
+        .iter()
+        .find(|message| message.id == id)
+        .cloned();
+    render_reader(state, message);
 }
 
 fn is_inline_image(attachment: &AttachmentInfo) -> bool {
@@ -2272,6 +2678,12 @@ fn open_settings(state: Rc<AppState>) {
             button.set_sensitive(false);
             let database = state_for_remove.database.clone();
             let queued_sends = database.pending_sends(Some(account_id)).unwrap_or_default();
+            let draft_ids = database
+                .list_messages(Some(account_id), "Drafts")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|draft| draft.id)
+                .collect::<Vec<_>>();
             let account_email = account_email.clone();
             let (sender, receiver) = async_channel::bounded(1);
             std::thread::spawn(move || {
@@ -2289,6 +2701,9 @@ fn open_settings(state: Rc<AppState>) {
                     .map(|_| {
                         for send in queued_sends {
                             mail::outbox::remove_staged_files(&send);
+                        }
+                        for draft_id in draft_ids {
+                            mail::outbox::remove_draft_files(draft_id);
                         }
                     });
                 let _ = sender.send_blocking(result);
@@ -2806,6 +3221,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         initial_subject,
         initial_body,
         initial_body_html,
+        initial_attachments,
     ) = match context {
         Some(ComposeContext::Reply { message, reply_all }) => {
             let subject = if message.subject.to_lowercase().starts_with("re:") {
@@ -2837,6 +3253,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 subject,
                 body,
                 None,
+                Vec::new(),
             )
         }
         Some(ComposeContext::Forward(message)) => {
@@ -2862,6 +3279,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 subject,
                 body,
                 None,
+                Vec::new(),
             )
         }
         Some(ComposeContext::Draft(message)) => {
@@ -2875,6 +3293,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 message.subject,
                 message.body,
                 message.body_html,
+                message.attachments,
             )
         }
         None => (
@@ -2886,6 +3305,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             String::new(),
             String::new(),
             None,
+            Vec::new(),
         ),
     };
     let compose_title = if initial_draft_id.is_some() {
@@ -3036,11 +3456,23 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     }
     root.append(&format_toolbar);
     root.append(&body);
-    let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(
+        initial_attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment_available(attachment).then(|| PathBuf::from(&attachment.cache_path))
+            })
+            .collect(),
+    ));
     let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(initial_draft_id));
     let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     attachment_list.set_hexpand(true);
     root.append(&attachment_list);
+    for attachment in &initial_attachments {
+        if attachment_available(attachment) {
+            append_attachment_chip(&attachment_list, &attachment.filename);
+        }
+    }
     let compose_status = gtk::Label::new(None);
     compose_status.set_xalign(0.0);
     compose_status.set_wrap(true);
@@ -3085,9 +3517,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                         .unwrap_or("attachment")
                         .to_string();
                     paths.borrow_mut().push(path);
-                    let chip = gtk::Label::new(Some(&format!("  {name}  ")));
-                    chip.add_css_class("mail-attachment-chip");
-                    list.append(&chip);
+                    append_attachment_chip(&list, &name);
                     status.set_text("Attachment added");
                 }
                 Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {}
@@ -3097,6 +3527,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     });
 
     let state_for_draft = state.clone();
+    let attachment_paths_for_draft = attachment_paths.clone();
     let draft_id_for_manual = draft_id.clone();
     let account_selector_for_draft = account_selector.clone();
     let to_for_draft = to.clone();
@@ -3119,6 +3550,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             body_for_draft.clone(),
             format_selector_for_draft.clone(),
             formatting_for_draft.clone(),
+            attachment_paths_for_draft.clone(),
             compose_status_for_draft.clone(),
             "Saving draft…",
         );
@@ -3136,6 +3568,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let body = body.clone();
         let format_selector = format_selector.clone();
         let formatting = formatting.clone();
+        let attachment_paths = attachment_paths.clone();
         let status = compose_status.clone();
         let revision = draft_revision.clone();
         Rc::new(move || {
@@ -3150,6 +3583,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 body.clone(),
                 format_selector.clone(),
                 formatting.clone(),
+                attachment_paths.clone(),
                 status.clone(),
                 revision.clone(),
             )
@@ -3295,6 +3729,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 let database = state_for_send.database.clone();
                 std::thread::spawn(move || {
                     let _ = database.delete_message(draft_id);
+                    mail::outbox::remove_draft_files(draft_id);
                 });
             }
             set_status(&state_for_send, "Preview message queued");
@@ -3378,6 +3813,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                         let database = state.database.clone();
                         std::thread::spawn(move || {
                             let _ = database.delete_message(draft_id);
+                            mail::outbox::remove_draft_files(draft_id);
                         });
                     }
                     set_status(&state, "Message sent");
@@ -3388,6 +3824,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                         let database = state.database.clone();
                         std::thread::spawn(move || {
                             let _ = database.delete_message(draft_id);
+                            mail::outbox::remove_draft_files(draft_id);
                         });
                     }
                     refresh_cached_view(&state);
@@ -3428,6 +3865,7 @@ fn schedule_draft_autosave(
     body: gtk::TextView,
     format_selector: gtk::DropDown,
     formatting: Rc<ComposerFormatting>,
+    attachment_paths: Rc<RefCell<Vec<PathBuf>>>,
     status: gtk::Label,
     revision: Rc<Cell<u64>>,
 ) {
@@ -3446,6 +3884,7 @@ fn schedule_draft_autosave(
                 body,
                 format_selector,
                 formatting,
+                attachment_paths,
                 status,
                 "Saving draft…",
             );
@@ -3464,6 +3903,7 @@ fn save_draft_async(
     body: gtk::TextView,
     format_selector: gtk::DropDown,
     formatting: Rc<ComposerFormatting>,
+    attachment_paths: Rc<RefCell<Vec<PathBuf>>>,
     status: gtk::Label,
     status_text: &'static str,
 ) {
@@ -3473,7 +3913,12 @@ fn save_draft_async(
     let recipients = compose_recipient_summary(&to_value, &cc_value, &bcc_value);
     let subject = subject.text().to_string();
     let (body, body_html) = composer_contents(&body, format_selector.selected() == 1, &formatting);
-    if recipients.is_empty() && subject.trim().is_empty() && body.trim().is_empty() {
+    let source_paths = attachment_paths.borrow().clone();
+    if recipients.is_empty()
+        && subject.trim().is_empty()
+        && body.trim().is_empty()
+        && source_paths.is_empty()
+    {
         return;
     }
     let account_id = state
@@ -3486,30 +3931,54 @@ fn save_draft_async(
     status.set_text(status_text);
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let result = match existing_id {
-            Some(existing_id) => database.update_draft_with_html(
-                existing_id,
+        let result = (|| {
+            let id = match existing_id {
+                Some(existing_id) => existing_id,
+                None => database.save_draft_with_html(
+                    account_id,
+                    &recipients,
+                    &subject,
+                    &body,
+                    body_html.as_deref(),
+                )?,
+            };
+            let staged = mail::outbox::stage_draft_attachments(id, &source_paths)
+                .map_err(|error| crate::database::DatabaseError::InvalidValue(error.to_string()))?;
+            let metadata = staged
+                .iter()
+                .map(|attachment| AttachmentInfo {
+                    filename: attachment.filename.clone(),
+                    content_type: "application/octet-stream".into(),
+                    size: std::fs::metadata(&attachment.path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or_default(),
+                    cache_path: attachment.path.clone(),
+                    content_id: None,
+                })
+                .collect::<Vec<_>>();
+            let id = database.update_draft_with_html_and_attachments(
+                id,
                 account_id,
                 &recipients,
                 &subject,
                 &body,
                 body_html.as_deref(),
-            ),
-            None => database.save_draft_with_html(
-                account_id,
-                &recipients,
-                &subject,
-                &body,
-                body_html.as_deref(),
-            ),
-        }
+                &metadata,
+            )?;
+            Ok::<_, crate::database::DatabaseError>((id, staged))
+        })()
         .map_err(|error| error.to_string());
         let _ = sender.send_blocking(result);
     });
     glib::MainContext::default().spawn_local(async move {
         match receiver.recv().await {
-            Ok(Ok(id)) => {
+            Ok(Ok((id, staged))) => {
                 draft_id.set(Some(id));
+                let staged_paths = staged
+                    .iter()
+                    .map(|attachment| PathBuf::from(&attachment.path))
+                    .collect::<Vec<_>>();
+                *attachment_paths.borrow_mut() = staged_paths;
                 status.set_text("Draft saved locally");
             }
             Ok(Err(error)) => status.set_text(&format!("Couldn’t save this draft: {error}")),
@@ -3575,6 +4044,7 @@ fn delete_local_message(state: &Rc<AppState>, message_id: i64) {
     let database = state.database.clone();
     std::thread::spawn(move || {
         let _ = database.delete_message(message_id);
+        mail::outbox::remove_draft_files(message_id);
     });
     set_status(state, "Draft deleted");
     render_sidebar(state);
@@ -3598,6 +4068,14 @@ fn form_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     row.append(&label_widget);
     row.append(widget);
     row
+}
+
+fn append_attachment_chip(list: &gtk::Box, filename: &str) {
+    let chip = gtk::Label::new(Some(&format!("  {filename}  ")));
+    chip.add_css_class("mail-attachment-chip");
+    chip.set_max_width_chars(34);
+    chip.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    list.append(&chip);
 }
 
 fn preference_switch_row<F>(state: &Rc<AppState>, label: &str, active: bool, setter: F) -> gtk::Box
@@ -3726,5 +4204,32 @@ mod tests {
                 bcc: "archive@example.com".into(),
             }
         );
+    }
+
+    #[test]
+    fn combines_text_and_local_search_filters() {
+        let mut message = Message::demo_messages().remove(0);
+        message.account_id = Some(7);
+        message.folder = "Sent".into();
+        message.received_at = "2026-08-31T14:32:00+00:00".into();
+        let filters = SearchFilters {
+            unread: true,
+            starred: true,
+            attachments: true,
+            account_id: Some(7),
+            folder: Some("Sent".into()),
+            after: Some("2026-08-01".into()),
+            before: Some("2026-08-31".into()),
+        };
+        assert!(search_filters_match(&message, &filters));
+        assert!(search_text_matches(&message, "garden photos"));
+        assert!(!search_text_matches(&message, "garden unrelated"));
+        assert!(!search_filters_match(
+            &message,
+            &SearchFilters {
+                folder: Some("Inbox".into()),
+                ..filters
+            }
+        ));
     }
 }

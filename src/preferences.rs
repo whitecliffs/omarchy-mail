@@ -15,6 +15,8 @@ pub struct Preferences {
     pub plain_text_warning: bool,
     #[serde(default)]
     pub signatures: HashMap<String, String>,
+    #[serde(default)]
+    pub allowed_remote_image_senders: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -24,6 +26,7 @@ impl Default for Preferences {
             conversation_view: true,
             plain_text_warning: false,
             signatures: HashMap::new(),
+            allowed_remote_image_senders: Vec::new(),
         }
     }
 }
@@ -42,6 +45,25 @@ impl Preferences {
                 };
                 format!("-- \n{name}")
             })
+    }
+
+    pub fn remote_images_allowed_for_sender(&self, sender_email: &str) -> bool {
+        let sender_email = sender_email.trim().to_ascii_lowercase();
+        !sender_email.is_empty()
+            && self
+                .allowed_remote_image_senders
+                .iter()
+                .any(|sender| sender.trim().eq_ignore_ascii_case(&sender_email))
+    }
+
+    pub fn allow_remote_images_for_sender(&mut self, sender_email: &str) {
+        let sender_email = sender_email.trim();
+        if sender_email.is_empty() || self.remote_images_allowed_for_sender(sender_email) {
+            return;
+        }
+        self.allowed_remote_image_senders
+            .push(sender_email.to_ascii_lowercase());
+        self.allowed_remote_image_senders.sort_unstable();
     }
 }
 
@@ -109,5 +131,17 @@ mod tests {
             .signatures
             .insert(account.email.clone(), "Regards,\nJim".into());
         assert_eq!(preferences.signature_for(&account), "Regards,\nJim");
+    }
+
+    #[test]
+    fn remembers_remote_image_permission_per_sender() {
+        let mut preferences = Preferences::default();
+        assert!(!preferences.remote_images_allowed_for_sender("Jane@Example.com"));
+        preferences.allow_remote_images_for_sender(" Jane@Example.com ");
+        assert!(preferences.remote_images_allowed_for_sender("jane@example.com"));
+        assert_eq!(
+            preferences.allowed_remote_image_senders,
+            vec!["jane@example.com"]
+        );
     }
 }

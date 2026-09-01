@@ -19,7 +19,9 @@ without making the GTK main loop responsible for network activity.
 - `mail/mime.rs` parses MIME messages, retains normalized `Content-ID` values,
   and sanitises HTML before the UI sees it. Inline image bytes are cached as
   ordinary disposable attachments and rendered by GTK only from that local
-  cache; remote URLs and scripts never reach a web runtime.
+  cache. Remote image URLs are reduced to an explicit `http(s)` allowlist and
+  are fetched only after a user action; no browser runtime or script execution
+  is involved.
 - The composer keeps its small rich-text model in GTK text tags, with a plain
   text body always available as the compatibility part. Optional draft HTML is
   sanitized at the persistence boundary, and SMTP emits `multipart/alternative`
@@ -32,7 +34,9 @@ without making the GTK main loop responsible for network activity.
   fallback and capped reconnect backoff.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
-- `ui/window.rs` contains the first vertical slice of the desktop experience.
+- `ui/window.rs` contains the desktop experience, including adaptive pane
+  navigation and composable local search filters. Network and disk work stays
+  outside the GTK event loop.
 
 ## Data boundaries
 
@@ -46,11 +50,17 @@ filenames and metadata are retained with the cached message in SQLite.
 Non-secret display and composing preferences use
 `XDG_CONFIG_HOME/omarchy-mail/preferences.json`; signatures are keyed by
 account email so changing a server password does not affect them. Missing or
-invalid preferences fall back to privacy-first defaults.
+invalid preferences fall back to privacy-first defaults. Sender-level remote
+image permissions are stored in the same non-secret preference file; one-time
+message permissions live only for the running window.
 Queued outgoing messages are durable user data in the `pending_sends` table;
 their selected attachments are copied to
 `XDG_DATA_HOME/omarchy-mail/outbox/` before the queue row is committed. This
 means the original file can move without breaking a later retry.
+Local draft attachments are copied into stable per-draft directories under
+`XDG_DATA_HOME/omarchy-mail/drafts/` before their metadata is committed to the
+draft row. Autosave replaces that directory atomically, and deleting or sending
+the draft removes the app-owned copy.
 
 Each enabled account owns an isolated monitor thread. The monitor performs a
 bounded initial sync, waits for INBOX changes using IMAP IDLE for at most 25

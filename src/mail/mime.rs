@@ -66,16 +66,48 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
 
 pub fn sanitize_html(html: &str) -> String {
     let html = strip_dangerous_blocks(html);
-    Builder::default()
+    let mut builder = Builder::default();
+    builder
         .tags(HashSet::from([
-            "a", "b", "br", "code", "div", "em", "i", "li", "ol", "p", "pre", "span", "strong",
-            "u", "ul",
+            "a", "b", "br", "code", "div", "em", "i", "img", "li", "ol", "p", "pre", "span",
+            "strong", "u", "ul",
         ]))
         .generic_attributes(HashSet::from(["title"]))
+        .add_tag_attributes("img", ["src", "alt", "width", "height"])
         .link_rel(Some("noopener noreferrer"))
         .url_relative(ammonia::UrlRelative::PassThrough)
+        .url_schemes(HashSet::from(["http", "https", "mailto"]))
         .clean(&html)
         .to_string()
+}
+
+/// Returns only network image URLs from already-sanitised HTML. Local files,
+/// data URLs, cid resources, and malformed values never leave the MIME layer.
+pub fn remote_image_urls(html: &str) -> Vec<String> {
+    let safe = sanitize_html(html);
+    let lower = safe.to_ascii_lowercase();
+    let mut urls = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("<img") {
+        let start = cursor + relative;
+        let Some(end_relative) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + end_relative;
+        let tag = &safe[start..=end];
+        if let Some(src) = attribute_value(tag, "src") {
+            let src = decode_entities(&src);
+            if (src.starts_with("https://") || src.starts_with("http://"))
+                && src.len() <= 4096
+                && !src.chars().any(char::is_whitespace)
+                && !urls.iter().any(|known| known == &src)
+            {
+                urls.push(src);
+            }
+        }
+        cursor = end + 1;
+    }
+    urls
 }
 
 fn strip_dangerous_blocks(html: &str) -> String {
@@ -310,6 +342,20 @@ fn href_from_tag(tag: &str) -> Option<String> {
         .then_some(value)
 }
 
+fn attribute_value(tag: &str, attribute: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let marker = format!("{attribute}=");
+    let start = lower.find(&marker)? + marker.len();
+    let value = tag[start..].trim_start();
+    if let Some(value) = value.strip_prefix('"') {
+        return value.split_once('"').map(|(value, _)| value.to_string());
+    }
+    if let Some(value) = value.strip_prefix('\'') {
+        return value.split_once('\'').map(|(value, _)| value.to_string());
+    }
+    value.split_whitespace().next().map(ToOwned::to_owned)
+}
+
 fn decode_entities(value: &str) -> String {
     value
         .replace("&nbsp;", " ")
@@ -457,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_inline_image_content_id_without_allowing_remote_images() {
+    fn preserves_inline_image_content_id_and_lists_only_safe_remote_images() {
         let raw = concat!(
             "Content-Type: multipart/related; boundary=related\r\n\r\n",
             "--related\r\n",
@@ -476,7 +522,18 @@ mod tests {
             parsed.attachments[0].content_id.as_deref(),
             Some("logo@example.com")
         );
-        assert!(!parsed.body.contains("remote"));
-        assert!(!sanitize_html(&parsed.body).contains("img"));
+        assert!(
+            !remote_image_urls(&parsed.body)
+                .iter()
+                .any(|url| url.contains("remote"))
+        );
+        let safe = sanitize_html(
+            r#"<p>Hello<img src="https://images.example/logo.png"><img src="file:///etc/passwd"><img src="data:image/png;base64,bad"></p>"#,
+        );
+        assert!(safe.contains("https://images.example/logo.png"));
+        assert_eq!(
+            remote_image_urls(&safe),
+            vec!["https://images.example/logo.png"]
+        );
     }
 }

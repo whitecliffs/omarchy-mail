@@ -205,7 +205,9 @@ impl Message {
                 subject: "Welcome to the Osaka Jade release".into(),
                 preview: "A small set of thoughtful improvements for your desktop...".into(),
                 body: "Hello,\n\nA small set of thoughtful improvements for your desktop has arrived. Thank you for helping shape Omarchy.\n\nThe Omarchy team".into(),
-                body_html: None,
+                body_html: Some(
+                    "<p>A small set of thoughtful improvements for your desktop has arrived.</p><p><img src=\"https://example.com/omarchy-mail-preview.png\" alt=\"Release preview\"></p>".into(),
+                ),
                 received_at: "Today, 11:08".into(),
                 unread: true,
                 starred: false,

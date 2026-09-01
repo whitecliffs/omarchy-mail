@@ -1,5 +1,6 @@
 use crate::models::{
-    Account, MailFolder, Message, OutgoingAttachment, PendingAction, PendingSend, ServerConfig,
+    Account, AttachmentInfo, MailFolder, Message, OutgoingAttachment, PendingAction, PendingSend,
+    ServerConfig,
 };
 use chrono::Utc;
 use rusqlite::{Connection, params};
@@ -239,11 +240,32 @@ impl Database {
         body: &str,
         body_html: Option<&str>,
     ) -> Result<i64> {
+        self.save_draft_with_html_and_attachments(
+            account_id,
+            recipients,
+            subject,
+            body,
+            body_html,
+            &[],
+        )
+    }
+
+    pub fn save_draft_with_html_and_attachments(
+        &self,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+        body_html: Option<&str>,
+        attachments: &[AttachmentInfo],
+    ) -> Result<i64> {
         let body_html = body_html.map(crate::mail::mime::sanitize_html);
+        let attachments_json = serde_json::to_string(attachments)
+            .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
         let connection = self.connection()?;
         let id = -Utc::now().timestamp_micros();
         connection.execute(
-            "INSERT INTO messages(id, account_id, folder, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size)\n             VALUES (?1, ?2, 'Drafts', '', '', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 1)",
+            "INSERT INTO messages(id, account_id, folder, sender_name, sender_email, recipients, subject, preview, body, body_html, received_at, unread, starred, has_attachments, thread_size, attachments_json)\n             VALUES (?1, ?2, 'Drafts', '', '', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, 1, ?10)",
             params![
                 id,
                 account_id,
@@ -252,7 +274,9 @@ impl Database {
                 body.chars().take(160).collect::<String>(),
                 body,
                 body_html,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                (!attachments.is_empty()) as i64,
+                attachments_json,
             ],
         )?;
         Ok(id)
@@ -278,13 +302,37 @@ impl Database {
         body: &str,
         body_html: Option<&str>,
     ) -> Result<i64> {
+        self.update_draft_with_html_and_attachments(
+            draft_id,
+            account_id,
+            recipients,
+            subject,
+            body,
+            body_html,
+            &[],
+        )
+    }
+
+    pub fn update_draft_with_html_and_attachments(
+        &self,
+        draft_id: i64,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+        body_html: Option<&str>,
+        attachments: &[AttachmentInfo],
+    ) -> Result<i64> {
         let body_html = body_html.map(crate::mail::mime::sanitize_html);
+        let attachments_json = serde_json::to_string(attachments)
+            .map_err(|error| DatabaseError::InvalidValue(error.to_string()))?;
         let connection = self.connection()?;
         let updated = connection.execute(
             "UPDATE messages
              SET account_id = ?1, recipients = ?2, subject = ?3, preview = ?4,
-                 body = ?5, body_html = ?6, received_at = ?7
-             WHERE id = ?8 AND folder = 'Drafts'",
+                 body = ?5, body_html = ?6, received_at = ?7,
+                 has_attachments = ?8, attachments_json = ?9
+             WHERE id = ?10 AND folder = 'Drafts'",
             params![
                 account_id,
                 recipients,
@@ -293,6 +341,8 @@ impl Database {
                 body,
                 body_html,
                 Utc::now().to_rfc3339(),
+                (!attachments.is_empty()) as i64,
+                attachments_json,
                 draft_id,
             ],
         )?;
@@ -300,7 +350,14 @@ impl Database {
             return Ok(draft_id);
         }
         drop(connection);
-        self.save_draft_with_html(account_id, recipients, subject, body, body_html.as_deref())
+        self.save_draft_with_html_and_attachments(
+            account_id,
+            recipients,
+            subject,
+            body,
+            body_html.as_deref(),
+            attachments,
+        )
     }
 
     pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
@@ -370,6 +427,10 @@ impl Database {
     }
 
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>> {
+        let query = fts_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.body_html, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
@@ -651,6 +712,17 @@ impl Database {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter_map(|term| {
+            let term = term.replace('"', "");
+            (!term.is_empty()).then(|| format!("\"{term}\""))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -1125,5 +1197,40 @@ mod tests {
             draft.body_html.as_deref(),
             Some("<p><strong>A styled note</strong></p>")
         );
+    }
+
+    #[test]
+    fn round_trips_draft_attachment_metadata() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let attachment = AttachmentInfo {
+            filename: "notes.txt".into(),
+            content_type: "text/plain".into(),
+            size: 12,
+            cache_path: directory
+                .path()
+                .join("drafts/draft-1/notes.txt")
+                .to_string_lossy()
+                .into_owned(),
+            content_id: None,
+        };
+        let draft_id = database
+            .save_draft_with_html_and_attachments(
+                None,
+                "jane@example.com",
+                "A note with a file",
+                "See attached.",
+                None,
+                std::slice::from_ref(&attachment),
+            )
+            .expect("save draft");
+        let draft = database
+            .list_messages(None, "Drafts")
+            .expect("load draft")
+            .into_iter()
+            .find(|draft| draft.id == draft_id)
+            .expect("draft row");
+        assert!(draft.has_attachments);
+        assert_eq!(draft.attachments, vec![attachment]);
     }
 }

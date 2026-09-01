@@ -13,8 +13,9 @@ per-account cached-folder navigation, resumable local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings surfaces
 with separate Cc/Bcc fields, resumable draft editing, lightweight
 plain-text/HTML composition with safe formatting, links, and account signatures,
-All/Unread/Starred/Attachment filters, safe inline image rendering, attachment
-re-fetch after cache eviction, a durable offline Outbox,
+composable local search filters for account, folder, unread, starred, attachment,
+and date, safe inline image rendering, privacy-first remote-image controls,
+attachment re-fetch after cache eviction, a durable offline Outbox,
 and Omarchy theme integration. The cache now reconciles deleted messages and
 server-side mailbox removals using complete UID/UIDVALIDITY snapshots. IMAP
 and SMTP can use provider-issued OAuth2 access tokens through native XOAUTH2
@@ -32,9 +33,15 @@ on-demand.
 
 HTML mail is sanitized and rendered with native GTK/Pango formatting rather
 than a browser runtime. Safe `cid:` inline images are cached and shown as
-native GTK pictures; remote images and scripts remain blocked. Incoming
-attachments are cached under `$XDG_CACHE_HOME/omarchy-mail/attachments/` (or
-`~/.cache/omarchy-mail/`) and can be saved from the reader.
+native GTK pictures. Remote images are blocked by default and can be loaded
+once for a message or trusted for a sender; explicit loads use GIO and reject
+images larger than 8 MiB. Incoming attachments are cached under
+`$XDG_CACHE_HOME/omarchy-mail/attachments/` (or `~/.cache/omarchy-mail/`) and
+can be saved from the reader.
+
+The main window adapts to narrow Hyprland tiles: the reader becomes a focused
+second view with a Messages back action, and very narrow windows expose the
+sidebar through a compact navigation button.
 
 The composer defaults to plain text. HTML mode adds only the small controls
 needed for everyday mail—bold, italic, underline, bullets, links, and a
@@ -87,6 +94,9 @@ source tree. The local database is at
 Non-secret preferences, including per-account signatures, are stored at
 `$XDG_CONFIG_HOME/omarchy-mail/preferences.json` or
 `~/.config/omarchy-mail/preferences.json`.
+Draft attachments are safely copied under
+`$XDG_DATA_HOME/omarchy-mail/drafts/` (or `~/.local/share/omarchy-mail/drafts/`)
+so an autosaved draft remains usable if the original file moves.
 
 ## Theme integration
 
