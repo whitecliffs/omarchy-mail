@@ -2067,17 +2067,25 @@ fn append_html_content(
                     .and_then(|action| action.request())
                     .and_then(|request| request.uri())
                     .map(|uri| uri.to_string());
-                if let Some(uri) = uri
+                if let Some(ref uri) = uri
                     && (uri.starts_with("https://")
                         || uri.starts_with("http://")
                         || uri.starts_with("mailto:"))
                 {
                     let _ =
                         gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                    decision.ignore();
+                    return true;
                 }
+                // load_html() uses this local document URI. It must be allowed
+                // through the policy callback or the reader stays blank.
+                if uri.as_deref() == Some("about:blank") {
+                    decision.use_();
+                    return true;
+                }
+                decision.ignore();
+                return true;
             }
-            decision.ignore();
-            return true;
         }
         false
     });
