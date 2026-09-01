@@ -1849,7 +1849,7 @@ fn open_account_dialog(state: Rc<AppState>) {
     title.add_css_class("mail-reader-subject");
     root.append(&title);
     let hint = gtk::Label::new(Some(
-        "We’ll keep your password in the system keyring. It will never be written to Omarchy Mail’s database.",
+        "We’ll keep your password or access token in the system keyring. It will never be written to Omarchy Mail’s database.",
     ));
     hint.set_xalign(0.0);
     hint.set_wrap(true);
@@ -1867,13 +1867,13 @@ fn open_account_dialog(state: Rc<AppState>) {
         .hexpand(true)
         .build();
     let password = gtk::Entry::builder()
-        .placeholder_text("Password or app password")
+        .placeholder_text("Password, app password, or OAuth2 token")
         .hexpand(true)
         .build();
     password.set_visibility(false);
     root.append(&form_row("Email address", &email));
     root.append(&form_row("Display name", &display_name));
-    root.append(&form_row("Password", &password));
+    root.append(&form_row("Password / token", &password));
 
     let advanced = gtk::Expander::new(Some("Connection details"));
     advanced.set_margin_top(12);
@@ -1883,6 +1883,18 @@ fn open_account_dialog(state: Rc<AppState>) {
         .text("imap.example.com")
         .hexpand(true)
         .build();
+    let incoming_auth = gtk::DropDown::from_strings(&["Password", "OAuth2 access token"]);
+    incoming_auth.set_selected(0);
+    incoming_auth.connect_selected_notify({
+        let password = password.clone();
+        move |auth| {
+            password.set_placeholder_text(Some(if auth.selected() == 1 {
+                "Paste IMAP OAuth2 access token"
+            } else {
+                "Password or app password"
+            }));
+        }
+    });
     let incoming_username = gtk::Entry::builder()
         .placeholder_text("IMAP username (defaults to email)")
         .hexpand(true)
@@ -1895,6 +1907,8 @@ fn open_account_dialog(state: Rc<AppState>) {
         .text("smtp.example.com")
         .hexpand(true)
         .build();
+    let outgoing_auth = gtk::DropDown::from_strings(&["Password", "OAuth2 access token"]);
+    outgoing_auth.set_selected(0);
     let outgoing_username = gtk::Entry::builder()
         .placeholder_text("SMTP username (defaults to email)")
         .hexpand(true)
@@ -1908,17 +1922,29 @@ fn open_account_dialog(state: Rc<AppState>) {
         .hexpand(true)
         .build();
     outgoing_password.set_visibility(false);
+    outgoing_auth.connect_selected_notify({
+        let outgoing_password = outgoing_password.clone();
+        move |auth| {
+            outgoing_password.set_placeholder_text(Some(if auth.selected() == 1 {
+                "Paste SMTP OAuth2 access token"
+            } else {
+                "Leave empty to reuse IMAP password"
+            }));
+        }
+    });
+    details.append(&form_row("IMAP authentication", &incoming_auth));
     details.append(&form_row("IMAP server", &incoming_host));
     details.append(&form_row("IMAP username", &incoming_username));
     details.append(&form_row("IMAP port", &incoming_port));
     details.append(&form_row("IMAP security", &incoming_security));
+    details.append(&form_row("SMTP authentication", &outgoing_auth));
     details.append(&form_row("SMTP server", &outgoing_host));
     details.append(&form_row("SMTP username", &outgoing_username));
     details.append(&form_row("SMTP port", &outgoing_port));
     details.append(&form_row("SMTP security", &outgoing_security));
-    details.append(&form_row("SMTP password", &outgoing_password));
+    details.append(&form_row("SMTP password / token", &outgoing_password));
     let note = gtk::Label::new(Some(
-        "TLS is used by default. IMAP and SMTP usernames may differ; leave SMTP password empty to reuse the IMAP password.",
+        "TLS is used by default. IMAP and SMTP usernames may differ. OAuth2 currently accepts a provider-issued access token; browser authorization will be added next.",
     ));
     note.set_wrap(true);
     note.add_css_class("mail-empty-body");
@@ -2006,6 +2032,21 @@ fn open_account_dialog(state: Rc<AppState>) {
         } else {
             outgoing_password.text().to_string()
         };
+        let auth_method_for_index = |index| {
+            if index == 1 {
+                AuthMethod::OAuth2
+            } else {
+                AuthMethod::Password
+            }
+        };
+        let incoming_auth_method = auth_method_for_index(incoming_auth.selected());
+        let outgoing_auth_method = auth_method_for_index(outgoing_auth.selected());
+        if outgoing_password.text().is_empty() && incoming_auth_method != outgoing_auth_method {
+            error.set_text(
+                "Enter a separate SMTP credential when IMAP and SMTP use different authentication methods.",
+            );
+            return;
+        }
         let security_for_index = |index| match index {
             1 => SecurityMode::StartTls,
             2 => SecurityMode::None,
@@ -2017,14 +2058,14 @@ fn open_account_dialog(state: Rc<AppState>) {
             port: incoming_port.value_as_int().max(1) as u16,
             security: security_for_index(incoming_security.selected()),
             username: incoming_login.clone(),
-            auth: AuthMethod::Password,
+            auth: incoming_auth_method,
         };
         account.outgoing = ServerConfig {
             hostname: outgoing_host.text().trim().to_string(),
             port: outgoing_port.value_as_int().max(1) as u16,
             security: security_for_index(outgoing_security.selected()),
             username: outgoing_login.clone(),
-            auth: AuthMethod::Password,
+            auth: outgoing_auth_method,
         };
         button.set_sensitive(false);
         error.set_text("Saving securely…");
@@ -2034,10 +2075,20 @@ fn open_account_dialog(state: Rc<AppState>) {
         let database = state_for_save.database.clone();
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = mail::credentials::store_password(&address, "imap", &secret)
+            let result = mail::credentials::store_auth_material(
+                &address,
+                "imap",
+                &account.incoming.auth,
+                &secret,
+            )
                 .map_err(|error| error.to_string())
                 .and_then(|_| {
-                    mail::credentials::store_password(&address, "smtp", &outgoing_secret)
+                    mail::credentials::store_auth_material(
+                        &address,
+                        "smtp",
+                        &account.outgoing.auth,
+                        &outgoing_secret,
+                    )
                         .map_err(|error| error.to_string())
                 })
                 .and_then(|_| {
@@ -2134,10 +2185,10 @@ fn open_settings(state: Rc<AppState>) {
             let queued_sends = database.pending_sends(Some(account_id)).unwrap_or_default();
             let (sender, receiver) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let result = mail::credentials::delete_password(&account_email, "imap")
+                let result = mail::credentials::delete_auth_materials(&account_email, "imap")
                     .map_err(|error| error.to_string())
                     .and_then(|_| {
-                        mail::credentials::delete_password(&account_email, "smtp")
+                        mail::credentials::delete_auth_materials(&account_email, "smtp")
                             .map_err(|error| error.to_string())
                     })
                     .and_then(|_| {
@@ -2497,42 +2548,46 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let (sender, receiver) = async_channel::bounded(1);
         let database = state_for_send.database.clone();
         std::thread::spawn(move || {
-            let result = mail::credentials::load_password(&account.email, "smtp")
-                .map_err(|error| error.to_string())
-                .and_then(|password| {
-                    match mail::smtp::send_text_with_attachments(
-                        &account,
-                        &password,
-                        &to_value,
-                        &cc_values,
-                        &subject_value,
-                        &body_value,
-                        &attachments,
-                    ) {
-                        Ok(()) => Ok(SendDisposition::Sent),
-                        Err(error) => {
-                            let error_text = error.to_string();
-                            let retryable = error.is_retryable();
-                            mail::outbox::queue_failed_send(
-                                &database,
-                                account_id,
-                                &to_value,
-                                &cc_values,
-                                &subject_value,
-                                &body_value,
-                                &attachments,
-                                &error_text,
-                                retryable,
-                            )
-                            .map(|_| SendDisposition::Queued { retryable })
-                            .map_err(|queue_error| {
-                                format!(
-                                    "{error_text}; also could not save it to Outbox: {queue_error}"
-                                )
-                            })
-                        }
+            let result = mail::credentials::load_auth_material(
+                &account.email,
+                "smtp",
+                &account.outgoing.auth,
+            )
+            .map_err(|error| {
+                mail::credentials::friendly_load_error("SMTP", &account.outgoing.auth, &error)
+            })
+            .and_then(|auth| {
+                match mail::smtp::send_text_with_auth(
+                    &account,
+                    &auth,
+                    &to_value,
+                    &cc_values,
+                    &subject_value,
+                    &body_value,
+                    &attachments,
+                ) {
+                    Ok(()) => Ok(SendDisposition::Sent),
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        let retryable = error.is_retryable();
+                        mail::outbox::queue_failed_send(
+                            &database,
+                            account_id,
+                            &to_value,
+                            &cc_values,
+                            &subject_value,
+                            &body_value,
+                            &attachments,
+                            &error_text,
+                            retryable,
+                        )
+                        .map(|_| SendDisposition::Queued { retryable })
+                        .map_err(|queue_error| {
+                            format!("{error_text}; also could not save it to Outbox: {queue_error}")
+                        })
                     }
-                });
+                }
+            });
             let _ = sender.send_blocking(result);
         });
         let state = state_for_send.clone();

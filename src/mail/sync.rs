@@ -54,28 +54,14 @@ pub fn notify_new_mail(account: &str, fetched: usize) {
         .show();
 }
 
-fn load_imap_password(account: &Account) -> Result<String, String> {
-    match credentials::load_auth_material(&account.email, "imap", &account.incoming.auth)
-        .map_err(|error| error.to_string())?
-    {
-        credentials::AuthMaterial::Password(password) => Ok(password),
-        credentials::AuthMaterial::OAuth2AccessToken(_) => Err(
-            "OAuth2 sign-in is reserved for a future provider flow; choose password or an app password for now."
-                .into(),
-        ),
-    }
+fn load_imap_auth(account: &Account) -> Result<credentials::AuthMaterial, String> {
+    credentials::load_auth_material(&account.email, "imap", &account.incoming.auth)
+        .map_err(|error| credentials::friendly_load_error("IMAP", &account.incoming.auth, &error))
 }
 
-fn load_smtp_password(account: &Account) -> Result<String, String> {
-    match credentials::load_auth_material(&account.email, "smtp", &account.outgoing.auth)
-        .map_err(|error| error.to_string())?
-    {
-        credentials::AuthMaterial::Password(password) => Ok(password),
-        credentials::AuthMaterial::OAuth2AccessToken(_) => Err(
-            "OAuth2 sign-in is reserved for a future provider flow; choose password or an app password for now."
-                .into(),
-        ),
-    }
+fn load_smtp_auth(account: &Account) -> Result<credentials::AuthMaterial, String> {
+    credentials::load_auth_material(&account.email, "smtp", &account.outgoing.auth)
+        .map_err(|error| credentials::friendly_load_error("SMTP", &account.outgoing.auth, &error))
 }
 
 /// Starts one isolated worker per account. A failing account returns a report
@@ -113,8 +99,8 @@ pub fn spawn_account_monitor(
             let mut report = sync_account_once(&account, &database);
             report.initial = initial_sync;
             if initial_sync && report.error.is_none() {
-                match load_imap_password(&account) {
-                    Ok(password) => match sync_standard_folders(&account, &password, &database) {
+                match load_imap_auth(&account) {
+                    Ok(auth) => match sync_standard_folders(&account, &auth, &database) {
                         Ok((fetched, new_messages)) => {
                             report.fetched += fetched;
                             report.new_messages += new_messages;
@@ -140,8 +126,8 @@ pub fn spawn_account_monitor(
             }
             reconnect_backoff = Duration::from_secs(2);
 
-            let password = match load_imap_password(&account) {
-                Ok(password) => password,
+            let auth = match load_imap_auth(&account) {
+                Ok(auth) => auth,
                 Err(error) => {
                     let _ = sender.send_blocking(SyncReport {
                         account_id: account.id,
@@ -156,7 +142,7 @@ pub fn spawn_account_monitor(
                 }
             };
 
-            match imap::wait_for_inbox_change(&account, &password, Duration::from_secs(25 * 60)) {
+            match imap::wait_for_inbox_change(&account, &auth, Duration::from_secs(25 * 60)) {
                 Ok(imap::IdleOutcome::Changed | imap::IdleOutcome::TimedOut) => {}
                 Ok(imap::IdleOutcome::Unsupported) => {
                     sleep_with_stop(&stop, Duration::from_secs(300));
@@ -224,8 +210,8 @@ fn retry_pending_sends(account: &Account, database: &Database) -> OutboxReport {
             .unwrap_or_default();
         return report;
     }
-    let password = match load_smtp_password(account) {
-        Ok(password) => password,
+    let auth = match load_smtp_auth(account) {
+        Ok(auth) => auth,
         Err(error) => {
             report.error = Some(error);
             report.remaining = database
@@ -237,7 +223,7 @@ fn retry_pending_sends(account: &Account, database: &Database) -> OutboxReport {
     };
 
     for send in sends {
-        match smtp::send_pending(account, &password, &send) {
+        match smtp::send_pending_with_auth(account, &auth, &send) {
             Ok(()) => {
                 let result = database
                     .mark_pending_send_sent(send.id)
@@ -297,13 +283,13 @@ fn sleep_with_stop(stop: &AtomicBool, duration: Duration) {
 }
 
 fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
-    match load_imap_password(account) {
-        Ok(password) => {
-            let reconciliation_error = reconcile_pending_actions(account, &password, database);
+    match load_imap_auth(account) {
+        Ok(auth) => {
+            let reconciliation_error = reconcile_pending_actions(account, &auth, database);
             let mut last_error = None;
             let mut report = None;
             for attempt in 0..3 {
-                match imap::sync_inbox(account, &password, 250) {
+                match imap::sync_inbox(account, &auth, 250) {
                     Ok(snapshot) => {
                         let fetched = snapshot.messages.len();
                         let uidvalidity = snapshot.uidvalidity;
@@ -412,7 +398,7 @@ fn append_error(errors: &mut Option<String>, error: impl ToString) {
 
 fn sync_standard_folders(
     account: &Account,
-    password: &str,
+    auth: &credentials::AuthMaterial,
     database: &Database,
 ) -> Result<(usize, usize), String> {
     let Some(account_id) = account.id else {
@@ -437,7 +423,7 @@ fn sync_standard_folders(
         let mut snapshot = None;
         let mut last_error = None;
         for attempt in 0..3 {
-            match imap::sync_folder(account, password, &folder.remote_name, &folder.name, 100) {
+            match imap::sync_folder(account, auth, &folder.remote_name, &folder.name, 100) {
                 Ok(result) => {
                     snapshot = Some(result);
                     break;
@@ -489,7 +475,7 @@ fn sync_standard_folders(
 
 fn reconcile_pending_actions(
     account: &Account,
-    password: &str,
+    auth: &credentials::AuthMaterial,
     database: &Database,
 ) -> Option<String> {
     let Some(account_id) = account.id else {
@@ -506,7 +492,7 @@ fn reconcile_pending_actions(
         Ok(folders) => folders,
         Err(error) => return Some(format!("Could not load mailboxes: {error}")),
     };
-    match imap::reconcile_actions(account, password, &actions, &folders) {
+    match imap::reconcile_actions(account, auth, &actions, &folders) {
         Ok(applied) => {
             for action_id in applied {
                 if let Err(error) = database.delete_pending_action(action_id) {
@@ -527,12 +513,12 @@ pub fn spawn_folder_sync(
     sender: async_channel::Sender<FolderSyncReport>,
 ) {
     thread::spawn(move || {
-        let report = match load_imap_password(&account) {
-            Ok(password) => {
+        let report = match load_imap_auth(&account) {
+            Ok(auth) => {
                 let mut snapshot = None;
                 let mut last_error = None;
                 for attempt in 0..3 {
-                    match imap::sync_folder(&account, &password, &remote_name, &local_name, 250) {
+                    match imap::sync_folder(&account, &auth, &remote_name, &local_name, 250) {
                         Ok(result) => {
                             snapshot = Some(result);
                             break;
@@ -620,12 +606,12 @@ pub fn spawn_message_fetch(
         let report = match (
             message.remote_uid,
             message.uidvalidity,
-            load_imap_password(&account),
+            load_imap_auth(&account),
         ) {
-            (Some(remote_uid), uidvalidity, Ok(password)) => {
+            (Some(remote_uid), uidvalidity, Ok(auth)) => {
                 match imap::fetch_message(
                     &account,
-                    &password,
+                    &auth,
                     &remote_name,
                     &message.folder,
                     remote_uid,

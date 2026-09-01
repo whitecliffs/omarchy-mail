@@ -10,10 +10,12 @@ without making the GTK main loop responsible for network activity.
 - `database.rs` owns XDG data placement, schema migrations, cache metadata,
   FTS5 indexing, and pending-action storage. Passwords are intentionally not
   represented in its schema.
-- `mail/credentials.rs` stores passwords using the Linux Secret Service via
-  the `keyring` crate and reserves separate keyring slots for OAuth2 access
-  tokens. `AuthMethod` is deliberately separate from TLS transport settings;
-  provider authorization UI and SASL XOAUTH2 are not enabled yet.
+- `mail/credentials.rs` stores passwords and OAuth2 access tokens using
+  isolated Linux Secret Service entries via the `keyring` crate. `AuthMethod`
+  is deliberately separate from TLS transport settings. IMAP performs native
+  XOAUTH2 challenge authentication and SMTP selects lettre's XOAUTH2
+  mechanism; provider browser authorization is deferred until provider client
+  registration can be configured without shipping secrets.
 - `mail/mime.rs` parses MIME messages, retains normalized `Content-ID` values,
   and sanitises HTML before the UI sees it. Inline image bytes are cached as
   ordinary disposable attachments and rendered by GTK only from that local

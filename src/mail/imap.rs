@@ -1,3 +1,4 @@
+use crate::mail::credentials::AuthMaterial;
 use crate::mail::mime;
 use crate::models::{Account, MailFolder, Message, PendingAction, SecurityMode};
 use chrono::Utc;
@@ -50,7 +51,7 @@ pub enum IdleOutcome {
 /// network connection.
 pub fn sync_inbox(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     limit: usize,
 ) -> Result<SyncSnapshot, ImapError> {
     let tls = TlsConnector::builder().build()?;
@@ -59,12 +60,12 @@ pub fn sync_inbox(
         SecurityMode::Tls => {
             let client = imap::connect(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
+            sync_client(client, account, auth, "INBOX", "Inbox", limit, true)
         }
         SecurityMode::StartTls => {
             let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
+            sync_client(client, account, auth, "INBOX", "Inbox", limit, true)
         }
         SecurityMode::None => {
             let stream = TcpStream::connect(address)
@@ -73,14 +74,14 @@ pub fn sync_inbox(
             client
                 .read_greeting()
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
+            sync_client(client, account, auth, "INBOX", "Inbox", limit, true)
         }
     }
 }
 
 pub fn sync_folder(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     remote_name: &str,
     local_name: &str,
     limit: usize,
@@ -91,28 +92,12 @@ pub fn sync_folder(
         SecurityMode::Tls => {
             let client = imap::connect(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(
-                client,
-                account,
-                password,
-                remote_name,
-                local_name,
-                limit,
-                false,
-            )?
+            sync_client(client, account, auth, remote_name, local_name, limit, false)?
         }
         SecurityMode::StartTls => {
             let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(
-                client,
-                account,
-                password,
-                remote_name,
-                local_name,
-                limit,
-                false,
-            )?
+            sync_client(client, account, auth, remote_name, local_name, limit, false)?
         }
         SecurityMode::None => {
             let stream = TcpStream::connect(address)
@@ -121,15 +106,7 @@ pub fn sync_folder(
             client
                 .read_greeting()
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(
-                client,
-                account,
-                password,
-                remote_name,
-                local_name,
-                limit,
-                false,
-            )?
+            sync_client(client, account, auth, remote_name, local_name, limit, false)?
         }
     };
     Ok(snapshot)
@@ -140,7 +117,7 @@ pub fn sync_folder(
 /// parsing so a recycled UID can never populate the wrong local message.
 pub fn fetch_message(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     remote_name: &str,
     local_name: &str,
     remote_uid: u32,
@@ -155,7 +132,7 @@ pub fn fetch_message(
             fetch_message_client(
                 client,
                 account,
-                password,
+                auth,
                 remote_name,
                 local_name,
                 remote_uid,
@@ -168,7 +145,7 @@ pub fn fetch_message(
             fetch_message_client(
                 client,
                 account,
-                password,
+                auth,
                 remote_name,
                 local_name,
                 remote_uid,
@@ -185,7 +162,7 @@ pub fn fetch_message(
             fetch_message_client(
                 client,
                 account,
-                password,
+                auth,
                 remote_name,
                 local_name,
                 remote_uid,
@@ -200,7 +177,7 @@ pub fn fetch_message(
 /// connection and recover cleanly from laptop suspend or server idle limits.
 pub fn wait_for_inbox_change(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     timeout: Duration,
 ) -> Result<IdleOutcome, ImapError> {
     let tls = TlsConnector::builder().build()?;
@@ -209,12 +186,12 @@ pub fn wait_for_inbox_change(
         SecurityMode::Tls => {
             let client = imap::connect(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            idle_client(client, account, password, timeout)
+            idle_client(client, account, auth, timeout)
         }
         SecurityMode::StartTls => {
             let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            idle_client(client, account, password, timeout)
+            idle_client(client, account, auth, timeout)
         }
         SecurityMode::None => {
             let stream = TcpStream::connect(address)
@@ -223,7 +200,44 @@ pub fn wait_for_inbox_change(
             client
                 .read_greeting()
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            idle_client(client, account, password, timeout)
+            idle_client(client, account, auth, timeout)
+        }
+    }
+}
+
+struct XOAuth2Authenticator {
+    username: String,
+    access_token: String,
+}
+
+impl imap::Authenticator for XOAuth2Authenticator {
+    type Response = String;
+
+    fn process(&self, _challenge: &[u8]) -> Self::Response {
+        format!(
+            "user={}\x01auth=Bearer {}\x01\x01",
+            self.username, self.access_token
+        )
+    }
+}
+
+fn authenticate<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    auth: &AuthMaterial,
+) -> Result<imap::Session<T>, ImapError> {
+    match auth {
+        AuthMaterial::Password(password) => client
+            .login(&account.incoming.username, password)
+            .map_err(|error| ImapError::Protocol(error.0.to_string())),
+        AuthMaterial::OAuth2AccessToken(access_token) => {
+            let authenticator = XOAuth2Authenticator {
+                username: account.incoming.username.clone(),
+                access_token: access_token.clone(),
+            };
+            client
+                .authenticate("XOAUTH2", &authenticator)
+                .map_err(|error| ImapError::Protocol(error.0.to_string()))
         }
     }
 }
@@ -231,12 +245,10 @@ pub fn wait_for_inbox_change(
 fn idle_client<T: Read + Write + imap::extensions::idle::SetReadTimeout>(
     client: imap::Client<T>,
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     timeout: Duration,
 ) -> Result<IdleOutcome, ImapError> {
-    let mut session = client
-        .login(&account.incoming.username, password)
-        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mut session = authenticate(client, account, auth)?;
     let supports_idle = session
         .capabilities()
         .map_err(|error| ImapError::Protocol(error.to_string()))?
@@ -270,7 +282,7 @@ fn idle_client<T: Read + Write + imap::extensions::idle::SetReadTimeout>(
 /// instead of risking a change to an unrelated, recycled UID.
 pub fn reconcile_actions(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     actions: &[PendingAction],
     folders: &[MailFolder],
 ) -> Result<Vec<i64>, ImapError> {
@@ -283,12 +295,12 @@ pub fn reconcile_actions(
         SecurityMode::Tls => {
             let client = imap::connect(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            reconcile_client(client, account, password, actions, folders)
+            reconcile_client(client, account, auth, actions, folders)
         }
         SecurityMode::StartTls => {
             let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            reconcile_client(client, account, password, actions, folders)
+            reconcile_client(client, account, auth, actions, folders)
         }
         SecurityMode::None => {
             let stream = TcpStream::connect(address)
@@ -297,7 +309,7 @@ pub fn reconcile_actions(
             client
                 .read_greeting()
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            reconcile_client(client, account, password, actions, folders)
+            reconcile_client(client, account, auth, actions, folders)
         }
     }
 }
@@ -305,13 +317,11 @@ pub fn reconcile_actions(
 fn reconcile_client<T: Read + Write>(
     client: imap::Client<T>,
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     actions: &[PendingAction],
     folders: &[MailFolder],
 ) -> Result<Vec<i64>, ImapError> {
-    let mut session = client
-        .login(&account.incoming.username, password)
-        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mut session = authenticate(client, account, auth)?;
     let mut applied = Vec::new();
     let mut ordered_actions = actions.to_vec();
     // Flags are applied before moves. This preserves the user's intent even
@@ -462,15 +472,13 @@ fn remote_name_for_local(
 fn sync_client<T: Read + Write>(
     client: imap::Client<T>,
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     remote_name: &str,
     local_name: &str,
     limit: usize,
     discover_folders: bool,
 ) -> Result<SyncSnapshot, ImapError> {
-    let mut session = client
-        .login(&account.incoming.username, password)
-        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mut session = authenticate(client, account, auth)?;
     let folders = if discover_folders {
         session
             .list(None, Some("*"))
@@ -521,15 +529,13 @@ fn sync_client<T: Read + Write>(
 fn fetch_message_client<T: Read + Write>(
     client: imap::Client<T>,
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     remote_name: &str,
     local_name: &str,
     remote_uid: u32,
     expected_uidvalidity: Option<u32>,
 ) -> Result<Option<Message>, ImapError> {
-    let mut session = client
-        .login(&account.incoming.username, password)
-        .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let mut session = authenticate(client, account, auth)?;
     let mailbox = session
         .select(remote_name)
         .map_err(|error| ImapError::Protocol(error.to_string()))?;
@@ -697,6 +703,7 @@ fn derive_thread_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imap::Authenticator;
 
     #[test]
     fn stable_ids_are_repeatable() {
@@ -752,5 +759,17 @@ mod tests {
             ("Receipts".into(), "custom".into())
         );
         assert_eq!(classify_folder("Junk"), ("Spam".into(), "spam".into()));
+    }
+
+    #[test]
+    fn builds_the_standard_xoauth2_authenticator_payload() {
+        let authenticator = XOAuth2Authenticator {
+            username: "jim@example.com".into(),
+            access_token: "token-value".into(),
+        };
+        assert_eq!(
+            authenticator.process(b"ignored challenge"),
+            "user=jim@example.com\x01auth=Bearer token-value\x01\x01"
+        );
     }
 }

@@ -1,5 +1,7 @@
-use crate::models::{Account, PendingSend, SecurityMode};
+use crate::mail::credentials::AuthMaterial;
+use crate::models::{Account, AuthMethod, PendingSend, SecurityMode};
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart, header::ContentType};
+use lettre::transport::smtp::authentication::Mechanism;
 use lettre::{Message as LettreMessage, SmtpTransport, Transport};
 use std::fs;
 use std::path::PathBuf;
@@ -33,9 +35,9 @@ impl SmtpError {
     }
 }
 
-pub fn send_text_with_attachments(
+pub fn send_text_with_auth(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     to: &str,
     cc: &[String],
     subject: &str,
@@ -53,12 +55,26 @@ pub fn send_text_with_attachments(
             (filename, path.clone())
         })
         .collect::<Vec<_>>();
-    send_named_attachments(account, password, to, cc, subject, body, &named_attachments)
+    let (auth_method, secret) = match auth {
+        AuthMaterial::Password(password) => (AuthMethod::Password, password.as_str()),
+        AuthMaterial::OAuth2AccessToken(token) => (AuthMethod::OAuth2, token.as_str()),
+    };
+    send_named_attachments(
+        account,
+        secret,
+        auth_method,
+        to,
+        cc,
+        subject,
+        body,
+        &named_attachments,
+    )
 }
 
 fn send_named_attachments(
     account: &Account,
-    password: &str,
+    secret: &str,
+    auth_method: AuthMethod,
     to: &str,
     cc: &[String],
     subject: &str,
@@ -68,29 +84,30 @@ fn send_named_attachments(
     let message = build_message_with_names(account, to, cc, subject, body, attachments)?;
     let credentials = lettre::transport::smtp::authentication::Credentials::new(
         account.outgoing.username.clone(),
-        password.to_string(),
+        secret.to_string(),
     );
-    let mailer = match account.outgoing.security {
-        SecurityMode::Tls => SmtpTransport::relay(&account.outgoing.hostname)?
-            .port(account.outgoing.port)
-            .credentials(credentials)
-            .build(),
-        SecurityMode::StartTls => SmtpTransport::starttls_relay(&account.outgoing.hostname)?
-            .port(account.outgoing.port)
-            .credentials(credentials)
-            .build(),
-        SecurityMode::None => SmtpTransport::builder_dangerous(&account.outgoing.hostname)
-            .port(account.outgoing.port)
-            .credentials(credentials)
-            .build(),
-    };
+    let mut builder =
+        match account.outgoing.security {
+            SecurityMode::Tls => {
+                SmtpTransport::relay(&account.outgoing.hostname)?.port(account.outgoing.port)
+            }
+            SecurityMode::StartTls => SmtpTransport::starttls_relay(&account.outgoing.hostname)?
+                .port(account.outgoing.port),
+            SecurityMode::None => SmtpTransport::builder_dangerous(&account.outgoing.hostname)
+                .port(account.outgoing.port),
+        };
+    builder = builder.credentials(credentials);
+    if auth_method == AuthMethod::OAuth2 {
+        builder = builder.authentication(vec![Mechanism::Xoauth2]);
+    }
+    let mailer = builder.build();
     mailer.send(&message)?;
     Ok(())
 }
 
-pub fn send_pending(
+pub fn send_pending_with_auth(
     account: &Account,
-    password: &str,
+    auth: &AuthMaterial,
     send: &PendingSend,
 ) -> Result<(), SmtpError> {
     let attachments = send
@@ -103,9 +120,14 @@ pub fn send_pending(
             )
         })
         .collect::<Vec<_>>();
+    let (auth_method, secret) = match auth {
+        AuthMaterial::Password(password) => (AuthMethod::Password, password.as_str()),
+        AuthMaterial::OAuth2AccessToken(token) => (AuthMethod::OAuth2, token.as_str()),
+    };
     send_named_attachments(
         account,
-        password,
+        secret,
+        auth_method,
         &send.to,
         &send.cc,
         &send.subject,

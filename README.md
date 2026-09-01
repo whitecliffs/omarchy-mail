@@ -5,7 +5,7 @@ designed around calm typography, clear hierarchy, and the practical reliability
 of a local cache rather than a dashboard full of unrelated features.
 
 The current working slice includes the GTK4/libadwaita shell, responsive
-three-pane layout, first-run account flow, Secret Service password storage,
+three-pane layout, first-run account flow, Secret Service credential storage,
 SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
 fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
 actions, server mailbox discovery with on-demand folder fetching, unified and
@@ -14,8 +14,10 @@ reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, lightweight All/Unread/Starred/Attachment filters, safe inline image
 rendering, attachment re-fetch after cache eviction, a durable offline Outbox,
 and Omarchy theme integration. The cache now reconciles deleted messages and
-server-side mailbox removals using complete UID/UIDVALIDITY snapshots. OAuth2
-remains an explicit follow-up milestone. Read/star/move
+server-side mailbox removals using complete UID/UIDVALIDITY snapshots. IMAP
+and SMTP can use provider-issued OAuth2 access tokens through native XOAUTH2
+transport support; provider browser authorization remains a follow-up because
+it requires provider-specific client registration. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server.
 
@@ -69,10 +71,11 @@ Omarchy’s launcher without a custom launcher integration.
 
 Add accounts through the graphical setup flow. IMAP and SMTP usernames and
 passwords can differ; secrets are stored separately in the Linux Secret
-Service and never in SQLite. The account model now separates authentication
-method from transport security, and keyring slots for future OAuth2 tokens
-are isolated from password entries; the provider authorization UI and SASL
-XOAUTH2 transport are a later milestone. The local database is at
+Service and never in SQLite. The account model separates authentication
+method from transport security. Password entries and OAuth2 token entries use
+isolated Secret Service slots; the account flow accepts either credential type,
+while provider browser authorization is intentionally not hard-coded into the
+source tree. The local database is at
 `$XDG_DATA_HOME/omarchy-mail/mail.db` or `~/.local/share/omarchy-mail/mail.db`.
 
 ## Theme integration
