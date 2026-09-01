@@ -8,7 +8,8 @@ The current working slice includes the GTK4/libadwaita shell, responsive
 three-pane layout, first-run account flow, Secret Service password storage,
 SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
 fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
-actions, unified and per-account cached-folder navigation, local drafts,
+actions, server mailbox discovery with on-demand folder fetching, unified and
+per-account cached-folder navigation, local drafts,
 reply/reply-all/forward prefilling, file attachments, compose/settings
 surfaces, and Omarchy theme integration. Full folder reconciliation, live
 conversation rendering, OAuth2, durable attachment caching/downloads, and a

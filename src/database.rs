@@ -1,4 +1,4 @@
-use crate::models::{Account, Message, ServerConfig};
+use crate::models::{Account, MailFolder, Message, ServerConfig};
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::fs;
@@ -131,6 +131,47 @@ impl Database {
         let connection = self.connection()?;
         connection.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
         Ok(())
+    }
+
+    pub fn upsert_folders(&self, folders: &[MailFolder]) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for folder in folders {
+            transaction.execute(
+                "INSERT INTO folders(account_id, name, remote_name, kind, unread_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(account_id, remote_name) DO UPDATE SET
+                 name=excluded.name, kind=excluded.kind, unread_count=excluded.unread_count",
+                params![
+                    folder.account_id,
+                    folder.name,
+                    folder.remote_name,
+                    folder.kind,
+                    folder.unread_count,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_folders(&self) -> Result<Vec<MailFolder>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT account_id, name, remote_name, kind, unread_count
+             FROM folders ORDER BY account_id, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(MailFolder {
+                account_id: row.get(0)?,
+                name: row.get(1)?,
+                remote_name: row.get(2)?,
+                kind: row.get(3)?,
+                unread_count: row.get::<_, i64>(4)?.max(0) as u32,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
     }
 
     pub fn save_draft(
@@ -350,6 +391,38 @@ mod tests {
         assert_eq!(archived[0].id, 1);
         assert_eq!(starred.len(), 1);
         assert_eq!(starred[0].id, 1);
+    }
+
+    #[test]
+    fn round_trips_server_folder_metadata() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account = Account::new("jim@example.com", "Jim");
+        let account_id = database.save_account(&account).expect("save account");
+        database
+            .upsert_folders(&[
+                MailFolder {
+                    account_id,
+                    name: "Inbox".into(),
+                    remote_name: "INBOX".into(),
+                    kind: "inbox".into(),
+                    unread_count: 4,
+                },
+                MailFolder {
+                    account_id,
+                    name: "Receipts".into(),
+                    remote_name: "Archive/Receipts".into(),
+                    kind: "custom".into(),
+                    unread_count: 0,
+                },
+            ])
+            .expect("save folders");
+
+        let folders = database.load_folders().expect("load folders");
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].name, "Inbox");
+        assert_eq!(folders[0].unread_count, 4);
+        assert_eq!(folders[1].remote_name, "Archive/Receipts");
     }
 
     #[test]

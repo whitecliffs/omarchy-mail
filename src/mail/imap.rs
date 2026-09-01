@@ -1,7 +1,7 @@
 use crate::mail::mime;
 use crate::models::{Account, Message, SecurityMode};
 use chrono::Utc;
-use imap::types::Fetch;
+use imap::types::{Fetch, Name, NameAttribute};
 use native_tls::TlsConnector;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -17,26 +17,41 @@ pub enum ImapError {
     Mime(#[from] mime::MimeError),
 }
 
-/// Fetches a bounded window from INBOX. This function is intended to run on a
-/// worker thread; it never touches GTK state and can therefore be retried with
-/// backoff after suspend or a lost network connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFolder {
+    pub name: String,
+    pub remote_name: String,
+    pub kind: String,
+    pub unread_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncSnapshot {
+    pub messages: Vec<Message>,
+    pub folders: Vec<RemoteFolder>,
+}
+
+/// Discovers selectable mailboxes and fetches a bounded window from INBOX.
+/// This function is intended to run on a worker thread; it never touches GTK
+/// state and can therefore be retried with backoff after suspend or a lost
+/// network connection.
 pub fn sync_inbox(
     account: &Account,
     password: &str,
     limit: usize,
-) -> Result<Vec<Message>, ImapError> {
+) -> Result<SyncSnapshot, ImapError> {
     let tls = TlsConnector::builder().build()?;
     let address = (account.incoming.hostname.as_str(), account.incoming.port);
     match account.incoming.security {
         SecurityMode::Tls => {
             let client = imap::connect(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, limit)
+            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
         }
         SecurityMode::StartTls => {
             let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, limit)
+            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
         }
         SecurityMode::None => {
             let stream = TcpStream::connect(address)
@@ -45,22 +60,92 @@ pub fn sync_inbox(
             client
                 .read_greeting()
                 .map_err(|error| ImapError::Protocol(error.to_string()))?;
-            sync_client(client, account, password, limit)
+            sync_client(client, account, password, "INBOX", "Inbox", limit, true)
         }
     }
+}
+
+pub fn sync_folder(
+    account: &Account,
+    password: &str,
+    remote_name: &str,
+    local_name: &str,
+    limit: usize,
+) -> Result<Vec<Message>, ImapError> {
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    let snapshot = match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                limit,
+                false,
+            )?
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                limit,
+                false,
+            )?
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(
+                client,
+                account,
+                password,
+                remote_name,
+                local_name,
+                limit,
+                false,
+            )?
+        }
+    };
+    Ok(snapshot.messages)
 }
 
 fn sync_client<T: Read + Write>(
     client: imap::Client<T>,
     account: &Account,
     password: &str,
+    remote_name: &str,
+    local_name: &str,
     limit: usize,
-) -> Result<Vec<Message>, ImapError> {
+    discover_folders: bool,
+) -> Result<SyncSnapshot, ImapError> {
     let mut session = client
         .login(&account.incoming.username, password)
         .map_err(|error| ImapError::Protocol(error.0.to_string()))?;
+    let folders = if discover_folders {
+        session
+            .list(None, Some("*"))
+            .map_err(|error| ImapError::Protocol(error.to_string()))?
+            .into_iter()
+            .filter_map(remote_folder)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mailbox = session
-        .select("INBOX")
+        .select(remote_name)
         .map_err(|error| ImapError::Protocol(error.to_string()))?;
     let uidvalidity = mailbox.uid_validity;
     let uids = session
@@ -80,20 +165,67 @@ fn sync_client<T: Read + Write>(
             .uid_fetch(sequence, "(RFC822 FLAGS INTERNALDATE)")
             .map_err(|error| ImapError::Protocol(error.to_string()))?;
         for fetch in fetches.iter() {
-            if let Some(message) = message_from_fetch(fetch, account.id, uidvalidity)? {
+            if let Some(message) = message_from_fetch(fetch, account.id, uidvalidity, local_name)? {
                 messages.push(message);
             }
         }
     }
     messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
     let _ = session.logout();
-    Ok(messages)
+    Ok(SyncSnapshot { messages, folders })
+}
+
+fn remote_folder(folder: &Name) -> Option<RemoteFolder> {
+    if folder
+        .attributes()
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::NoSelect))
+    {
+        return None;
+    }
+    let remote_name = folder.name().to_string();
+    let (name, kind) = classify_folder(&remote_name);
+    Some(RemoteFolder {
+        name,
+        remote_name,
+        kind,
+        unread_count: 0,
+    })
+}
+
+pub fn classify_folder(remote_name: &str) -> (String, String) {
+    let lower = remote_name.to_ascii_lowercase();
+    let leaf = remote_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(remote_name);
+    let leaf_lower = leaf.to_ascii_lowercase();
+    if lower == "inbox" {
+        return ("Inbox".into(), "inbox".into());
+    }
+    if leaf_lower.contains("sent") || leaf_lower == "outbox" {
+        return ("Sent".into(), "sent".into());
+    }
+    if leaf_lower.contains("draft") {
+        return ("Drafts".into(), "drafts".into());
+    }
+    if leaf_lower.contains("archive") || leaf_lower.contains("all mail") {
+        return ("Archive".into(), "archive".into());
+    }
+    if leaf_lower.contains("trash") || leaf_lower == "bin" || leaf_lower.contains("deleted") {
+        return ("Trash".into(), "trash".into());
+    }
+    if leaf_lower.contains("spam") || leaf_lower.contains("junk") {
+        return ("Spam".into(), "spam".into());
+    }
+    (leaf.to_string(), "custom".into())
 }
 
 fn message_from_fetch(
     fetch: &Fetch,
     account_id: Option<i64>,
     uidvalidity: Option<u32>,
+    folder: &str,
 ) -> Result<Option<Message>, ImapError> {
     let Some(raw) = fetch.body() else {
         return Ok(None);
@@ -123,7 +255,7 @@ fn message_from_fetch(
     Ok(Some(Message {
         id,
         account_id,
-        folder: "Inbox".into(),
+        folder: folder.into(),
         remote_uid: Some(remote_uid),
         uidvalidity,
         message_id: parsed.message_id,
@@ -189,5 +321,19 @@ mod tests {
     #[test]
     fn preview_collapses_whitespace() {
         assert_eq!(preview("hello\n\nthere"), "hello there");
+    }
+
+    #[test]
+    fn classifies_common_and_custom_mailboxes() {
+        assert_eq!(classify_folder("INBOX"), ("Inbox".into(), "inbox".into()));
+        assert_eq!(
+            classify_folder("[Gmail]/Sent Mail"),
+            ("Sent".into(), "sent".into())
+        );
+        assert_eq!(
+            classify_folder("Archive/Receipts"),
+            ("Receipts".into(), "custom".into())
+        );
+        assert_eq!(classify_folder("Junk"), ("Spam".into(), "spam".into()));
     }
 }

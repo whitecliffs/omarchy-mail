@@ -35,6 +35,15 @@ pub struct ServerConfig {
     pub username: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailFolder {
+    pub account_id: i64,
+    pub name: String,
+    pub remote_name: String,
+    pub kind: String,
+    pub unread_count: u32,
+}
+
 impl ServerConfig {
     pub fn imap_defaults(domain: &str, username: &str) -> Self {
         Self {

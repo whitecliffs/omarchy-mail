@@ -1,6 +1,6 @@
 use crate::database::Database;
 use crate::mail;
-use crate::models::{Account, Message, SecurityMode, ServerConfig};
+use crate::models::{Account, MailFolder, Message, SecurityMode, ServerConfig};
 use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
@@ -13,6 +13,7 @@ struct AppState {
     window: adw::ApplicationWindow,
     database: Database,
     accounts: RefCell<Vec<Account>>,
+    folders: RefCell<Vec<MailFolder>>,
     messages: RefCell<Vec<Message>>,
     sidebar: gtk::Box,
     message_list: gtk::ListBox,
@@ -34,6 +35,7 @@ pub fn build_window(application: &adw::Application) {
     let database =
         Database::open_default().expect("Omarchy Mail could not open its local database");
     let accounts = database.load_accounts().unwrap_or_default();
+    let folders = database.load_folders().unwrap_or_default();
     let demo_mode = std::env::var("OMARCHY_MAIL_DEMO").as_deref() == Ok("1");
     let messages = if demo_mode {
         Message::demo_messages()
@@ -104,6 +106,7 @@ pub fn build_window(application: &adw::Application) {
         window: window.clone(),
         database,
         accounts: RefCell::new(accounts),
+        folders: RefCell::new(folders),
         messages: RefCell::new(messages),
         sidebar,
         message_list,
@@ -354,22 +357,56 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
     expander.set_label_widget(Some(&title));
     expander.set_expanded(true);
 
+    let Some(account_id) = account.id else {
+        return expander;
+    };
+    let known_folders = state
+        .folders
+        .borrow()
+        .iter()
+        .filter(|folder| folder.account_id == account_id)
+        .cloned()
+        .collect::<Vec<_>>();
     let folders = gtk::Box::new(gtk::Orientation::Vertical, 2);
     folders.set_margin_start(24);
-    for folder in ["Inbox", "Drafts", "Sent", "Archive", "Spam", "Trash"] {
-        let Some(account_id) = account.id else {
-            continue;
-        };
+    for name in ["Inbox", "Drafts", "Sent", "Archive", "Spam", "Trash"] {
+        let count = known_folders
+            .iter()
+            .find(|folder| folder.name.eq_ignore_ascii_case(name))
+            .map(|folder| folder.unread_count as usize);
         folders.append(&sidebar_action_row(
             &state,
-            folder,
+            name,
             "folder-symbolic",
-            None,
+            count,
             MailScope::Account {
                 id: account_id,
-                folder: folder.into(),
+                folder: name.into(),
             },
         ));
+    }
+    let custom = known_folders
+        .iter()
+        .filter(|folder| folder.kind == "custom")
+        .collect::<Vec<_>>();
+    if !custom.is_empty() {
+        let custom_expander = gtk::Expander::new(Some("Folders"));
+        let custom_rows = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        custom_rows.set_margin_start(12);
+        for folder in custom {
+            custom_rows.append(&sidebar_action_row(
+                &state,
+                &folder.name,
+                "folder-symbolic",
+                Some(folder.unread_count as usize),
+                MailScope::Account {
+                    id: account_id,
+                    folder: folder.name.clone(),
+                },
+            ));
+        }
+        custom_expander.set_child(Some(&custom_rows));
+        folders.append(&custom_expander);
     }
     expander.set_child(Some(&folders));
     expander
@@ -416,12 +453,19 @@ fn sidebar_action_row(
 }
 
 fn select_scope(state: &Rc<AppState>, scope: MailScope) {
+    let account_scope = match &scope {
+        MailScope::Account { id, folder } => Some((*id, folder.clone())),
+        MailScope::Unified(_) => None,
+    };
     state.scope.replace(scope);
     state.selected_message.replace(None);
     load_messages_for_scope(state);
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
     render_reader(state, None);
+    if let Some((account_id, folder)) = account_scope {
+        sync_folder_for_scope(state, account_id, &folder);
+    }
 }
 
 fn load_messages_for_scope(state: &Rc<AppState>) {
@@ -446,6 +490,69 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
     };
     if let Ok(messages) = result {
         state.messages.replace(messages);
+    }
+}
+
+fn sync_folder_for_scope(state: &Rc<AppState>, account_id: i64, local_name: &str) {
+    let Some(account) = state
+        .accounts
+        .borrow()
+        .iter()
+        .find(|account| account.id == Some(account_id))
+        .cloned()
+    else {
+        return;
+    };
+    let remote_name = state
+        .folders
+        .borrow()
+        .iter()
+        .find(|folder| folder.account_id == account_id && folder.name == local_name)
+        .map(|folder| folder.remote_name.clone())
+        .unwrap_or_else(|| default_remote_folder(local_name).to_string());
+    set_status(state, &format!("Loading {local_name}…"));
+    let (sender, receiver) = async_channel::bounded(1);
+    crate::mail::sync::spawn_folder_sync(
+        account,
+        state.database.clone(),
+        remote_name,
+        local_name.to_string(),
+        sender,
+    );
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(report) if report.error.is_none() => {
+                load_messages_for_scope(&state);
+                render_sidebar(&state);
+                render_messages(&state, state.search_entry.text().as_str());
+                set_status(
+                    &state,
+                    &format!("{} ready · {} new", report.folder, report.new_messages),
+                );
+            }
+            Ok(report) => set_status(
+                &state,
+                &format!(
+                    "Couldn’t load {}: {}",
+                    report.folder,
+                    report.error.unwrap_or_default()
+                ),
+            ),
+            Err(_) => set_status(&state, "The folder worker stopped unexpectedly."),
+        }
+    });
+}
+
+fn default_remote_folder(local_name: &str) -> &str {
+    match local_name {
+        "Inbox" => "INBOX",
+        "Drafts" => "Drafts",
+        "Sent" => "Sent",
+        "Archive" => "Archive",
+        "Spam" => "Spam",
+        "Trash" => "Trash",
+        other => other,
     }
 }
 
@@ -550,6 +657,9 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
                 errors.push(format!("{}: {error}", report.email));
             } else if notify && report.new_messages > 0 {
                 crate::mail::sync::notify_new_mail(&report.email, report.new_messages);
+            }
+            if let Ok(folders) = state.database.load_folders() {
+                state.folders.replace(folders);
             }
             load_messages_for_scope(&state);
             render_sidebar(&state);
