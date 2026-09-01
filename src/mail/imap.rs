@@ -1,8 +1,10 @@
 use crate::mail::mime;
-use crate::models::{Account, Message};
+use crate::models::{Account, Message, SecurityMode};
 use chrono::Utc;
 use imap::types::Fetch;
 use native_tls::TlsConnector;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,12 +26,36 @@ pub fn sync_inbox(
     limit: usize,
 ) -> Result<Vec<Message>, ImapError> {
     let tls = TlsConnector::builder().build()?;
-    let client = imap::connect(
-        (account.incoming.hostname.as_str(), account.incoming.port),
-        &account.incoming.hostname,
-        &tls,
-    )
-    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(client, account, password, limit)
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(client, account, password, limit)
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            sync_client(client, account, password, limit)
+        }
+    }
+}
+
+fn sync_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    password: &str,
+    limit: usize,
+) -> Result<Vec<Message>, ImapError> {
     let mut session = client
         .login(&account.incoming.username, password)
         .map_err(|error| ImapError::Protocol(error.0.to_string()))?;

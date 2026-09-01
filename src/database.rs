@@ -133,6 +133,22 @@ impl Database {
         Ok(())
     }
 
+    pub fn save_draft(
+        &self,
+        account_id: Option<i64>,
+        recipients: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let connection = self.connection()?;
+        let id = -Utc::now().timestamp_micros();
+        connection.execute(
+            "INSERT INTO messages(id, account_id, folder, sender_name, sender_email, recipients, subject, preview, body, received_at, unread, starred, has_attachments, thread_size)\n             VALUES (?1, ?2, 'Drafts', '', '', ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 1)",
+            params![id, account_id, recipients, subject, body.chars().take(160).collect::<String>(), body, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
     pub fn upsert_messages(&self, messages: &[Message]) -> Result<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -175,11 +191,23 @@ impl Database {
     }
 
     pub fn list_messages(&self, account_id: Option<i64>, folder: &str) -> Result<Vec<Message>> {
+        self.list_messages_filtered(account_id, Some(folder), false)
+    }
+
+    pub fn list_messages_filtered(
+        &self,
+        account_id: Option<i64>,
+        folder: Option<&str>,
+        starred_only: bool,
+    ) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body,\n                    received_at, unread, starred, has_attachments, thread_size\n             FROM messages WHERE folder = ?1 AND (?2 IS NULL OR account_id = ?2)\n             ORDER BY id DESC",
+            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body,\n                    received_at, unread, starred, has_attachments, thread_size\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
         )?;
-        let rows = statement.query_map(params![folder, account_id], message_from_row)?;
+        let rows = statement.query_map(
+            params![account_id, folder, starred_only as i64],
+            message_from_row,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }
@@ -303,6 +331,28 @@ mod tests {
     }
 
     #[test]
+    fn filters_cached_messages_by_folder_and_star() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        database
+            .upsert_messages(&Message::demo_messages())
+            .expect("insert messages");
+        database.move_message(1, "Archive").expect("move message");
+
+        let archived = database
+            .list_messages_filtered(None, Some("Archive"), false)
+            .expect("list archive");
+        let starred = database
+            .list_messages_filtered(None, None, true)
+            .expect("list starred");
+
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, 1);
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, 1);
+    }
+
+    #[test]
     fn server_config_serializes_without_secret_material() {
         let config = ServerConfig::imap_defaults("example.com", "jim@example.com");
         let encoded = serde_json::to_string(&config).expect("json");
@@ -324,5 +374,31 @@ mod tests {
             })
             .expect("read action");
         assert_eq!(action, "move");
+    }
+
+    #[test]
+    fn saves_draft_in_the_drafts_folder() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account = Account::new("jim@example.com", "Jim");
+        let account_id = database.save_account(&account).expect("save account");
+
+        let draft_id = database
+            .save_draft(
+                Some(account_id),
+                "jane@example.com",
+                "A saved thought",
+                "I will finish this later.",
+            )
+            .expect("save draft");
+        let drafts = database
+            .list_messages(Some(account_id), "Drafts")
+            .expect("list drafts");
+
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].id, draft_id);
+        assert_eq!(drafts[0].recipients, "jane@example.com");
+        assert_eq!(drafts[0].body, "I will finish this later.");
+        assert!(!drafts[0].unread);
     }
 }

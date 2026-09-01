@@ -5,6 +5,7 @@ use crate::theme;
 use adw::prelude::*;
 use gtk::gdk;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -17,9 +18,16 @@ struct AppState {
     message_list: gtk::ListBox,
     reader: gtk::Box,
     search_entry: gtk::SearchEntry,
+    scope: RefCell<MailScope>,
     selected_message: RefCell<Option<i64>>,
     status: gtk::Label,
     demo_mode: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MailScope {
+    Unified(String),
+    Account { id: i64, folder: String },
 }
 
 pub fn build_window(application: &adw::Application) {
@@ -101,6 +109,7 @@ pub fn build_window(application: &adw::Application) {
         message_list,
         reader,
         search_entry: search.clone(),
+        scope: RefCell::new(MailScope::Unified("Inbox".into())),
         selected_message: RefCell::new(None),
         status,
         demo_mode,
@@ -265,8 +274,18 @@ fn render_sidebar(state: &Rc<AppState>) {
     unified.add_css_class("mail-section-label");
     inner.append(&unified);
 
-    let messages = state.messages.borrow();
-    let unread = messages.iter().filter(|message| message.unread).count();
+    let inbox_messages = if state.demo_mode {
+        state.messages.borrow().clone()
+    } else {
+        state
+            .database
+            .list_messages_filtered(None, Some("Inbox"), false)
+            .unwrap_or_else(|_| state.messages.borrow().clone())
+    };
+    let unread = inbox_messages
+        .iter()
+        .filter(|message| message.unread)
+        .count();
     for (label, icon, count) in [
         ("Inbox", "mail-unread-symbolic", Some(unread)),
         ("Starred", "starred-symbolic", None),
@@ -275,10 +294,14 @@ fn render_sidebar(state: &Rc<AppState>) {
         ("Archive", "archive-symbolic", None),
         ("Trash", "user-trash-symbolic", None),
     ] {
-        inner.append(&sidebar_row(label, icon, count));
+        inner.append(&sidebar_action_row(
+            state,
+            label,
+            icon,
+            count,
+            MailScope::Unified(label.into()),
+        ));
     }
-    drop(messages);
-
     let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
     separator.set_margin_top(12);
     separator.set_margin_bottom(6);
@@ -298,7 +321,7 @@ fn render_sidebar(state: &Rc<AppState>) {
         inner.append(&hint);
     } else {
         for account in accounts.iter() {
-            inner.append(&account_expander(account));
+            inner.append(&account_expander(account, state.clone()));
         }
     }
     drop(accounts);
@@ -313,7 +336,7 @@ fn render_sidebar(state: &Rc<AppState>) {
     state.sidebar.append(&inner);
 }
 
-fn account_expander(account: &Account) -> gtk::Expander {
+fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
     let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let dot = gtk::Label::new(Some("●"));
     dot.add_css_class("mail-unread-dot");
@@ -334,7 +357,19 @@ fn account_expander(account: &Account) -> gtk::Expander {
     let folders = gtk::Box::new(gtk::Orientation::Vertical, 2);
     folders.set_margin_start(24);
     for folder in ["Inbox", "Drafts", "Sent", "Archive", "Spam", "Trash"] {
-        folders.append(&sidebar_row(folder, "folder-symbolic", None));
+        let Some(account_id) = account.id else {
+            continue;
+        };
+        folders.append(&sidebar_action_row(
+            &state,
+            folder,
+            "folder-symbolic",
+            None,
+            MailScope::Account {
+                id: account_id,
+                folder: folder.into(),
+            },
+        ));
     }
     expander.set_child(Some(&folders));
     expander
@@ -362,21 +397,90 @@ fn sidebar_row(label: &str, icon: &str, count: Option<usize>) -> gtk::Box {
     row
 }
 
+fn sidebar_action_row(
+    state: &Rc<AppState>,
+    label: &str,
+    icon: &str,
+    count: Option<usize>,
+    scope: MailScope,
+) -> gtk::Button {
+    let row = sidebar_row(label, icon, count);
+    let button = gtk::Button::new();
+    button.set_has_frame(false);
+    button.set_halign(gtk::Align::Fill);
+    button.set_child(Some(&row));
+    button.set_tooltip_text(Some(&format!("Show {label}")));
+    let state = state.clone();
+    button.connect_clicked(move |_| select_scope(&state, scope.clone()));
+    button
+}
+
+fn select_scope(state: &Rc<AppState>, scope: MailScope) {
+    state.scope.replace(scope);
+    state.selected_message.replace(None);
+    load_messages_for_scope(state);
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
+    render_reader(state, None);
+}
+
+fn load_messages_for_scope(state: &Rc<AppState>) {
+    if state.demo_mode {
+        return;
+    }
+    let scope = state.scope.borrow().clone();
+    let result = match scope {
+        MailScope::Unified(folder) if folder == "Starred" => {
+            state.database.list_messages_filtered(None, None, true)
+        }
+        MailScope::Unified(folder) => {
+            state
+                .database
+                .list_messages_filtered(None, Some(&folder), false)
+        }
+        MailScope::Account { id, folder } => {
+            state
+                .database
+                .list_messages_filtered(Some(id), Some(&folder), false)
+        }
+    };
+    if let Ok(messages) = result {
+        state.messages.replace(messages);
+    }
+}
+
 fn render_messages(state: &Rc<AppState>, query: &str) {
     clear(&state.message_list);
-    let query = query.trim().to_lowercase();
-    let messages = state.messages.borrow();
+    let raw_query = query.trim();
+    let query = raw_query.to_lowercase();
+    let scope = state.scope.borrow().clone();
+    let messages = if raw_query.is_empty() || state.demo_mode {
+        state.messages.borrow().clone()
+    } else {
+        state
+            .database
+            .search_messages(raw_query)
+            .unwrap_or_else(|_| state.messages.borrow().clone())
+    };
     for message in messages.iter().filter(|message| {
-        query.is_empty()
-            || [
-                message.sender_name.as_str(),
-                message.sender_email.as_str(),
-                message.recipients.as_str(),
-                message.subject.as_str(),
-                message.body.as_str(),
-            ]
-            .iter()
-            .any(|value| value.to_lowercase().contains(&query))
+        let in_scope = match &scope {
+            MailScope::Unified(folder) if folder == "Starred" => message.starred,
+            MailScope::Unified(folder) => message.folder.eq_ignore_ascii_case(folder),
+            MailScope::Account { id, folder } => {
+                message.account_id == Some(*id) && message.folder.eq_ignore_ascii_case(folder)
+            }
+        };
+        in_scope
+            && (query.is_empty()
+                || [
+                    message.sender_name.as_str(),
+                    message.sender_email.as_str(),
+                    message.recipients.as_str(),
+                    message.subject.as_str(),
+                    message.body.as_str(),
+                ]
+                .iter()
+                .any(|value| value.to_lowercase().contains(&query)))
     }) {
         let (row, star) = message_row(message);
         let message_id = message.id;
@@ -396,7 +500,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
                 let _ = database.set_starred(message_id, next);
             });
             render_sidebar(&state_for_star);
-            render_messages(&state_for_star, "");
+            render_messages(&state_for_star, state_for_star.search_entry.text().as_str());
         });
 
         let gesture = gtk::GestureClick::new();
@@ -447,11 +551,9 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
             } else if notify && report.new_messages > 0 {
                 crate::mail::sync::notify_new_mail(&report.email, report.new_messages);
             }
-            if let Ok(messages) = state.database.list_messages(None, "Inbox") {
-                state.messages.replace(messages);
-                render_sidebar(&state);
-                render_messages(&state, "");
-            }
+            load_messages_for_scope(&state);
+            render_sidebar(&state);
+            render_messages(&state, state.search_entry.text().as_str());
             set_status(&state, &format!("Synchronised {completed}/{account_count}"));
         }
         if errors.is_empty() {
@@ -594,16 +696,22 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
             } else {
                 "Trash"
             };
-            state
-                .messages
-                .borrow_mut()
-                .retain(|message| message.id != message_id);
+            let account_id = {
+                let mut messages = state.messages.borrow_mut();
+                let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
+                else {
+                    return;
+                };
+                let account_id = message.account_id;
+                message.folder = folder.to_string();
+                account_id
+            };
             let database = state.database.clone();
             let folder = folder.to_string();
             std::thread::spawn(move || {
                 let _ = database.move_message(message_id, &folder);
                 let _ = database.queue_action(
-                    None,
+                    account_id,
                     Some(message_id),
                     "move",
                     &serde_json::json!({ "folder": folder }).to_string(),
@@ -617,22 +725,36 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
                     "Moved to Trash — ready to undo"
                 },
             );
+            state.selected_message.replace(None);
+            render_reader(state, None);
         }
         _ => {}
     }
     if let Some((kind, value)) = persist {
         let database = state.database.clone();
+        let account_id = state
+            .messages
+            .borrow()
+            .iter()
+            .find(|message| message.id == message_id)
+            .and_then(|message| message.account_id);
         std::thread::spawn(move || {
             if kind == "read" {
                 let _ = database.set_unread(message_id, value);
             } else {
                 let _ = database.set_starred(message_id, value);
             }
+            let _ = database.queue_action(
+                account_id,
+                Some(message_id),
+                kind,
+                &serde_json::json!({ "value": value }).to_string(),
+            );
         });
         set_status(state, "Message updated");
     }
     render_sidebar(state);
-    render_messages(state, "");
+    render_messages(state, state.search_entry.text().as_str());
 }
 
 fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
@@ -689,6 +811,7 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
             button.set_use_underline(false);
             let state = state.clone();
             let label_owned = label.to_string();
+            let message_for_compose = message.clone();
             let action = match label {
                 "Archive" => Some("archive"),
                 "Delete" => Some("trash"),
@@ -697,6 +820,27 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
             button.connect_clicked(move |_| {
                 if let Some(action) = action {
                     apply_message_action(&state, reader_message_id, action);
+                } else if label_owned == "Reply" {
+                    open_compose_with_context(
+                        state.clone(),
+                        Some(ComposeContext::Reply {
+                            message: message_for_compose.clone(),
+                            reply_all: false,
+                        }),
+                    );
+                } else if label_owned == "Reply all" {
+                    open_compose_with_context(
+                        state.clone(),
+                        Some(ComposeContext::Reply {
+                            message: message_for_compose.clone(),
+                            reply_all: true,
+                        }),
+                    );
+                } else if label_owned == "Forward" {
+                    open_compose_with_context(
+                        state.clone(),
+                        Some(ComposeContext::Forward(message_for_compose.clone())),
+                    );
                 } else {
                     set_status(&state, &format!("{label_owned} ready"));
                 }
@@ -819,20 +963,42 @@ fn open_account_dialog(state: Rc<AppState>) {
         .text("imap.example.com")
         .hexpand(true)
         .build();
+    let incoming_username = gtk::Entry::builder()
+        .placeholder_text("IMAP username (defaults to email)")
+        .hexpand(true)
+        .build();
     let incoming_port = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     incoming_port.set_value(993.0);
+    let incoming_security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
+    incoming_security.set_selected(0);
     let outgoing_host = gtk::Entry::builder()
         .text("smtp.example.com")
         .hexpand(true)
         .build();
+    let outgoing_username = gtk::Entry::builder()
+        .placeholder_text("SMTP username (defaults to email)")
+        .hexpand(true)
+        .build();
     let outgoing_port = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     outgoing_port.set_value(465.0);
+    let outgoing_security = gtk::DropDown::from_strings(&["TLS", "STARTTLS", "None"]);
+    outgoing_security.set_selected(0);
+    let outgoing_password = gtk::Entry::builder()
+        .placeholder_text("Leave empty to reuse IMAP password")
+        .hexpand(true)
+        .build();
+    outgoing_password.set_visibility(false);
     details.append(&form_row("IMAP server", &incoming_host));
+    details.append(&form_row("IMAP username", &incoming_username));
     details.append(&form_row("IMAP port", &incoming_port));
+    details.append(&form_row("IMAP security", &incoming_security));
     details.append(&form_row("SMTP server", &outgoing_host));
+    details.append(&form_row("SMTP username", &outgoing_username));
     details.append(&form_row("SMTP port", &outgoing_port));
+    details.append(&form_row("SMTP security", &outgoing_security));
+    details.append(&form_row("SMTP password", &outgoing_password));
     let note = gtk::Label::new(Some(
-        "TLS is used by default. Provider-specific OAuth sign-in will be added without storing provider secrets in the app.",
+        "TLS is used by default. IMAP and SMTP usernames may differ; leave SMTP password empty to reuse the IMAP password.",
     ));
     note.set_wrap(true);
     note.add_css_class("mail-empty-body");
@@ -845,6 +1011,9 @@ fn open_account_dialog(state: Rc<AppState>) {
         let incoming_port = incoming_port.clone();
         let outgoing_host = outgoing_host.clone();
         let outgoing_port = outgoing_port.clone();
+        let outgoing_security = outgoing_security.clone();
+        let incoming_username = incoming_username.clone();
+        let outgoing_username = outgoing_username.clone();
         move |entry| {
             if mail::valid_email(entry.text().as_str()) {
                 let (imap_host, imap_port, smtp_host, smtp_port) =
@@ -853,6 +1022,13 @@ fn open_account_dialog(state: Rc<AppState>) {
                 incoming_port.set_value(imap_port as f64);
                 outgoing_host.set_text(&smtp_host);
                 outgoing_port.set_value(smtp_port as f64);
+                outgoing_security.set_selected(if smtp_port == 587 { 1 } else { 0 });
+                if incoming_username.text().is_empty() {
+                    incoming_username.set_text(entry.text().as_str());
+                }
+                if outgoing_username.text().is_empty() {
+                    outgoing_username.set_text(entry.text().as_str());
+                }
             }
         }
     });
@@ -895,22 +1071,38 @@ fn open_account_dialog(state: Rc<AppState>) {
         } else {
             display_name.text().trim().to_string()
         };
+        let incoming_login = if incoming_username.text().trim().is_empty() {
+            address.clone()
+        } else {
+            incoming_username.text().trim().to_string()
+        };
+        let outgoing_login = if outgoing_username.text().trim().is_empty() {
+            address.clone()
+        } else {
+            outgoing_username.text().trim().to_string()
+        };
+        let outgoing_secret = if outgoing_password.text().is_empty() {
+            secret.clone()
+        } else {
+            outgoing_password.text().to_string()
+        };
+        let security_for_index = |index| match index {
+            1 => SecurityMode::StartTls,
+            2 => SecurityMode::None,
+            _ => SecurityMode::Tls,
+        };
         let mut account = Account::new(&address, name);
         account.incoming = ServerConfig {
             hostname: incoming_host.text().trim().to_string(),
             port: incoming_port.value_as_int().max(1) as u16,
-            security: SecurityMode::Tls,
-            username: address.clone(),
+            security: security_for_index(incoming_security.selected()),
+            username: incoming_login.clone(),
         };
         account.outgoing = ServerConfig {
             hostname: outgoing_host.text().trim().to_string(),
             port: outgoing_port.value_as_int().max(1) as u16,
-            security: if outgoing_port.value_as_int() == 587 {
-                SecurityMode::StartTls
-            } else {
-                SecurityMode::Tls
-            },
-            username: address.clone(),
+            security: security_for_index(outgoing_security.selected()),
+            username: outgoing_login.clone(),
         };
         button.set_sensitive(false);
         error.set_text("Saving securely…");
@@ -920,8 +1112,12 @@ fn open_account_dialog(state: Rc<AppState>) {
         let database = state_for_save.database.clone();
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = mail::credentials::store_password(&address, &secret)
+            let result = mail::credentials::store_password(&address, "imap", &secret)
                 .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    mail::credentials::store_password(&address, "smtp", &outgoing_secret)
+                        .map_err(|error| error.to_string())
+                })
                 .and_then(|_| {
                     database
                         .save_account(&account)
@@ -1009,12 +1205,16 @@ fn open_settings(state: Rc<AppState>) {
                 return;
             };
             button.set_sensitive(false);
-            let email = account.email.clone();
+            let account_email = account.email.clone();
             let database = state_for_remove.database.clone();
             let (sender, receiver) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let result = mail::credentials::delete_password(&email)
+                let result = mail::credentials::delete_password(&account_email, "imap")
                     .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        mail::credentials::delete_password(&account_email, "smtp")
+                            .map_err(|error| error.to_string())
+                    })
                     .and_then(|_| {
                         database
                             .delete_account(account_id)
@@ -1072,10 +1272,63 @@ fn open_settings(state: Rc<AppState>) {
 }
 
 fn open_compose(state: Rc<AppState>) {
+    open_compose_with_context(state, None);
+}
+
+enum ComposeContext {
+    Reply { message: Message, reply_all: bool },
+    Forward(Message),
+}
+
+fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext>) {
     if state.accounts.borrow().is_empty() && !state.demo_mode {
         open_account_dialog(state);
         return;
     }
+
+    let (initial_to, initial_cc, initial_subject, initial_body) = match context {
+        Some(ComposeContext::Reply { message, reply_all }) => {
+            let subject = if message.subject.to_lowercase().starts_with("re:") {
+                message.subject.clone()
+            } else {
+                format!("Re: {}", message.subject)
+            };
+            let cc = if reply_all {
+                message.recipients
+            } else {
+                String::new()
+            };
+            let quoted = message
+                .body
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = format!(
+                "\n\nOn {}, {} wrote:\n{}",
+                message.received_at, message.sender_name, quoted
+            );
+            (message.sender_email, cc, subject, body)
+        }
+        Some(ComposeContext::Forward(message)) => {
+            let subject = if message.subject.to_lowercase().starts_with("fwd:") {
+                message.subject.clone()
+            } else {
+                format!("Fwd: {}", message.subject)
+            };
+            let body = format!(
+                "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\n\n{}",
+                message.sender_name,
+                message.sender_email,
+                message.received_at,
+                message.subject,
+                message.body
+            );
+            (String::new(), String::new(), subject, body)
+        }
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
+
     let window = adw::Window::builder()
         .transient_for(&state.window)
         .modal(true)
@@ -1095,6 +1348,33 @@ fn open_compose(state: Rc<AppState>) {
     let to = gtk::Entry::builder().placeholder_text("Recipients").build();
     let cc = gtk::Entry::builder().placeholder_text("Cc / Bcc").build();
     let subject = gtk::Entry::builder().placeholder_text("Subject").build();
+    let account_labels = if state.demo_mode && state.accounts.borrow().is_empty() {
+        vec!["Preview account <demo@example.com>".to_string()]
+    } else {
+        state
+            .accounts
+            .borrow()
+            .iter()
+            .map(|account| {
+                if account.display_name.is_empty() {
+                    account.email.clone()
+                } else {
+                    format!("{} <{}>", account.display_name, account.email)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let account_label_refs = account_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let account_selector = gtk::DropDown::from_strings(&account_label_refs);
+    account_selector.set_hexpand(true);
+    account_selector.set_selected(0);
+    root.append(&form_row("From", &account_selector));
+    to.set_text(&initial_to);
+    cc.set_text(&initial_cc);
+    subject.set_text(&initial_subject);
     root.append(&to);
     root.append(&cc);
     root.append(&subject);
@@ -1108,7 +1388,12 @@ fn open_compose(state: Rc<AppState>) {
     body.set_bottom_margin(16);
     body.set_left_margin(12);
     body.set_right_margin(12);
+    body.buffer().set_text(&initial_body);
     root.append(&body);
+    let attachment_paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    attachment_list.set_hexpand(true);
+    root.append(&attachment_list);
     let compose_status = gtk::Label::new(None);
     compose_status.set_xalign(0.0);
     compose_status.set_wrap(true);
@@ -1124,10 +1409,87 @@ fn open_compose(state: Rc<AppState>) {
     toolbar.append(&send);
     toolbar.set_halign(gtk::Align::End);
     root.append(&toolbar);
+
+    let file_dialog = gtk::FileDialog::builder()
+        .title("Attach a file")
+        .accept_label("Attach")
+        .build();
+    let window_for_attach = window.clone();
+    let paths_for_attach = attachment_paths.clone();
+    let list_for_attach = attachment_list.clone();
+    let status_for_attach = compose_status.clone();
+    attach.connect_clicked(move |_| {
+        let dialog = file_dialog.clone();
+        let paths = paths_for_attach.clone();
+        let list = list_for_attach.clone();
+        let status = status_for_attach.clone();
+        dialog.open(
+            Some(&window_for_attach),
+            None::<&gio::Cancellable>,
+            move |result| match result {
+                Ok(file) => {
+                    let Some(path) = file.path() else {
+                        status.set_text("That file is not available locally.");
+                        return;
+                    };
+                    let name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("attachment")
+                        .to_string();
+                    paths.borrow_mut().push(path);
+                    let chip = gtk::Label::new(Some(&format!("  {name}  ")));
+                    chip.add_css_class("mail-attachment-chip");
+                    list.append(&chip);
+                    status.set_text("Attachment added");
+                }
+                Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => {}
+                Err(error) => status.set_text(&format!("Couldn’t attach that file: {error}")),
+            },
+        );
+    });
+
     let state_for_draft = state.clone();
-    draft.connect_clicked(move |_| set_status(&state_for_draft, "Draft saved locally"));
+    let database_for_draft = state.database.clone();
+    let account_selector_for_draft = account_selector.clone();
+    let to_for_draft = to.clone();
+    let subject_for_draft = subject.clone();
+    let body_for_draft = body.clone();
+    let compose_status_for_draft = compose_status.clone();
+    draft.connect_clicked(move |_| {
+        let account_id = state_for_draft
+            .accounts
+            .borrow()
+            .get(account_selector_for_draft.selected() as usize)
+            .and_then(|account| account.id);
+        let recipients = to_for_draft.text().trim().to_string();
+        let subject = subject_for_draft.text().to_string();
+        let body = text_view_contents(&body_for_draft);
+        compose_status_for_draft.set_text("Saving draft…");
+        let (sender, receiver) = async_channel::bounded(1);
+        let database = database_for_draft.clone();
+        std::thread::spawn(move || {
+            let result = database
+                .save_draft(account_id, &recipients, &subject, &body)
+                .map_err(|error| error.to_string());
+            let _ = sender.send_blocking(result);
+        });
+        let compose_status = compose_status_for_draft.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match receiver.recv().await {
+                Ok(Ok(_)) => compose_status.set_text("Draft saved locally"),
+                Ok(Err(error)) => {
+                    compose_status.set_text(&format!("Couldn’t save this draft: {error}"))
+                }
+                Err(_) => compose_status.set_text("The draft worker stopped unexpectedly."),
+            }
+        });
+    });
+
     let state_for_send = state.clone();
     let window_for_send = window.clone();
+    let account_selector_for_send = account_selector.clone();
+    let attachments_for_send = attachment_paths.clone();
     send.connect_clicked(move |button| {
         let to_value = to.text().trim().to_string();
         if to_value.is_empty() {
@@ -1135,16 +1497,20 @@ fn open_compose(state: Rc<AppState>) {
             return;
         }
         let subject_value = subject.text().to_string();
-        let body_buffer = body.buffer();
-        let body_value = body_buffer
-            .text(&body_buffer.start_iter(), &body_buffer.end_iter(), true)
-            .to_string();
+        let body_value = text_view_contents(&body);
+        let attachments = attachments_for_send.borrow().clone();
         if state_for_send.demo_mode {
             set_status(&state_for_send, "Preview message queued");
             window_for_send.close();
             return;
         }
-        let Some(account) = state_for_send.accounts.borrow().first().cloned() else {
+        let Some(account) = state_for_send
+            .accounts
+            .borrow()
+            .get(account_selector_for_send.selected() as usize)
+            .cloned()
+            .or_else(|| state_for_send.accounts.borrow().first().cloned())
+        else {
             compose_status.set_text("Add an account before sending.");
             return;
         };
@@ -1159,16 +1525,17 @@ fn open_compose(state: Rc<AppState>) {
         compose_status.set_text("Sending securely…");
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = mail::credentials::load_password(&account.email)
+            let result = mail::credentials::load_password(&account.email, "smtp")
                 .map_err(|error| error.to_string())
                 .and_then(|password| {
-                    mail::smtp::send_text(
+                    mail::smtp::send_text_with_attachments(
                         &account,
                         &password,
                         &to_value,
                         &cc_values,
                         &subject_value,
                         &body_value,
+                        &attachments,
                     )
                     .map_err(|error| error.to_string())
                 });
@@ -1198,6 +1565,13 @@ fn open_compose(state: Rc<AppState>) {
     let _ = attach;
     window.set_content(Some(&root));
     window.present();
+}
+
+fn text_view_contents(view: &gtk::TextView) -> String {
+    let buffer = view.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string()
 }
 
 fn form_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {

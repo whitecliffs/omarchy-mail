@@ -8,9 +8,11 @@ The current working slice includes the GTK4/libadwaita shell, responsive
 three-pane layout, first-run account flow, Secret Service password storage,
 SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
 fetch workers, TLS/STARTTLS SMTP sending, native notifications, local message
-actions, compose/settings surfaces, and Omarchy theme integration. Full folder
-reconciliation, conversation rendering, OAuth2, and richer attachment handling
-remain explicit follow-up milestones.
+actions, unified and per-account cached-folder navigation, local drafts,
+reply/reply-all/forward prefilling, file attachments, compose/settings
+surfaces, and Omarchy theme integration. Full folder reconciliation, live
+conversation rendering, OAuth2, durable attachment caching/downloads, and a
+full offline outbox remain explicit follow-up milestones.
 
 ## Build and preview
 
@@ -47,8 +49,9 @@ Omarchy’s launcher without a custom launcher integration.
 
 ## Accounts and data
 
-Add accounts through the graphical setup flow. Passwords are stored in the
-Linux Secret Service and never in SQLite. The local database is at
+Add accounts through the graphical setup flow. IMAP and SMTP usernames and
+passwords can differ; secrets are stored separately in the Linux Secret
+Service and never in SQLite. The local database is at
 `$XDG_DATA_HOME/omarchy-mail/mail.db` or `~/.local/share/omarchy-mail/mail.db`.
 
 ## Theme integration

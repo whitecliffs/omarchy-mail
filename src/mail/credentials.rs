@@ -9,16 +9,24 @@ pub enum CredentialError {
     Keyring(#[from] keyring::Error),
 }
 
-pub fn store_password(username: &str, password: &str) -> Result<(), CredentialError> {
-    Entry::new(SERVICE, username)?.set_password(password)?;
+fn entry(account_email: &str, protocol: &str) -> Result<Entry, CredentialError> {
+    Ok(Entry::new(SERVICE, &format!("{protocol}:{account_email}"))?)
+}
+
+pub fn store_password(
+    account_email: &str,
+    protocol: &str,
+    password: &str,
+) -> Result<(), CredentialError> {
+    entry(account_email, protocol)?.set_password(password)?;
     Ok(())
 }
 
-pub fn load_password(username: &str) -> Result<String, CredentialError> {
-    Ok(Entry::new(SERVICE, username)?.get_password()?)
+pub fn load_password(account_email: &str, protocol: &str) -> Result<String, CredentialError> {
+    Ok(entry(account_email, protocol)?.get_password()?)
 }
 
-pub fn delete_password(username: &str) -> Result<(), CredentialError> {
-    Entry::new(SERVICE, username)?.delete_credential()?;
+pub fn delete_password(account_email: &str, protocol: &str) -> Result<(), CredentialError> {
+    entry(account_email, protocol)?.delete_credential()?;
     Ok(())
 }
