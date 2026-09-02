@@ -983,14 +983,13 @@ fn render_sidebar(state: &Rc<AppState>) {
     unified.add_css_class("mail-section-label");
     inner.append(&unified);
 
-    let inbox_messages = if state.demo_mode {
-        state.messages.borrow().clone()
-    } else {
-        state
-            .database
-            .list_messages_filtered(None, Some("Inbox"), false)
-            .unwrap_or_else(|_| state.messages.borrow().clone())
-    };
+    let inbox_messages = state
+        .messages
+        .borrow()
+        .iter()
+        .filter(|message| message.folder.eq_ignore_ascii_case("Inbox"))
+        .cloned()
+        .collect::<Vec<_>>();
     let unread = if state.demo_mode {
         inbox_messages
             .iter()
