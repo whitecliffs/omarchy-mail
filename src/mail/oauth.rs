@@ -32,6 +32,13 @@ impl Provider {
         }
     }
 
+    fn client_secret_env(self) -> &'static str {
+        match self {
+            Self::Google => "OMARCHY_MAIL_GOOGLE_CLIENT_SECRET",
+            Self::Microsoft => "OMARCHY_MAIL_MICROSOFT_CLIENT_SECRET",
+        }
+    }
+
     fn authorization_endpoint(self) -> &'static str {
         match self {
             Self::Google => "https://accounts.google.com/o/oauth2/v2/auth",
@@ -103,6 +110,7 @@ pub struct AuthorizationRequest {
     listener: TcpListener,
     provider: Provider,
     client_id: String,
+    client_secret: Option<String>,
     verifier: String,
     redirect_uri: String,
     state: String,
@@ -111,7 +119,9 @@ pub struct AuthorizationRequest {
 #[derive(Debug, Deserialize)]
 struct Config {
     google_client_id: Option<String>,
+    google_client_secret: Option<String>,
     microsoft_client_id: Option<String>,
+    microsoft_client_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,22 +141,8 @@ pub fn provider_for_email(email: &str) -> Option<Provider> {
 }
 
 pub fn configured_client_id(provider: Provider) -> Result<String, OAuthError> {
-    if let Ok(value) = std::env::var(provider.client_id_env()) {
-        if !value.trim().is_empty() {
-            return Ok(value.trim().to_string());
-        }
-    }
-    if let Some(path) = config_path()
-        && let Ok(contents) = std::fs::read_to_string(path)
-        && let Ok(config) = serde_json::from_str::<Config>(&contents)
-    {
-        let value = match provider {
-            Provider::Google => config.google_client_id,
-            Provider::Microsoft => config.microsoft_client_id,
-        };
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            return Ok(value.trim().to_string());
-        }
+    if let Some(value) = configured_client_values(provider).0 {
+        return Ok(value);
     }
     Err(OAuthError::ClientIdMissing {
         provider: provider.label(),
@@ -154,9 +150,46 @@ pub fn configured_client_id(provider: Provider) -> Result<String, OAuthError> {
     })
 }
 
+fn configured_client_secret(provider: Provider) -> Option<String> {
+    configured_client_values(provider).1
+}
+
+fn configured_client_values(provider: Provider) -> (Option<String>, Option<String>) {
+    let environment_id = std::env::var(provider.client_id_env())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let environment_secret = std::env::var(provider.client_secret_env())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+
+    let file_values = config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str::<Config>(&contents).ok())
+        .map(|config| match provider {
+            Provider::Google => (config.google_client_id, config.google_client_secret),
+            Provider::Microsoft => (config.microsoft_client_id, config.microsoft_client_secret),
+        })
+        .unwrap_or_default();
+    let file_id = file_values
+        .0
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let file_secret = file_values
+        .1
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    (
+        environment_id.or(file_id),
+        environment_secret.or(file_secret),
+    )
+}
+
 pub fn begin(email: &str) -> Result<AuthorizationRequest, OAuthError> {
     let provider = provider_for_email(email).ok_or(OAuthError::UnsupportedProvider)?;
     let client_id = configured_client_id(provider)?;
+    let client_secret = configured_client_secret(provider);
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
@@ -179,6 +212,7 @@ pub fn begin(email: &str) -> Result<AuthorizationRequest, OAuthError> {
         listener,
         provider,
         client_id,
+        client_secret,
         verifier,
         redirect_uri,
         state,
@@ -218,6 +252,7 @@ pub fn complete(request: AuthorizationRequest) -> Result<OAuthTokens, OAuthError
     exchange_code(
         request.provider,
         &request.client_id,
+        request.client_secret.as_deref(),
         &request.redirect_uri,
         &request.verifier,
         code,
@@ -233,12 +268,16 @@ pub fn refresh_access_token(
     form.append_pair("client_id", client_id)
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token);
+    if let Some(client_secret) = configured_client_secret(provider) {
+        form.append_pair("client_secret", &client_secret);
+    }
     parse_token_response(http_post_form(provider.token_endpoint(), &form.finish())?)
 }
 
 fn exchange_code(
     provider: Provider,
     client_id: &str,
+    client_secret: Option<&str>,
     redirect_uri: &str,
     verifier: &str,
     code: &str,
@@ -249,6 +288,9 @@ fn exchange_code(
         .append_pair("code", code)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("code_verifier", verifier);
+    if let Some(client_secret) = client_secret {
+        form.append_pair("client_secret", client_secret);
+    }
     parse_token_response(http_post_form(provider.token_endpoint(), &form.finish())?)
 }
 

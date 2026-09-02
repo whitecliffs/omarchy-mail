@@ -1,6 +1,6 @@
 pkgname=omarchy-mail
 pkgver=0.1.0
-pkgrel=6
+pkgrel=7
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
 url='https://github.com/omarchy/omarchy-mail'

@@ -189,14 +189,19 @@ or the optional `~/.config/omarchy-mail/oauth.json` file:
 ```json
 {
   "google_client_id": "your-desktop-client-id.apps.googleusercontent.com",
-  "microsoft_client_id": "your-desktop-client-id"
+  "google_client_secret": "your-desktop-client-secret",
+  "microsoft_client_id": "your-desktop-client-id",
+  "microsoft_client_secret": "your-desktop-client-secret"
 }
 ```
 
 Use `OMARCHY_MAIL_GOOGLE_CLIENT_ID` or
-`OMARCHY_MAIL_MICROSOFT_CLIENT_ID` for a temporary session. The flow uses PKCE,
-opens the system browser, listens only on a random localhost port, validates
-the callback state, and refreshes expired access tokens when possible.
+`OMARCHY_MAIL_MICROSOFT_CLIENT_ID` for a temporary session. If the provider
+requires a client secret during token exchange, also set the matching
+`OMARCHY_MAIL_*_CLIENT_SECRET` variable or add the secret to this local file.
+The flow uses PKCE, opens the system browser, listens only on a random
+localhost port, validates the callback state, and refreshes expired access
+tokens when possible.
 
 ## Theme integration
 
