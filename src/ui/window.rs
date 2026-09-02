@@ -356,7 +356,10 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     search.set_widget_name("message-search");
     bar.append(&search);
 
-    let filter = icon_button("view-filter-symbolic", "Filter messages");
+    // `view-filter-symbolic` is not provided by the active Omarchy icon theme
+    // and falls back to a confusing missing-icon glyph. This native filter
+    // glyph is available in the same theme and reads as adjustable filters.
+    let filter = icon_button("nautilus-search-filters-symbolic", "Filter messages");
     bar.append(&filter);
     (bar, search, filter)
 }
