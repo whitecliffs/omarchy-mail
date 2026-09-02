@@ -128,6 +128,14 @@ it. Copy intentionally does not invent a destination UID in the cache, so the
 destination appears on its next folder refresh rather than risking duplicate
 or recycled local rows.
 
+The message list uses GTK ListBox multiple selection. Selected IDs are kept
+separately from the reader’s current message, allowing a reader to remain
+open while a batch is prepared. Batch flag changes and moves update the local
+cache immediately, then enqueue one UID-safe action per message. Ctrl+A
+selects the visible list when it has focus, Escape clears selection, and
+Delete or the a key performs the corresponding batch move when multiple rows
+are selected.
+
 The protocol boundary has offline socket integration coverage in the IMAP and
 SMTP modules. The tests run the production clients against temporary local
 servers, so login, folder discovery, UID FETCH literals, MIME parsing, SMTP

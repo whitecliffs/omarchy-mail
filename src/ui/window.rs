@@ -10,7 +10,7 @@ use adw::prelude::*;
 use chrono::Datelike;
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
@@ -47,6 +47,9 @@ struct AppState {
     outbox_sender: async_channel::Sender<mail::sync::OutboxReport>,
     outbox_stops: RefCell<HashMap<i64, Arc<AtomicBool>>>,
     status: gtk::Label,
+    selection_bar: gtk::Box,
+    selection_count: gtk::Label,
+    selected_messages: RefCell<HashSet<i64>>,
     demo_mode: bool,
 }
 
@@ -126,7 +129,7 @@ pub fn build_window(application: &adw::Application) {
         .build();
 
     let message_list = gtk::ListBox::new();
-    message_list.set_selection_mode(gtk::SelectionMode::Single);
+    message_list.set_selection_mode(gtk::SelectionMode::Multiple);
     message_list.set_activate_on_single_click(true);
     message_list.add_css_class("mail-message-list");
     let message_scroll = gtk::ScrolledWindow::builder()
@@ -139,6 +142,17 @@ pub fn build_window(application: &adw::Application) {
     middle.add_css_class("mail-middle");
     let (filter_bar, search, filter_button) = build_filter_bar();
     middle.append(&filter_bar);
+    let (
+        selection_bar,
+        selection_count,
+        mark_read,
+        mark_unread,
+        star_selected,
+        archive_selected,
+        trash_selected,
+        clear_selection,
+    ) = build_selection_bar();
+    middle.append(&selection_bar);
     middle.append(&message_scroll);
 
     let reader = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -188,6 +202,9 @@ pub fn build_window(application: &adw::Application) {
         outbox_sender,
         outbox_stops: RefCell::new(HashMap::new()),
         status,
+        selection_bar,
+        selection_count,
+        selected_messages: RefCell::new(HashSet::new()),
         demo_mode,
     });
 
@@ -201,6 +218,15 @@ pub fn build_window(application: &adw::Application) {
     });
     let state_for_filter = state.clone();
     filter_button.connect_clicked(move |button| open_filter_menu(state_for_filter.clone(), button));
+    connect_selection_actions(
+        state.clone(),
+        &mark_read,
+        &mark_unread,
+        &star_selected,
+        &archive_selected,
+        &trash_selected,
+        &clear_selection,
+    );
     render_sidebar(&state);
     render_messages(&state, "");
     render_reader(&state, None);
@@ -287,6 +313,20 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
     pane.set_shrink_end_child(true);
 
     let message_list = state.message_list.clone();
+    let state_for_selected_rows = state.clone();
+    message_list.connect_selected_rows_changed(move |list| {
+        let selected = list
+            .selected_rows()
+            .into_iter()
+            .filter_map(|row| {
+                row.widget_name()
+                    .strip_prefix("message-row-")
+                    .and_then(|id| id.parse::<i64>().ok())
+            })
+            .collect::<HashSet<_>>();
+        state_for_selected_rows.selected_messages.replace(selected);
+        update_selection_summary(&state_for_selected_rows);
+    });
     let state_for_selection = state.clone();
     message_list.connect_row_selected(move |_, row| {
         let Some(row) = row else { return };
@@ -347,6 +387,22 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
             sync_all(state_for_key.clone(), true);
             return glib::Propagation::Stop;
         }
+        if control && key == gdk::Key::a && state_for_key.message_list.has_focus() {
+            state_for_key.message_list.select_all();
+            return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::Escape && !state_for_key.selected_messages.borrow().is_empty() {
+            clear_selected_rows(&state_for_key);
+            return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::Delete && state_for_key.selected_messages.borrow().len() > 1 {
+            apply_bulk_move(&state_for_key, "Trash");
+            return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::a && state_for_key.selected_messages.borrow().len() > 1 {
+            apply_bulk_move(&state_for_key, "Archive");
+            return glib::Propagation::Stop;
+        }
         let Some(message_id) = *state_for_key.selected_message.borrow() else {
             return glib::Propagation::Proceed;
         };
@@ -385,6 +441,96 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     filter.set_margin_end(12);
     bar.append(&filter);
     (bar, search, filter)
+}
+
+fn build_selection_bar() -> (
+    gtk::Box,
+    gtk::Label,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
+) {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bar.add_css_class("mail-selection-bar");
+    bar.set_margin_start(12);
+    bar.set_margin_end(12);
+    bar.set_margin_top(2);
+    bar.set_margin_bottom(8);
+    let count = gtk::Label::new(Some("0 selected"));
+    count.set_xalign(0.0);
+    count.set_hexpand(true);
+    count.add_css_class("mail-reader-meta");
+    bar.append(&count);
+
+    let mark_read = gtk::Button::with_label("Read");
+    mark_read.set_tooltip_text(Some("Mark selected messages as read"));
+    let mark_unread = gtk::Button::with_label("Unread");
+    mark_unread.set_tooltip_text(Some("Mark selected messages as unread"));
+    let star = gtk::Button::with_label("Star");
+    star.set_tooltip_text(Some("Star selected messages"));
+    let archive = gtk::Button::with_label("Archive");
+    archive.set_tooltip_text(Some("Archive selected messages"));
+    let trash = gtk::Button::with_label("Trash");
+    trash.set_tooltip_text(Some("Move selected messages to Trash"));
+    trash.add_css_class("destructive-action");
+    let clear = gtk::Button::with_label("Clear");
+    clear.set_tooltip_text(Some("Clear message selection"));
+    for button in [&mark_read, &mark_unread, &star, &archive, &trash, &clear] {
+        button.set_has_frame(false);
+        bar.append(button);
+    }
+    bar.set_visible(false);
+    (
+        bar,
+        count,
+        mark_read,
+        mark_unread,
+        star,
+        archive,
+        trash,
+        clear,
+    )
+}
+
+fn connect_selection_actions(
+    state: Rc<AppState>,
+    mark_read: &gtk::Button,
+    mark_unread: &gtk::Button,
+    star: &gtk::Button,
+    archive: &gtk::Button,
+    trash: &gtk::Button,
+    clear: &gtk::Button,
+) {
+    let state_for_read = state.clone();
+    mark_read.connect_clicked(move |_| apply_bulk_flag(&state_for_read, "read", true));
+    let state_for_unread = state.clone();
+    mark_unread.connect_clicked(move |_| apply_bulk_flag(&state_for_unread, "read", false));
+    let state_for_star = state.clone();
+    star.connect_clicked(move |_| apply_bulk_flag(&state_for_star, "star", true));
+    let state_for_archive = state.clone();
+    archive.connect_clicked(move |_| apply_bulk_move(&state_for_archive, "Archive"));
+    let state_for_trash = state.clone();
+    trash.connect_clicked(move |_| apply_bulk_move(&state_for_trash, "Trash"));
+    clear.connect_clicked(move |_| clear_selected_rows(&state));
+}
+
+fn update_selection_summary(state: &AppState) {
+    let count = state.selected_messages.borrow().len();
+    state.selection_count.set_text(&format!("{count} selected"));
+    state.selection_bar.set_visible(count > 0);
+}
+
+fn clear_selected_rows(state: &Rc<AppState>) {
+    state.message_list.unselect_all();
+    state.selected_messages.borrow_mut().clear();
+    update_selection_summary(state);
+}
+
+fn selected_message_ids(state: &Rc<AppState>) -> Vec<i64> {
+    state.selected_messages.borrow().iter().copied().collect()
 }
 
 fn open_filter_menu(state: Rc<AppState>, button: &gtk::Button) {
@@ -1061,6 +1207,9 @@ fn default_remote_folder(local_name: &str) -> &str {
 }
 
 fn render_messages(state: &Rc<AppState>, query: &str) {
+    state.message_list.unselect_all();
+    state.selected_messages.borrow_mut().clear();
+    update_selection_summary(state);
     clear(&state.message_list);
     let raw_query = query.trim();
     let query = raw_query.to_lowercase();
@@ -2261,6 +2410,136 @@ fn apply_message_transfer(
     let _ = uidvalidity;
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
+}
+
+fn apply_bulk_flag(state: &Rc<AppState>, kind: &str, enabled: bool) {
+    let ids = selected_message_ids(state);
+    if ids.is_empty() {
+        return;
+    }
+    let updates = {
+        let mut messages = state.messages.borrow_mut();
+        messages
+            .iter_mut()
+            .filter(|message| ids.contains(&message.id) && message.id >= 0)
+            .map(|message| {
+                let value = if kind == "read" {
+                    message.unread = !enabled;
+                    !enabled
+                } else {
+                    message.starred = enabled;
+                    enabled
+                };
+                (
+                    message.id,
+                    message.account_id,
+                    message.folder.clone(),
+                    value,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if updates.is_empty() {
+        clear_selected_rows(state);
+        return;
+    }
+    let database = state.database.clone();
+    let kind_for_worker = kind.to_string();
+    std::thread::spawn(move || {
+        for (message_id, account_id, folder, value) in updates {
+            if kind_for_worker == "read" {
+                let _ = database.set_unread(message_id, value);
+            } else {
+                let _ = database.set_starred(message_id, value);
+            }
+            if let Some(account_id) = account_id {
+                let _ = database.queue_action(
+                    Some(account_id),
+                    Some(message_id),
+                    &kind_for_worker,
+                    &serde_json::json!({ "value": value, "folder": folder }).to_string(),
+                );
+            }
+        }
+    });
+    clear_selected_rows(state);
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
+    set_status(
+        state,
+        match (kind, enabled) {
+            ("read", true) => "Selected messages marked read",
+            ("read", false) => "Selected messages marked unread",
+            ("star", true) => "Selected messages starred",
+            _ => "Selected messages updated",
+        },
+    );
+}
+
+fn apply_bulk_move(state: &Rc<AppState>, target_folder: &str) {
+    let ids = selected_message_ids(state);
+    if ids.is_empty() {
+        return;
+    }
+    let updates = {
+        let mut messages = state.messages.borrow_mut();
+        messages
+            .iter_mut()
+            .filter(|message| {
+                ids.contains(&message.id)
+                    && message.id >= 0
+                    && message.account_id.is_some()
+                    && message.remote_uid.is_some()
+                    && message.uidvalidity.is_some()
+                    && !message.folder.eq_ignore_ascii_case(target_folder)
+            })
+            .map(|message| {
+                let source_folder = message.folder.clone();
+                let account_id = message.account_id.expect("filtered account id");
+                message.folder = target_folder.to_string();
+                (
+                    message.id,
+                    account_id,
+                    source_folder,
+                    target_folder.to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if updates.is_empty() {
+        clear_selected_rows(state);
+        set_status(state, "The selected messages are already there");
+        return;
+    }
+    let database = state.database.clone();
+    std::thread::spawn(move || {
+        for (message_id, account_id, source_folder, target_folder) in updates {
+            let _ = database.move_message(message_id, &target_folder);
+            let _ = database.queue_action(
+                Some(account_id),
+                Some(message_id),
+                "move",
+                &serde_json::json!({
+                    "folder": target_folder,
+                    "source_folder": source_folder,
+                })
+                .to_string(),
+            );
+        }
+    });
+    clear_selected_rows(state);
+    state.selected_message.replace(None);
+    render_reader(state, None);
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
+    set_status(
+        state,
+        if target_folder == "Trash" {
+            "Selected messages moved to Trash"
+        } else {
+            "Selected messages archived"
+        },
+    );
 }
 
 fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
