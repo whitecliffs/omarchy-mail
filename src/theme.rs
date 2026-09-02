@@ -110,7 +110,7 @@ window.omarchy-mail-window {{
 .mail-section-label {{ color: @om-muted; font-size: 0.78em; font-weight: 700; letter-spacing: 0.06em; }}
 .mail-sidebar-row {{ min-height: 34px; border-radius: 8px; color: @om-foreground; }}
 .mail-sidebar-row:hover {{ background: alpha(@om-lighter-background, 0.62); }}
-.mail-sidebar-row.selected {{ background: @om-selection; color: @om-light-foreground; }}
+.mail-sidebar-row.selected {{ background: @om-selection; color: @om-light-foreground; padding-left: 6px; }}
 .mail-sidebar-row.selected label, .mail-sidebar-row.selected image, .mail-sidebar-row.selected .mail-count {{ color: @om-light-foreground; }}
 .mail-count {{ color: @om-muted; font-size: 0.86em; }}
 .mail-filter-bar {{ background: @om-dark-background; border-bottom: 1px solid alpha(@om-muted, 0.24); }}

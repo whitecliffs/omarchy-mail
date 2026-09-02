@@ -344,14 +344,13 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
 fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar.add_css_class("mail-filter-bar");
-    bar.set_margin_start(12);
-    bar.set_margin_end(12);
-    bar.set_margin_top(10);
-    bar.set_margin_bottom(10);
 
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Search messages"));
     search.set_hexpand(true);
+    search.set_margin_start(12);
+    search.set_margin_top(10);
+    search.set_margin_bottom(10);
     search.set_tooltip_text(Some("Search sender, recipients, subject, and message text"));
     search.set_widget_name("message-search");
     bar.append(&search);
@@ -360,6 +359,9 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     // and falls back to a confusing missing-icon glyph. This native filter
     // glyph is available in the same theme and reads as adjustable filters.
     let filter = icon_button("nautilus-search-filters-symbolic", "Filter messages");
+    filter.set_margin_top(10);
+    filter.set_margin_bottom(10);
+    filter.set_margin_end(12);
     bar.append(&filter);
     (bar, search, filter)
 }
@@ -4597,6 +4599,21 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             .collect(),
     ));
     let draft_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(initial_draft_id));
+    let cancelled = Rc::new(Cell::new(false));
+    let discard_on_cancel = initial_draft_id.is_none();
+    let close_composer: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let window = window.clone();
+        let draft_id = draft_id.clone();
+        let cancelled = cancelled.clone();
+        Rc::new(move || {
+            cancelled.set(true);
+            if discard_on_cancel {
+                discard_draft_async(state.clone(), draft_id.get());
+            }
+            window.close();
+        })
+    };
     let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     attachment_list.set_hexpand(true);
     root.append(&attachment_list);
@@ -4613,13 +4630,30 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let attach = gtk::Button::with_label("Attach file");
     let draft = gtk::Button::with_label("Save draft");
+    let cancel = gtk::Button::with_label("Cancel");
     let send = gtk::Button::with_label("Send");
     send.add_css_class("mail-accent-button");
     toolbar.append(&attach);
     toolbar.append(&draft);
+    toolbar.append(&cancel);
     toolbar.append(&send);
     toolbar.set_halign(gtk::Align::End);
     root.append(&toolbar);
+
+    let close_for_cancel = close_composer.clone();
+    cancel.connect_clicked(move |_| close_for_cancel());
+    let close_for_escape = close_composer.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            close_for_escape();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key_controller);
 
     let file_dialog = gtk::FileDialog::builder()
         .title("Attach a file")
@@ -4670,6 +4704,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let format_selector_for_draft = format_selector.clone();
     let formatting_for_draft = formatting.clone();
     let compose_status_for_draft = compose_status.clone();
+    let cancelled_for_draft = cancelled.clone();
     draft.connect_clicked(move |_| {
         save_draft_async(
             state_for_draft.clone(),
@@ -4683,6 +4718,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             format_selector_for_draft.clone(),
             formatting_for_draft.clone(),
             attachment_paths_for_draft.clone(),
+            cancelled_for_draft.clone(),
             compose_status_for_draft.clone(),
             "Saving draft…",
         );
@@ -4701,6 +4737,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         let format_selector = format_selector.clone();
         let formatting = formatting.clone();
         let attachment_paths = attachment_paths.clone();
+        let cancelled = cancelled.clone();
         let status = compose_status.clone();
         let revision = draft_revision.clone();
         Rc::new(move || {
@@ -4716,6 +4753,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
                 format_selector.clone(),
                 formatting.clone(),
                 attachment_paths.clone(),
+                cancelled.clone(),
                 status.clone(),
                 revision.clone(),
             )
@@ -4998,6 +5036,7 @@ fn schedule_draft_autosave(
     format_selector: gtk::DropDown,
     formatting: Rc<ComposerFormatting>,
     attachment_paths: Rc<RefCell<Vec<PathBuf>>>,
+    cancelled: Rc<Cell<bool>>,
     status: gtk::Label,
     revision: Rc<Cell<u64>>,
 ) {
@@ -5017,6 +5056,7 @@ fn schedule_draft_autosave(
                 format_selector,
                 formatting,
                 attachment_paths,
+                cancelled,
                 status,
                 "Saving draft…",
             );
@@ -5036,9 +5076,13 @@ fn save_draft_async(
     format_selector: gtk::DropDown,
     formatting: Rc<ComposerFormatting>,
     attachment_paths: Rc<RefCell<Vec<PathBuf>>>,
+    cancelled: Rc<Cell<bool>>,
     status: gtk::Label,
     status_text: &'static str,
 ) {
+    if cancelled.get() {
+        return;
+    }
     let to_value = to.text().trim().to_string();
     let cc_value = cc.text().trim().to_string();
     let bcc_value = bcc.text().trim().to_string();
@@ -5105,6 +5149,10 @@ fn save_draft_async(
     glib::MainContext::default().spawn_local(async move {
         match receiver.recv().await {
             Ok(Ok((id, staged))) => {
+                if cancelled.get() {
+                    discard_draft_async(state.clone(), Some(id));
+                    return;
+                }
                 draft_id.set(Some(id));
                 let staged_paths = staged
                     .iter()
@@ -5181,6 +5229,17 @@ fn delete_local_message(state: &Rc<AppState>, message_id: i64) {
     set_status(state, "Draft deleted");
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
+}
+
+fn discard_draft_async(state: Rc<AppState>, draft_id: Option<i64>) {
+    let Some(draft_id) = draft_id else {
+        return;
+    };
+    let database = state.database.clone();
+    std::thread::spawn(move || {
+        let _ = database.delete_message(draft_id);
+        mail::outbox::remove_draft_files(draft_id);
+    });
 }
 
 fn text_view_contents(view: &gtk::TextView) -> String {
