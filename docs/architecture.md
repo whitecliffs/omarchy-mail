@@ -136,6 +136,12 @@ selects the visible list when it has focus, Escape clears selection, and
 Delete or the a key performs the corresponding batch move when multiple rows
 are selected.
 
+Mailbox lists load 100 cached rows at a time through LIMIT/OFFSET queries.
+Additional pages are fetched on a worker and appended only after the current
+scope still matches, while search stays bounded to its first indexed page.
+This keeps GTK row creation and initial cache reads bounded for large
+mailboxes without making the SQLite cache authoritative.
+
 The protocol boundary has offline socket integration coverage in the IMAP and
 SMTP modules. The tests run the production clients against temporary local
 servers, so login, folder discovery, UID FETCH literals, MIME parsing, SMTP

@@ -117,6 +117,8 @@ window.omarchy-mail-window {{
 .mail-selection-bar {{ background: alpha(@om-selection, 0.34); border-bottom: 1px solid alpha(@om-muted, 0.2); border-radius: 0 0 8px 8px; padding: 4px 6px; }}
 .mail-selection-bar button {{ min-height: 28px; padding: 2px 8px; }}
 .mail-selection-bar button:hover {{ background: alpha(@om-lighter-background, 0.52); }}
+.mail-load-more {{ color: @om-muted; min-height: 30px; padding: 4px 14px; }}
+.mail-load-more:hover {{ color: @om-light-foreground; background: alpha(@om-selection, 0.55); }}
 .mail-sidebar-secondary {{ color: @om-muted; padding: 4px 8px; }}
 .mail-sidebar-secondary:hover {{ color: @om-light-foreground; background: alpha(@om-lighter-background, 0.42); }}
 .mail-message-row {{ min-height: 86px; border-bottom: 1px solid alpha(@om-muted, 0.17); padding: 8px 14px; }}

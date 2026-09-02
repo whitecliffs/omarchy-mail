@@ -25,7 +25,8 @@ actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server. Message context menus now offer
 server-safe Move to… and Copy to… destinations, while each account exposes
 custom-folder create, rename, and delete operations. Message lists support
-multi-selection with batch read/unread, star, archive, and trash actions.
+multi-selection with batch read/unread, star, archive, and trash actions, and
+load cached folders in bounded 100-message pages.
 
 Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
 refreshes the connection before common server idle limits, falls back to a

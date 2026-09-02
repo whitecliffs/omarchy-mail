@@ -491,12 +491,29 @@ impl Database {
         folder: Option<&str>,
         starred_only: bool,
     ) -> Result<Vec<Message>> {
+        self.list_messages_filtered_page(account_id, folder, starred_only, usize::MAX, 0)
+    }
+
+    pub fn list_messages_filtered_page(
+        &self,
+        account_id: Option<i64>,
+        folder: Option<&str>,
+        starred_only: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Message>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html,\n                    received_at, unread, starred, has_attachments, thread_size, attachments_json\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY id DESC",
+            "SELECT id, account_id, folder, remote_uid, uidvalidity, message_id, thread_key, sender_name, sender_email, recipients, subject, preview, body, body_html,\n                    received_at, unread, starred, has_attachments, thread_size, attachments_json\n             FROM messages\n             WHERE (?1 IS NULL OR account_id = ?1)\n               AND (?2 IS NULL OR folder = ?2)\n               AND (?3 = 0 OR starred = 1)\n             ORDER BY received_at DESC, id DESC\n             LIMIT ?4 OFFSET ?5",
         )?;
         let rows = statement.query_map(
-            params![account_id, folder, starred_only as i64],
+            params![
+                account_id,
+                folder,
+                starred_only as i64,
+                limit.min(i64::MAX as usize) as i64,
+                offset.min(i64::MAX as usize) as i64
+            ],
             message_from_row,
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -504,15 +521,31 @@ impl Database {
     }
 
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>> {
+        self.search_messages_page(query, usize::MAX, 0)
+    }
+
+    pub fn search_messages_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Message>> {
         let query = fts_query(query);
         if query.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.body_html, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1 ORDER BY m.id DESC",
+            "SELECT m.id, m.account_id, m.folder, m.remote_uid, m.uidvalidity, m.message_id, m.thread_key, m.sender_name, m.sender_email, m.recipients, m.subject,\n                    m.preview, m.body, m.body_html, m.received_at, m.unread, m.starred, m.has_attachments, m.thread_size, m.attachments_json\n             FROM message_search s JOIN messages m ON m.id = s.rowid\n             WHERE message_search MATCH ?1\n             ORDER BY m.received_at DESC, m.id DESC\n             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = statement.query_map([query], message_from_row)?;
+        let rows = statement.query_map(
+            params![
+                query,
+                limit.min(i64::MAX as usize) as i64,
+                offset.min(i64::MAX as usize) as i64
+            ],
+            message_from_row,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }
@@ -1134,6 +1167,29 @@ mod tests {
         assert_eq!(archived[0].id, 1);
         assert_eq!(starred.len(), 1);
         assert_eq!(starred[0].id, 1);
+    }
+
+    #[test]
+    fn paginates_cached_messages_with_stable_received_order() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        database
+            .upsert_messages(&Message::demo_messages())
+            .expect("insert messages");
+
+        let first = database
+            .list_messages_filtered_page(None, Some("Inbox"), false, 2, 0)
+            .expect("first page");
+        let second = database
+            .list_messages_filtered_page(None, Some("Inbox"), false, 2, 2)
+            .expect("second page");
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert!(
+            first
+                .iter()
+                .all(|message| { second.iter().all(|other| message.id != other.id) })
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@ use std::sync::{
 use std::time::Duration;
 use webkit6::prelude::*;
 
+const MESSAGE_PAGE_SIZE: usize = 100;
+
 struct AppState {
     window: adw::ApplicationWindow,
     database: Database,
@@ -50,6 +52,9 @@ struct AppState {
     selection_bar: gtk::Box,
     selection_count: gtk::Label,
     selected_messages: RefCell<HashSet<i64>>,
+    load_more: gtk::Button,
+    message_offset: Cell<usize>,
+    has_more_messages: Cell<bool>,
     demo_mode: bool,
 }
 
@@ -102,7 +107,9 @@ pub fn build_window(application: &adw::Application) {
     let messages = if demo_mode {
         Message::demo_messages()
     } else {
-        database.list_messages(None, "Inbox").unwrap_or_default()
+        database
+            .list_messages_filtered_page(None, Some("Inbox"), false, MESSAGE_PAGE_SIZE, 0)
+            .unwrap_or_default()
     };
 
     let window = adw::ApplicationWindow::builder()
@@ -154,6 +161,13 @@ pub fn build_window(application: &adw::Application) {
     ) = build_selection_bar();
     middle.append(&selection_bar);
     middle.append(&message_scroll);
+    let load_more = gtk::Button::with_label("Load more messages");
+    load_more.set_halign(gtk::Align::Center);
+    load_more.set_margin_top(8);
+    load_more.set_margin_bottom(10);
+    load_more.add_css_class("mail-load-more");
+    load_more.set_visible(false);
+    middle.append(&load_more);
 
     let reader = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reader.add_css_class("mail-reader");
@@ -205,6 +219,13 @@ pub fn build_window(application: &adw::Application) {
         selection_bar,
         selection_count,
         selected_messages: RefCell::new(HashSet::new()),
+        load_more,
+        message_offset: Cell::new(if demo_mode {
+            Message::demo_messages().len()
+        } else {
+            MESSAGE_PAGE_SIZE
+        }),
+        has_more_messages: Cell::new(!demo_mode),
         demo_mode,
     });
 
@@ -227,6 +248,10 @@ pub fn build_window(application: &adw::Application) {
         &trash_selected,
         &clear_selection,
     );
+    let state_for_load_more = state.clone();
+    state
+        .load_more
+        .connect_clicked(move |_| load_more_messages(&state_for_load_more));
     render_sidebar(&state);
     render_messages(&state, "");
     render_reader(&state, None);
@@ -1029,6 +1054,8 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
     if state.demo_mode {
         return;
     }
+    state.message_offset.set(0);
+    state.has_more_messages.set(false);
     let scope = state.scope.borrow().clone();
     if let Some(account_id) = match scope {
         MailScope::Unified(folder) if folder == "Outbox" => Some(None),
@@ -1038,27 +1065,108 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
         state
             .messages
             .replace(load_outbox_messages(state, account_id));
+        state.message_offset.set(state.messages.borrow().len());
         return;
     }
     let scope = state.scope.borrow().clone();
     let result = match scope {
-        MailScope::Unified(folder) if folder == "Starred" => {
-            state.database.list_messages_filtered(None, None, true)
-        }
-        MailScope::Unified(folder) => {
-            state
-                .database
-                .list_messages_filtered(None, Some(&folder), false)
-        }
-        MailScope::Account { id, folder } => {
-            state
-                .database
-                .list_messages_filtered(Some(id), Some(&folder), false)
-        }
+        MailScope::Unified(folder) if folder == "Starred" => state
+            .database
+            .list_messages_filtered_page(None, None, true, MESSAGE_PAGE_SIZE, 0),
+        MailScope::Unified(folder) => state.database.list_messages_filtered_page(
+            None,
+            Some(&folder),
+            false,
+            MESSAGE_PAGE_SIZE,
+            0,
+        ),
+        MailScope::Account { id, folder } => state.database.list_messages_filtered_page(
+            Some(id),
+            Some(&folder),
+            false,
+            MESSAGE_PAGE_SIZE,
+            0,
+        ),
     };
     if let Ok(messages) = result {
+        state
+            .has_more_messages
+            .set(messages.len() == MESSAGE_PAGE_SIZE);
+        state.message_offset.set(messages.len());
         state.messages.replace(messages);
     }
+}
+
+fn load_more_messages(state: &Rc<AppState>) {
+    if state.demo_mode {
+        return;
+    }
+    let query = state.search_entry.text();
+    if !query.trim().is_empty() {
+        set_status(state, "Search results are shown from the local index");
+        return;
+    }
+    let scope = state.scope.borrow().clone();
+    let (account_id, folder, starred_only) = match &scope {
+        MailScope::Unified(folder) if folder == "Starred" => (None, None, true),
+        MailScope::Unified(folder) => (None, Some(folder.clone()), false),
+        MailScope::Account { id, folder } => (Some(*id), Some(folder.clone()), false),
+    };
+    if folder.as_deref() == Some("Outbox") {
+        return;
+    }
+    let offset = state.message_offset.get();
+    state.load_more.set_sensitive(false);
+    let database = state.database.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = database.list_messages_filtered_page(
+            account_id,
+            folder.as_deref(),
+            starred_only,
+            MESSAGE_PAGE_SIZE,
+            offset,
+        );
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        state_for_result.load_more.set_sensitive(true);
+        match receiver.recv().await {
+            Ok(Ok(messages)) => {
+                if *state_for_result.scope.borrow() != scope {
+                    return;
+                }
+                let loaded = messages.len();
+                state_for_result.messages.borrow_mut().extend(messages);
+                state_for_result
+                    .message_offset
+                    .set(offset.saturating_add(loaded));
+                state_for_result
+                    .has_more_messages
+                    .set(loaded == MESSAGE_PAGE_SIZE);
+                render_messages(
+                    &state_for_result,
+                    state_for_result.search_entry.text().as_str(),
+                );
+                if loaded == 0 {
+                    set_status(&state_for_result, "All messages loaded");
+                } else {
+                    set_status(&state_for_result, &format!("Loaded {loaded} more messages"));
+                }
+            }
+            Ok(Err(error)) => {
+                set_status(
+                    &state_for_result,
+                    &format!("Couldn’t load more messages: {error}"),
+                );
+            }
+            Err(_) => set_status(
+                &state_for_result,
+                "The message loading worker stopped unexpectedly.",
+            ),
+        }
+    });
 }
 
 fn load_outbox_messages(state: &Rc<AppState>, account_id: Option<i64>) -> Vec<Message> {
@@ -1211,6 +1319,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     state.selected_messages.borrow_mut().clear();
     update_selection_summary(state);
     clear(&state.message_list);
+    state.load_more.set_visible(false);
     let raw_query = query.trim();
     let query = raw_query.to_lowercase();
     let scope = state.scope.borrow().clone();
@@ -1224,9 +1333,13 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     } else {
         state
             .database
-            .search_messages(raw_query)
+            .search_messages_page(raw_query, MESSAGE_PAGE_SIZE, 0)
             .unwrap_or_else(|_| state.messages.borrow().clone())
     };
+    let can_load_more = raw_query.is_empty()
+        && !state.demo_mode
+        && !is_outbox_scope
+        && state.has_more_messages.get();
     let mut visible = messages
         .into_iter()
         .filter(|message| {
@@ -1256,6 +1369,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
             ("No messages yet", "There’s nothing here to show.")
         };
         append_empty_message_state(&state.message_list, title, subtitle);
+        state.load_more.set_visible(can_load_more);
         return;
     }
     visible.sort_by(compare_received_newest);
@@ -1291,6 +1405,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         }
         state.message_list.append(&row);
     }
+    state.load_more.set_visible(can_load_more);
 }
 
 fn search_filters_match(message: &Message, filters: &SearchFilters) -> bool {
