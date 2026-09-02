@@ -1,4 +1,5 @@
 use crate::models::Account;
+use crate::security;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -105,6 +106,7 @@ pub fn load() -> Preferences {
     let Some(path) = path() else {
         return Preferences::default();
     };
+    let _ = security::set_private_file_permissions(&path);
     fs::read_to_string(path)
         .ok()
         .and_then(|contents| serde_json::from_str(&contents).ok())
@@ -119,12 +121,13 @@ pub fn save(preferences: &Preferences) -> io::Result<()> {
         ));
     };
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        security::ensure_private_dir(parent)?;
     }
     let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let contents = serde_json::to_vec_pretty(preferences)
         .map_err(|error| io::Error::other(error.to_string()))?;
     fs::write(&temporary, contents)?;
+    security::set_private_file_permissions(&temporary)?;
     fs::rename(temporary, path)
 }
 

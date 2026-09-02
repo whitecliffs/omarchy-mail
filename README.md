@@ -120,12 +120,25 @@ omarchy-mail
 ```
 
 The uninstall script removes only the development binary, desktop metadata,
-icon, and theme template. It does not remove mail data from
-`~/.local/share/omarchy-mail/`.
+AppStream metadata, icon, and unchanged theme template. It does not remove
+mail data from `~/.local/share/omarchy-mail/`.
 
-For an Arch package, use `packaging/PKGBUILD` with a release source tarball.
-The desktop entry uses the normal XDG application directory and appears in
-Omarchy’s launcher without a custom launcher integration.
+For an Arch package, create the release source archive beside
+`packaging/PKGBUILD`, then generate and record its checksum before building:
+
+```bash
+git archive --format=tar.gz --prefix=omarchy-mail-0.1.0/ \
+  -o packaging/omarchy-mail-0.1.0.tar.gz HEAD
+cd packaging
+makepkg -g
+makepkg --verifysource
+makepkg
+```
+
+Replace the `sha256sums` value in the PKGBUILD with the output from `makepkg
+-g` for a published release. The package installs the desktop and AppStream
+metadata in the normal XDG/system locations, and installs its Omarchy theme
+template into the generator’s packaged template directory.
 
 The test suite includes fixture messages for UTF-8 headers, multipart
 attachments, inline and remote images, truncated MIME, and a serialized SMTP
@@ -183,10 +196,12 @@ the callback state, and refreshes expired access tokens when possible.
 ## Theme integration
 
 The app follows the active Omarchy palette from
-`~/.local/state/omarchy/current/theme/colors.toml`. The dev installer also
-registers `~/.config/omarchy/themed/omarchy-mail.css.tpl`, using Omarchy’s
-supported generated-template mechanism. Re-applying or changing an Omarchy
-theme regenerates the template output, and the running app watches the active
+`~/.local/state/omarchy/current/theme/colors.toml`. The dev installer registers
+`~/.config/omarchy/themed/omarchy-mail.css.tpl`, which is the supported user
+override location. The Arch package installs the same template under
+`/usr/share/omarchy/default/themed/omarchy-mail.css.tpl`, where Omarchy’s
+packaged generator discovers it. Re-applying or changing an Omarchy theme
+regenerates the template output, and the running app watches the active
 palette for live updates.
 
 ## Troubleshooting

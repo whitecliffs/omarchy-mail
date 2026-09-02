@@ -1,12 +1,15 @@
 pkgname=omarchy-mail
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
 url='https://github.com/omarchy/omarchy-mail'
 license=('MIT')
 depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret')
+optdepends=('omarchy-settings: Omarchy theme template generation')
 makedepends=('rust')
+# Build from the release archive placed beside this PKGBUILD. When publishing
+# a release, replace SKIP with the archive's sha256 from `makepkg -g`.
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -15,11 +18,20 @@ build() {
   cargo build --release --locked
 }
 
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --locked
+}
+
 package() {
   cd "$pkgname-$pkgver"
   install -Dm755 target/release/omarchy-mail "$pkgdir/usr/bin/omarchy-mail"
   install -Dm644 packaging/org.omarchy.Mail.desktop "$pkgdir/usr/share/applications/org.omarchy.Mail.desktop"
+  install -Dm644 packaging/org.omarchy.Mail.metainfo.xml "$pkgdir/usr/share/metainfo/org.omarchy.Mail.metainfo.xml"
   install -Dm644 packaging/icons/hicolor/scalable/apps/org.omarchy.Mail.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.omarchy.Mail.svg"
-  install -Dm644 packaging/omarchy-mail.css.tpl "$pkgdir/usr/share/omarchy-mail/omarchy-mail.css.tpl"
+  # Omarchy's theme generator reads packaged templates from this directory.
+  # The application also reads colors.toml directly, so it remains usable on
+  # non-Omarchy systems when the optional generator is not present.
+  install -Dm644 packaging/omarchy-mail.css.tpl "$pkgdir/usr/share/omarchy/default/themed/omarchy-mail.css.tpl"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

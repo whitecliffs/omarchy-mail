@@ -1,4 +1,5 @@
 use crate::models::AttachmentInfo;
+use crate::security;
 use ammonia::Builder;
 use base64::Engine;
 use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
@@ -1077,7 +1078,7 @@ pub fn cache_attachments(message_id: i64, attachments: &[Attachment]) -> Vec<Att
         .join("omarchy-mail")
         .join("attachments")
         .join(message_id.to_string());
-    let directory_available = fs::create_dir_all(&directory).is_ok();
+    let directory_available = security::ensure_private_dir(&directory).is_ok();
 
     attachments
         .iter()
@@ -1087,9 +1088,13 @@ pub fn cache_attachments(message_id: i64, attachments: &[Attachment]) -> Vec<Att
                 "{index:03}-{}",
                 safe_filename(&attachment.filename)
             ));
-            let cache_path = if directory_available && fs::write(&path, &attachment.bytes).is_ok() {
+            let cache_path = if directory_available
+                && fs::write(&path, &attachment.bytes).is_ok()
+                && security::set_private_file_permissions(&path).is_ok()
+            {
                 path.to_string_lossy().into_owned()
             } else {
+                let _ = fs::remove_file(&path);
                 String::new()
             };
             AttachmentInfo {

@@ -1,5 +1,6 @@
 use crate::database::{Database, DatabaseError};
 use crate::models::{OutgoingAttachment, PendingSend};
+use crate::security;
 use chrono::{Duration, Utc};
 use std::fs;
 use std::io;
@@ -95,7 +96,7 @@ pub fn stage_draft_attachments(
             "the XDG data directory is not available",
         )
     })?;
-    fs::create_dir_all(&root)?;
+    security::ensure_private_dir(&root)?;
     let final_directory = root.join(format!("draft-{draft_id}"));
     if source_paths.is_empty() {
         remove_draft_files(draft_id);
@@ -103,7 +104,7 @@ pub fn stage_draft_attachments(
     }
     let temporary_directory = root.join(format!(".draft-{draft_id}.tmp-{}", std::process::id()));
     let _ = fs::remove_dir_all(&temporary_directory);
-    fs::create_dir(&temporary_directory)?;
+    security::ensure_private_dir(&temporary_directory)?;
     let result = copy_attachments_to_directory(source_paths, &temporary_directory);
     let attachments = match result {
         Ok(attachments) => attachments,
@@ -166,7 +167,7 @@ fn stage_attachments_in_root(
     source_paths: &[PathBuf],
     root: &Path,
 ) -> Result<(Option<PathBuf>, Vec<OutgoingAttachment>), OutboxError> {
-    fs::create_dir_all(&root)?;
+    security::ensure_private_dir(root)?;
     let timestamp = Utc::now().timestamp_micros();
     let staging_dir = (0..100)
         .map(|attempt| {
@@ -175,7 +176,16 @@ fn stage_attachments_in_root(
                 std::process::id()
             ))
         })
-        .find(|directory| fs::create_dir(directory).is_ok())
+        .find_map(|directory| {
+            if fs::create_dir(&directory).is_err() {
+                return None;
+            }
+            if security::ensure_private_dir(&directory).is_err() {
+                let _ = fs::remove_dir(&directory);
+                return None;
+            }
+            Some(directory)
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -213,6 +223,7 @@ fn copy_attachments_to_directory(
             .unwrap_or_else(|| "attachment".into());
         let destination = directory.join(format!("{index:03}-{filename}"));
         fs::copy(source, &destination)?;
+        security::set_private_file_permissions(&destination)?;
         attachments.push(OutgoingAttachment {
             filename,
             path: destination.to_string_lossy().into_owned(),

@@ -2,10 +2,10 @@ use crate::models::{
     Account, AttachmentInfo, MailFolder, Message, OutgoingAttachment, PendingAction, PendingSend,
     ServerConfig,
 };
+use crate::security;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -38,11 +38,15 @@ impl Database {
 
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&data_dir)?;
+        security::ensure_private_dir(&data_dir)?;
         let database = Self {
             path: data_dir.join("mail.db"),
         };
+        if database.path.exists() {
+            security::set_private_file_permissions(&database.path)?;
+        }
         database.migrate()?;
+        security::set_private_file_permissions(&database.path)?;
         Ok(database)
     }
 

@@ -5,4 +5,6 @@
 *.db-wal
 *.log
 .direnv/
-
+packaging/*.tar.gz
+packaging/*.pkg.tar.*
+packaging/*.src.tar.*

@@ -180,8 +180,10 @@ without depending on a live provider.
 ## Theme boundary
 
 `packaging/omarchy-mail.css.tpl` is installed as
-`~/.config/omarchy/themed/omarchy-mail.css.tpl`. Omarchy regenerates the
-matching `omarchy-mail.css` in the staged current theme on theme changes. The
+`~/.config/omarchy/themed/omarchy-mail.css.tpl` by the development installer.
+The Arch package places it under `/usr/share/omarchy/default/themed/`, the
+packaged generator’s built-in template path. Omarchy regenerates the matching
+`omarchy-mail.css` in the staged current theme on theme changes. The
 application also reads `colors.toml` directly and watches it, so a running
 window updates without a reboot and remains functional before the first
 regeneration.
