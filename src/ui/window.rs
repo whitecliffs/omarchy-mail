@@ -57,6 +57,7 @@ struct AppState {
     selection_bar: gtk::Box,
     selection_count: gtk::Label,
     selected_messages: RefCell<HashSet<i64>>,
+    selection_anchor: Cell<Option<i32>>,
     undo_button: gtk::Button,
     undo_action: RefCell<Option<UndoAction>>,
     undo_generation: Cell<u64>,
@@ -239,6 +240,7 @@ pub fn build_window(application: &adw::Application) {
         selection_bar,
         selection_count,
         selected_messages: RefCell::new(HashSet::new()),
+        selection_anchor: Cell::new(None),
         undo_button,
         undo_action: RefCell::new(None),
         undo_generation: Cell::new(0),
@@ -415,6 +417,58 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
     pane
 }
 
+fn connect_message_selection(state: &Rc<AppState>, row: &gtk::ListBoxRow) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(1);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let state_for_click = state.clone();
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        let Some(widget) = gesture.widget() else {
+            return;
+        };
+        let Ok(row) = widget.downcast::<gtk::ListBoxRow>() else {
+            return;
+        };
+        let index = row.index();
+        if index < 0 {
+            return;
+        }
+        let modifiers = gesture.current_event_state();
+        let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+        let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+        let list = &state_for_click.message_list;
+
+        if shift {
+            let anchor = state_for_click.selection_anchor.get().unwrap_or(index);
+            let start = anchor.min(index);
+            let end = anchor.max(index);
+            list.unselect_all();
+            for row_index in start..=end {
+                if let Some(range_row) = list.row_at_index(row_index) {
+                    list.select_row(Some(&range_row));
+                }
+            }
+        } else if control {
+            if list
+                .selected_rows()
+                .iter()
+                .any(|selected| selected.index() == index)
+            {
+                list.unselect_row(&row);
+            } else {
+                list.select_row(Some(&row));
+            }
+            state_for_click.selection_anchor.set(Some(index));
+        } else {
+            list.unselect_all();
+            list.select_row(Some(&row));
+            state_for_click.selection_anchor.set(Some(index));
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    row.add_controller(gesture);
+}
+
 fn connect_pane_persistence(
     state: &Rc<AppState>,
     sidebar_pane: &gtk::Paned,
@@ -516,6 +570,10 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
         }
         if control && key == gdk::Key::r {
             sync_all(state_for_key.clone(), true);
+            return glib::Propagation::Stop;
+        }
+        if control && key == gdk::Key::comma {
+            open_settings(state_for_key.clone());
             return glib::Propagation::Stop;
         }
         if control && key == gdk::Key::a && state_for_key.message_list.has_focus() {
@@ -682,12 +740,13 @@ fn connect_selection_actions(
 fn update_selection_summary(state: &AppState) {
     let count = state.selected_messages.borrow().len();
     state.selection_count.set_text(&format!("{count} selected"));
-    state.selection_bar.set_visible(count > 0);
+    state.selection_bar.set_visible(count > 1);
 }
 
 fn clear_selected_rows(state: &Rc<AppState>) {
     state.message_list.unselect_all();
     state.selected_messages.borrow_mut().clear();
+    state.selection_anchor.set(None);
     update_selection_summary(state);
 }
 
@@ -1654,6 +1713,7 @@ fn start_message_search(state: &Rc<AppState>, query: &str) {
 fn render_messages(state: &Rc<AppState>, query: &str) {
     state.message_list.unselect_all();
     state.selected_messages.borrow_mut().clear();
+    state.selection_anchor.set(None);
     update_selection_summary(state);
     clear(&state.message_list);
     state.load_more.set_visible(false);
@@ -1724,6 +1784,7 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     };
     for message in visible.iter() {
         let (row, star) = message_row(message);
+        connect_message_selection(state, &row);
         let message_id = message.id;
         let state_for_star = state.clone();
         star.connect_clicked(move |_| {
@@ -5424,18 +5485,27 @@ fn open_settings(state: Rc<AppState>) {
         .transient_for(&state.window)
         .modal(true)
         .title("Omarchy Mail settings")
-        .default_width(540)
-        .default_height(520)
+        .default_width(640)
+        .default_height(720)
         .build();
+    window.add_css_class("mail-settings-window");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("mail-settings-root");
+    root.set_spacing(16);
     root.set_margin_start(28);
     root.set_margin_end(28);
-    root.set_margin_top(26);
+    root.set_margin_top(24);
     root.set_margin_bottom(26);
     let title = gtk::Label::new(Some("Settings"));
     title.set_xalign(0.0);
     title.add_css_class("mail-reader-subject");
     root.append(&title);
+    let subtitle = gtk::Label::new(Some(
+        "Accounts, reading, notifications, and composing preferences.",
+    ));
+    subtitle.set_xalign(0.0);
+    subtitle.add_css_class("mail-settings-subtitle");
+    root.append(&subtitle);
 
     let accounts = gtk::Label::new(Some("ACCOUNTS"));
     accounts.set_xalign(0.0);
@@ -5451,10 +5521,13 @@ fn open_settings(state: Rc<AppState>) {
     root.append(&account_summary);
 
     let account_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    account_list.set_margin_top(12);
+    account_list.add_css_class("mail-settings-account-list");
+    account_list.set_margin_top(2);
     for account in state.accounts.borrow().iter().cloned() {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        row.add_css_class("mail-settings-account-card");
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        header.add_css_class("mail-settings-account-header");
         let identity = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let label = gtk::Label::new(Some(if account.display_name.trim().is_empty() {
             &account.email
@@ -5476,6 +5549,7 @@ fn open_settings(state: Rc<AppState>) {
         identity.set_hexpand(true);
         header.append(&identity);
         let edit = gtk::Button::with_label("Edit");
+        edit.add_css_class("mail-secondary-button");
         edit.set_tooltip_text(Some("Edit server details or re-enter credentials"));
         let settings_window_for_edit = window.clone();
         let state_for_edit = state.clone();
@@ -5539,20 +5613,53 @@ fn open_settings(state: Rc<AppState>) {
             .unwrap_or_default();
         let signature = gtk::TextView::new();
         signature.set_wrap_mode(gtk::WrapMode::WordChar);
-        signature.set_size_request(-1, 44);
+        signature.set_size_request(-1, 68);
         signature.buffer().set_text(&signature_value);
-        signature.add_css_class("mail-settings-signature");
+        signature.add_css_class("mail-settings-signature-editor");
         signature.set_hexpand(true);
         signature.set_tooltip_text(Some(
             "Signature (optional; leave empty to use the account identity)",
         ));
+        let signature_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .min_content_height(76)
+            .child(&signature)
+            .build();
+        signature_scroll.add_css_class("mail-settings-signature-scroll");
+        let signature_heading = gtk::Label::new(Some("Signature"));
+        signature_heading.set_xalign(0.0);
+        signature_heading.add_css_class("mail-settings-field-title");
+        let signature_hint =
+            gtk::Label::new(Some("Optional · leave empty to use your account name"));
+        signature_hint.set_xalign(0.0);
+        signature_hint.add_css_class("mail-settings-field-hint");
+        let signature_field = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        signature_field.add_css_class("mail-settings-signature-field");
+        signature_field.append(&signature_heading);
+        signature_field.append(&signature_hint);
+        let signature_overlay = gtk::Overlay::new();
+        signature_overlay.set_child(Some(&signature_scroll));
+        let signature_placeholder =
+            gtk::Label::new(Some("No custom signature — account name will be used"));
+        signature_placeholder.set_xalign(0.0);
+        signature_placeholder.set_valign(gtk::Align::Start);
+        signature_placeholder.set_margin_start(12);
+        signature_placeholder.set_margin_top(10);
+        signature_placeholder.add_css_class("mail-settings-signature-placeholder");
+        signature_placeholder.set_sensitive(false);
+        signature_placeholder.set_visible(signature_value.trim().is_empty());
+        signature_overlay.add_overlay(&signature_placeholder);
+        signature_field.append(&signature_overlay);
         let state_for_signature = state.clone();
         let email_for_signature = account.email.clone();
         let signature_for_callback = signature.clone();
+        let placeholder_for_signature = signature_placeholder.clone();
         signature.buffer().connect_changed(move |_| {
             let result = {
                 let mut preferences = state_for_signature.preferences.borrow_mut();
                 let value = text_view_contents(&signature_for_callback);
+                placeholder_for_signature.set_visible(value.trim().is_empty());
                 if value.trim().is_empty() {
                     preferences.signatures.remove(&email_for_signature);
                 } else {
@@ -5570,7 +5677,8 @@ fn open_settings(state: Rc<AppState>) {
             }
         });
         let remove = gtk::Button::with_label("Remove");
-        remove.add_css_class("mail-danger");
+        remove.add_css_class("mail-danger-button");
+        remove.set_tooltip_text(Some("Remove this account and its local cache"));
         let state_for_remove = state.clone();
         let account_email = account.email.clone();
         remove.connect_clicked(move |button| {
@@ -5635,9 +5743,13 @@ fn open_settings(state: Rc<AppState>) {
                 }
             });
         });
-        header.append(&remove);
         row.append(&header);
-        row.append(&signature);
+        row.append(&signature_field);
+        let account_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        account_actions.set_halign(gtk::Align::End);
+        account_actions.add_css_class("mail-settings-account-actions");
+        account_actions.append(&remove);
+        row.append(&account_actions);
         account_list.append(&row);
     }
     root.append(&account_list);
@@ -5685,12 +5797,18 @@ fn open_settings(state: Rc<AppState>) {
     ));
 
     let close = gtk::Button::with_label("Done");
+    close.add_css_class("mail-accent-button");
     close.set_halign(gtk::Align::End);
-    close.set_margin_top(26);
+    close.set_margin_top(4);
     let window_for_close = window.clone();
     close.connect_clicked(move |_| window_for_close.close());
     root.append(&close);
-    window.set_content(Some(&root));
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&root)
+        .build();
+    window.set_content(Some(&scroll));
     window.present();
 }
 
@@ -7089,11 +7207,12 @@ where
     F: Fn(&mut preferences::Preferences, bool) + 'static,
 {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row.set_margin_top(10);
+    row.add_css_class("mail-settings-preference-row");
     let text = gtk::Label::new(Some(label));
     text.set_xalign(0.0);
     text.set_hexpand(true);
     let switcher = gtk::Switch::new();
+    switcher.set_valign(gtk::Align::Center);
     switcher.set_active(active);
     let state = state.clone();
     switcher.connect_active_notify(move |switcher| {

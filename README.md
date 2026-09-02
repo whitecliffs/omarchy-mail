@@ -30,8 +30,9 @@ multi-selection with batch read/unread, star, archive, and trash actions, and
 load cached folders in bounded 100-message pages.
 Pane widths are remembered in the local preferences file, and message-list
 keyboard commands include reply (`r`), forward (`f`), archive (`a`), trash
-(`Delete`), read/unread (`u`), star (`s`), refresh (`Ctrl+R`), and compose
-(`Ctrl+N`).
+(`Delete`), read/unread (`u`), star (`s`), refresh (`Ctrl+R`), compose
+(`Ctrl+N`), and Settings (`Ctrl+,`). Hold Ctrl while clicking to toggle
+message selection, or Shift-click to select a contiguous range.
 
 Cached mailbox and Outbox reads run on workers as well, with scope-generation
 checks so a slow folder read cannot replace a newer selection.

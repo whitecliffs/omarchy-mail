@@ -151,6 +151,24 @@ window.omarchy-mail-window {{
 .mail-compose-toolbar {{ border-top: 1px solid alpha(@om-muted, 0.2); padding-top: 10px; }}
 #message-search:focus {{ border-color: alpha(@om-accent, 0.82); }}
 .mail-settings-signature {{ background: alpha(@om-dark-background, 0.35); border: 1px solid alpha(@om-muted, 0.22); border-radius: 7px; padding: 5px 7px; }}
+.mail-settings-window {{ background: @om-background; }}
+.mail-settings-root {{ background: @om-background; }}
+.mail-settings-subtitle {{ color: @om-muted; font-size: 0.95em; }}
+.mail-settings-account-list {{ margin-top: 2px; }}
+.mail-settings-account-card {{ background: alpha(@om-dark-background, 0.46); border: 1px solid alpha(@om-muted, 0.22); border-radius: 14px; padding: 14px; }}
+.mail-settings-account-header {{ min-height: 42px; }}
+.mail-settings-account-actions {{ margin-top: 2px; }}
+.mail-settings-field-title {{ color: @om-light-foreground; font-weight: 700; }}
+.mail-settings-field-hint {{ color: @om-muted; font-size: 0.88em; }}
+.mail-settings-signature-field {{ background: alpha(@om-darker-background, 0.2); border-radius: 10px; padding: 10px; margin-top: 4px; }}
+.mail-settings-signature-scroll {{ background: alpha(@om-background, 0.72); border: 1px solid alpha(@om-muted, 0.24); border-radius: 8px; }}
+.mail-settings-signature-editor {{ background: transparent; color: @om-foreground; padding: 8px; }}
+.mail-settings-signature-editor:focus {{ border-color: alpha(@om-accent, 0.82); }}
+.mail-settings-signature-placeholder {{ color: @om-muted; padding: 8px; }}
+.mail-settings-preference-row {{ background: alpha(@om-dark-background, 0.46); border: 1px solid alpha(@om-muted, 0.2); border-radius: 10px; padding: 10px 12px; }}
+.mail-settings-account-actions button, .mail-settings-preference-row button {{ min-height: 30px; }}
+.mail-danger-button {{ color: @om-red; border: 1px solid alpha(@om-red, 0.36); }}
+.mail-danger-button:hover {{ background: alpha(@om-red, 0.12); border-color: alpha(@om-red, 0.68); }}
 .mail-inline-images {{ background: alpha(@om-dark-background, 0.34); border: 1px solid alpha(@om-muted, 0.2); border-radius: 10px; padding: 10px 12px; }}
 .mail-remote-image-notice {{ background: alpha(@om-selection, 0.3); border: 1px solid alpha(@om-muted, 0.2); border-radius: 10px; padding: 9px 12px; }}
 .mail-inline-image {{ border-radius: 8px; }}
