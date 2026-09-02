@@ -117,7 +117,8 @@ window.omarchy-mail-window {{
 .mail-message-row {{ min-height: 86px; border-bottom: 1px solid alpha(@om-muted, 0.17); padding: 8px 14px; }}
 .mail-message-row > * {{ min-width: 0; }}
 .mail-message-row:hover {{ background: alpha(@om-lighter-background, 0.42); }}
-.mail-message-row:selected {{ background: @om-selection; }}
+.mail-message-row:selected {{ background: @om-selection; border-left: 3px solid @om-accent; padding-left: 11px; }}
+.mail-message-row:selected .mail-preview, .mail-message-row:selected .mail-date, .mail-message-row:selected .mail-count, .mail-message-row:selected .mail-attachment {{ color: @om-light-foreground; opacity: 0.82; }}
 .mail-message-row.unread .mail-sender, .mail-message-row.unread .mail-subject {{ color: @om-light-foreground; font-weight: 700; }}
 .mail-sender {{ color: @om-foreground; }}
 .mail-subject {{ color: @om-foreground; }}
@@ -138,6 +139,10 @@ window.omarchy-mail-window {{
 .mail-html-blockquote {{ border-left: 3px solid alpha(@om-muted, 0.45); color: @om-muted; }}
 .mail-format-button {{ min-width: 30px; min-height: 30px; padding: 3px 8px; }}
 .mail-format-button:hover {{ background: alpha(@om-selection, 0.7); }}
+.mail-compose-body {{ background: alpha(@om-darker-background, 0.32); border: 1px solid alpha(@om-muted, 0.24); border-radius: 10px; color: @om-foreground; }}
+.mail-compose-body:focus {{ border-color: alpha(@om-accent, 0.82); }}
+.mail-compose-toolbar {{ border-top: 1px solid alpha(@om-muted, 0.2); padding-top: 10px; }}
+#message-search:focus {{ border-color: alpha(@om-accent, 0.82); }}
 .mail-settings-signature {{ background: alpha(@om-dark-background, 0.35); border: 1px solid alpha(@om-muted, 0.22); border-radius: 7px; padding: 5px 7px; }}
 .mail-inline-images {{ background: alpha(@om-dark-background, 0.34); border: 1px solid alpha(@om-muted, 0.2); border-radius: 10px; padding: 10px 12px; }}
 .mail-remote-image-notice {{ background: alpha(@om-selection, 0.3); border: 1px solid alpha(@om-muted, 0.2); border-radius: 10px; padding: 9px 12px; }}

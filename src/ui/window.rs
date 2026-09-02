@@ -4540,6 +4540,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         bcc_row_for_toggle.set_visible(button.is_active());
     });
     let body = gtk::TextView::new();
+    body.add_css_class("mail-compose-body");
     body.set_wrap_mode(gtk::WrapMode::WordChar);
     body.set_vexpand(true);
     body.set_top_margin(16);
@@ -4628,6 +4629,7 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     compose_status.add_css_class("mail-status");
     root.append(&compose_status);
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    toolbar.add_css_class("mail-compose-toolbar");
     let attach = gtk::Button::with_label("Attach file");
     let draft = gtk::Button::with_label("Save draft");
     let cancel = gtk::Button::with_label("Cancel");
