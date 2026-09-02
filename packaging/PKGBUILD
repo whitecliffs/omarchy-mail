@@ -1,6 +1,6 @@
 pkgname=omarchy-mail
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
 url='https://github.com/omarchy/omarchy-mail'
@@ -8,6 +8,10 @@ license=('MIT')
 depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret')
 optdepends=('omarchy-settings: Omarchy theme template generation')
 makedepends=('rust')
+# Cargo's release profile already enables thin LTO.  Disabling makepkg's
+# additional C-level LTO keeps rusqlite's bundled SQLite archive linkable with
+# Arch's lld toolchain while retaining the release optimisation settings.
+options=('!lto')
 # Build from the release archive placed beside this PKGBUILD. When publishing
 # a release, replace SKIP with the archive's sha256 from `makepkg -g`.
 source=("$pkgname-$pkgver.tar.gz")
