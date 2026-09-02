@@ -1,11 +1,11 @@
 pkgname=omarchy-mail
 pkgver=0.1.0
-pkgrel=4
+pkgrel=5
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
 url='https://github.com/omarchy/omarchy-mail'
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret' 'openssl')
 optdepends=('omarchy-settings: Omarchy theme template generation')
 makedepends=('rust')
 # Cargo's release profile already enables thin LTO.  Disabling makepkg's
