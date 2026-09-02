@@ -102,6 +102,15 @@ struct UndoAction {
     target_folder: String,
 }
 
+struct SettingsSession {
+    original_preferences: preferences::Preferences,
+    original_account_notifications: HashMap<i64, bool>,
+    dirty: Cell<bool>,
+    warning_open: Cell<bool>,
+}
+
+type SettingsContinuation = Rc<dyn Fn()>;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SearchFilters {
     unread: bool,
@@ -5480,7 +5489,207 @@ fn open_account_dialog(state: Rc<AppState>) {
     dialog.present();
 }
 
+fn mark_settings_dirty(session: &Rc<SettingsSession>, save_button: &gtk::Button) {
+    session.dirty.set(true);
+    save_button.set_sensitive(true);
+}
+
+fn restore_settings_session(state: &Rc<AppState>, session: &SettingsSession) {
+    state
+        .preferences
+        .replace(session.original_preferences.clone());
+    for account in state.accounts.borrow_mut().iter_mut() {
+        if let Some(notify) = account
+            .id
+            .and_then(|id| session.original_account_notifications.get(&id))
+        {
+            account.notify = *notify;
+        }
+    }
+    session.dirty.set(false);
+}
+
+fn save_settings_session(
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    settings_window: adw::Window,
+    save_button: gtk::Button,
+    status: gtk::Label,
+    continuation: Option<SettingsContinuation>,
+) {
+    if !session.dirty.get() {
+        settings_window.close();
+        if let Some(continuation) = continuation {
+            continuation();
+        }
+        return;
+    }
+
+    save_button.set_sensitive(false);
+    status.set_text("Saving settings…");
+    let preferences = state.preferences.borrow().clone();
+    let accounts = state.accounts.borrow().clone();
+    let database = state.database.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = preferences::save(&preferences)
+            .map_err(|error| format!("preferences: {error}"))
+            .and_then(|_| {
+                accounts.iter().try_for_each(|account| {
+                    database
+                        .save_account(account)
+                        .map(|_| ())
+                        .map_err(|error| format!("account {}: {error}", account.email))
+                })
+            });
+        let _ = sender.send_blocking(result);
+    });
+
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(())) => {
+                session.dirty.set(false);
+                save_button.set_sensitive(false);
+                status.set_text("Settings saved");
+                settings_window.close();
+                set_status(&state_for_result, "Settings saved");
+                if let Some(continuation) = continuation {
+                    continuation();
+                }
+            }
+            Ok(Err(error)) => {
+                save_button.set_sensitive(true);
+                status.set_text(&format!("Couldn’t save settings: {error}"));
+            }
+            Err(_) => {
+                save_button.set_sensitive(true);
+                status.set_text("The settings worker stopped unexpectedly.");
+            }
+        }
+    });
+}
+
+fn open_unsaved_settings_warning(
+    state: Rc<AppState>,
+    settings_window: adw::Window,
+    session: Rc<SettingsSession>,
+    save_button: gtk::Button,
+    status: gtk::Label,
+    continuation: Option<SettingsContinuation>,
+) {
+    if session.warning_open.replace(true) {
+        return;
+    }
+
+    let warning = adw::Window::builder()
+        .transient_for(&settings_window)
+        .modal(true)
+        .title("Unsaved changes")
+        .default_width(420)
+        .default_height(220)
+        .build();
+    warning.add_css_class("mail-settings-confirmation");
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.set_margin_top(24);
+    content.set_margin_bottom(20);
+    let title = gtk::Label::new(Some("Save changes to settings?"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-empty-title");
+    content.append(&title);
+    let body = gtk::Label::new(Some("You have settings that haven’t been saved yet."));
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+    body.add_css_class("mail-empty-body");
+    content.append(&body);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.add_css_class("mail-settings-confirmation-actions");
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("mail-secondary-button");
+    let discard = gtk::Button::with_label("Don’t Save");
+    discard.add_css_class("mail-secondary-button");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("mail-accent-button");
+    actions.append(&cancel);
+    actions.append(&discard);
+    actions.append(&save);
+    content.append(&actions);
+    warning.set_content(Some(&content));
+
+    let session_for_close = session.clone();
+    warning.connect_close_request(move |_| {
+        session_for_close.warning_open.set(false);
+        glib::Propagation::Proceed
+    });
+
+    let warning_for_cancel = warning.clone();
+    cancel.connect_clicked(move |_| warning_for_cancel.close());
+
+    let state_for_discard = state.clone();
+    let settings_window_for_discard = settings_window.clone();
+    let session_for_discard = session.clone();
+    let warning_for_discard = warning.clone();
+    let continuation_for_discard = continuation.clone();
+    discard.connect_clicked(move |_| {
+        restore_settings_session(&state_for_discard, &session_for_discard);
+        warning_for_discard.close();
+        settings_window_for_discard.close();
+        if let Some(continuation) = continuation_for_discard.clone() {
+            continuation();
+        }
+    });
+
+    let state_for_save = state.clone();
+    let settings_window_for_save = settings_window.clone();
+    let session_for_save = session.clone();
+    let save_button_for_save = save_button.clone();
+    let status_for_save = status.clone();
+    let warning_for_save = warning.clone();
+    save.connect_clicked(move |_| {
+        warning_for_save.close();
+        save_settings_session(
+            state_for_save.clone(),
+            session_for_save.clone(),
+            settings_window_for_save.clone(),
+            save_button_for_save.clone(),
+            status_for_save.clone(),
+            continuation.clone(),
+        );
+    });
+
+    let warning_for_escape = warning.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            warning_for_escape.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    warning.add_controller(key_controller);
+    warning.present();
+}
+
 fn open_settings(state: Rc<AppState>) {
+    let original_account_notifications = state
+        .accounts
+        .borrow()
+        .iter()
+        .filter_map(|account| account.id.map(|id| (id, account.notify)))
+        .collect::<HashMap<_, _>>();
+    let session = Rc::new(SettingsSession {
+        original_preferences: state.preferences.borrow().clone(),
+        original_account_notifications,
+        dirty: Cell::new(false),
+        warning_open: Cell::new(false),
+    });
     let window = adw::Window::builder()
         .transient_for(&state.window)
         .modal(true)
@@ -5489,6 +5698,14 @@ fn open_settings(state: Rc<AppState>) {
         .default_height(720)
         .build();
     window.add_css_class("mail-settings-window");
+    let save_button = gtk::Button::with_label("Save Changes");
+    save_button.add_css_class("mail-accent-button");
+    save_button.set_sensitive(false);
+    let settings_status = gtk::Label::new(Some("Changes are saved when you choose Save Changes."));
+    settings_status.set_xalign(0.0);
+    settings_status.set_hexpand(true);
+    settings_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    settings_status.add_css_class("mail-status");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("mail-settings-root");
     root.set_spacing(16);
@@ -5554,56 +5771,61 @@ fn open_settings(state: Rc<AppState>) {
         let settings_window_for_edit = window.clone();
         let state_for_edit = state.clone();
         let account_for_edit = account.clone();
+        let session_for_edit = session.clone();
+        let save_button_for_edit = save_button.clone();
+        let settings_status_for_edit = settings_status.clone();
         edit.connect_clicked(move |_| {
-            settings_window_for_edit.close();
-            open_account_editor(state_for_edit.clone(), account_for_edit.clone());
+            let state_for_account_editor = state_for_edit.clone();
+            let account_for_account_editor = account_for_edit.clone();
+            let open_editor: SettingsContinuation = Rc::new(move || {
+                open_account_editor(
+                    state_for_account_editor.clone(),
+                    account_for_account_editor.clone(),
+                );
+            });
+            if session_for_edit.dirty.get() {
+                open_unsaved_settings_warning(
+                    state_for_edit.clone(),
+                    settings_window_for_edit.clone(),
+                    session_for_edit.clone(),
+                    save_button_for_edit.clone(),
+                    settings_status_for_edit.clone(),
+                    Some(open_editor),
+                );
+            } else {
+                settings_window_for_edit.close();
+                open_editor();
+            }
         });
         header.append(&edit);
-        let notify_label = gtk::Label::new(Some("Notify"));
+        let notify_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        notify_row.add_css_class("mail-settings-account-toggle");
+        let notify_label = gtk::Label::new(Some("New mail notifications"));
+        notify_label.set_xalign(0.0);
+        notify_label.set_hexpand(true);
         notify_label.add_css_class("mail-reader-meta");
         let notify = gtk::Switch::new();
         notify.set_active(account.notify);
         notify.set_tooltip_text(Some("Allow new-mail notifications for this account"));
         let state_for_notify = state.clone();
-        let account_for_notify = account.clone();
+        let session_for_notify = session.clone();
+        let save_button_for_notify = save_button.clone();
+        let account_id_for_notify = account.id;
         notify.connect_active_notify(move |switcher| {
-            let mut updated = account_for_notify.clone();
-            updated.notify = switcher.is_active();
-            let database = state_for_notify.database.clone();
-            let state = state_for_notify.clone();
-            let (sender, receiver) = async_channel::bounded(1);
-            std::thread::spawn(move || {
-                let result = database
-                    .save_account(&updated)
-                    .map(|_| updated)
-                    .map_err(|error| error.to_string());
-                let _ = sender.send_blocking(result);
-            });
-            glib::MainContext::default().spawn_local(async move {
-                match receiver.recv().await {
-                    Ok(Ok(updated)) => {
-                        if let Some(stored) = state
-                            .accounts
-                            .borrow_mut()
-                            .iter_mut()
-                            .find(|stored| stored.id == updated.id)
-                        {
-                            stored.notify = updated.notify;
-                        }
-                    }
-                    Ok(Err(error)) => set_status(
-                        &state,
-                        &format!("Couldn’t save notification setting: {error}"),
-                    ),
-                    Err(_) => set_status(
-                        &state,
-                        "The notification setting worker stopped unexpectedly.",
-                    ),
+            if let Some(account_id) = account_id_for_notify {
+                if let Some(account) = state_for_notify
+                    .accounts
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|account| account.id == Some(account_id))
+                {
+                    account.notify = switcher.is_active();
+                    mark_settings_dirty(&session_for_notify, &save_button_for_notify);
                 }
-            });
+            }
         });
-        header.append(&notify_label);
-        header.append(&notify);
+        notify_row.append(&notify_label);
+        notify_row.append(&notify);
         let signature_value = state
             .preferences
             .borrow()
@@ -5652,29 +5874,24 @@ fn open_settings(state: Rc<AppState>) {
         signature_overlay.add_overlay(&signature_placeholder);
         signature_field.append(&signature_overlay);
         let state_for_signature = state.clone();
+        let session_for_signature = session.clone();
+        let save_button_for_signature = save_button.clone();
         let email_for_signature = account.email.clone();
         let signature_for_callback = signature.clone();
         let placeholder_for_signature = signature_placeholder.clone();
         signature.buffer().connect_changed(move |_| {
-            let result = {
-                let mut preferences = state_for_signature.preferences.borrow_mut();
-                let value = text_view_contents(&signature_for_callback);
-                placeholder_for_signature.set_visible(value.trim().is_empty());
-                if value.trim().is_empty() {
-                    preferences.signatures.remove(&email_for_signature);
-                } else {
-                    preferences
-                        .signatures
-                        .insert(email_for_signature.clone(), value);
-                }
-                preferences::save(&preferences)
-            };
-            if let Err(error) = result {
-                set_status(
-                    &state_for_signature,
-                    &format!("Couldn’t save preferences: {error}"),
-                );
+            let mut preferences = state_for_signature.preferences.borrow_mut();
+            let value = text_view_contents(&signature_for_callback);
+            placeholder_for_signature.set_visible(value.trim().is_empty());
+            if value.trim().is_empty() {
+                preferences.signatures.remove(&email_for_signature);
+            } else {
+                preferences
+                    .signatures
+                    .insert(email_for_signature.clone(), value);
             }
+            drop(preferences);
+            mark_settings_dirty(&session_for_signature, &save_button_for_signature);
         });
         let remove = gtk::Button::with_label("Remove");
         remove.add_css_class("mail-danger-button");
@@ -5744,6 +5961,7 @@ fn open_settings(state: Rc<AppState>) {
             });
         });
         row.append(&header);
+        row.append(&notify_row);
         row.append(&signature_field);
         let account_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         account_actions.set_halign(gtk::Align::End);
@@ -5761,12 +5979,16 @@ fn open_settings(state: Rc<AppState>) {
     root.append(&reading);
     root.append(&preference_switch_row(
         &state,
+        &session,
+        &save_button,
         "Block remote images by default",
         state.preferences.borrow().block_remote_images,
         |preferences, active| preferences.block_remote_images = active,
     ));
     root.append(&preference_switch_row(
         &state,
+        &session,
+        &save_button,
         "Group messages into conversations",
         state.preferences.borrow().conversation_view,
         |preferences, active| preferences.conversation_view = active,
@@ -5779,6 +6001,8 @@ fn open_settings(state: Rc<AppState>) {
     root.append(&notifications);
     root.append(&preference_switch_row(
         &state,
+        &session,
+        &save_button,
         "New mail notifications",
         state.preferences.borrow().notifications_enabled,
         |preferences, active| preferences.notifications_enabled = active,
@@ -5791,18 +6015,73 @@ fn open_settings(state: Rc<AppState>) {
     root.append(&composing);
     root.append(&preference_switch_row(
         &state,
+        &session,
+        &save_button,
         "Ask before sending in plain text",
         state.preferences.borrow().plain_text_warning,
         |preferences, active| preferences.plain_text_warning = active,
     ));
 
-    let close = gtk::Button::with_label("Done");
-    close.add_css_class("mail-accent-button");
-    close.set_halign(gtk::Align::End);
-    close.set_margin_top(4);
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    footer.add_css_class("mail-settings-footer");
+    footer.set_margin_top(8);
+    footer.append(&settings_status);
+    let close = gtk::Button::with_label("Close");
+    close.add_css_class("mail-secondary-button");
     let window_for_close = window.clone();
     close.connect_clicked(move |_| window_for_close.close());
-    root.append(&close);
+    footer.append(&close);
+    save_button.set_halign(gtk::Align::End);
+    let state_for_save = state.clone();
+    let session_for_save = session.clone();
+    let window_for_save = window.clone();
+    let save_button_for_save = save_button.clone();
+    let settings_status_for_save = settings_status.clone();
+    save_button.connect_clicked(move |_| {
+        save_settings_session(
+            state_for_save.clone(),
+            session_for_save.clone(),
+            window_for_save.clone(),
+            save_button_for_save.clone(),
+            settings_status_for_save.clone(),
+            None,
+        );
+    });
+    footer.append(&save_button);
+    root.append(&footer);
+
+    let state_for_close_request = state.clone();
+    let session_for_close_request = session.clone();
+    let save_button_for_close_request = save_button.clone();
+    let settings_status_for_close_request = settings_status.clone();
+    window.connect_close_request(move |window| {
+        if session_for_close_request.dirty.get() {
+            open_unsaved_settings_warning(
+                state_for_close_request.clone(),
+                window.clone(),
+                session_for_close_request.clone(),
+                save_button_for_close_request.clone(),
+                settings_status_for_close_request.clone(),
+                None,
+            );
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+
+    let window_for_escape = window.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            window_for_escape.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key_controller);
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
@@ -7202,7 +7481,14 @@ fn append_attachment_chip(list: &gtk::Box, filename: &str) {
     list.append(&chip);
 }
 
-fn preference_switch_row<F>(state: &Rc<AppState>, label: &str, active: bool, setter: F) -> gtk::Box
+fn preference_switch_row<F>(
+    state: &Rc<AppState>,
+    session: &Rc<SettingsSession>,
+    save_button: &gtk::Button,
+    label: &str,
+    active: bool,
+    setter: F,
+) -> gtk::Box
 where
     F: Fn(&mut preferences::Preferences, bool) + 'static,
 {
@@ -7215,15 +7501,13 @@ where
     switcher.set_valign(gtk::Align::Center);
     switcher.set_active(active);
     let state = state.clone();
+    let session = session.clone();
+    let save_button = save_button.clone();
     switcher.connect_active_notify(move |switcher| {
-        let result = {
-            let mut preferences = state.preferences.borrow_mut();
-            setter(&mut preferences, switcher.is_active());
-            preferences::save(&preferences)
-        };
-        if let Err(error) = result {
-            set_status(&state, &format!("Couldn’t save preferences: {error}"));
-        }
+        let mut preferences = state.preferences.borrow_mut();
+        setter(&mut preferences, switcher.is_active());
+        drop(preferences);
+        mark_settings_dirty(&session, &save_button);
     });
     row.append(&text);
     row.append(&switcher);

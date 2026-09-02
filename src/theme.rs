@@ -157,7 +157,11 @@ window.omarchy-mail-window {{
 .mail-settings-account-list {{ margin-top: 2px; }}
 .mail-settings-account-card {{ background: alpha(@om-dark-background, 0.46); border: 1px solid alpha(@om-muted, 0.22); border-radius: 14px; padding: 14px; }}
 .mail-settings-account-header {{ min-height: 42px; }}
+.mail-settings-account-toggle {{ border-top: 1px solid alpha(@om-muted, 0.18); padding-top: 10px; margin-top: 8px; }}
 .mail-settings-account-actions {{ margin-top: 2px; }}
+.mail-settings-footer {{ border-top: 1px solid alpha(@om-muted, 0.2); padding-top: 12px; }}
+.mail-settings-confirmation {{ background: @om-dark-background; }}
+.mail-settings-confirmation-actions {{ margin-top: 4px; }}
 .mail-settings-field-title {{ color: @om-light-foreground; font-weight: 700; }}
 .mail-settings-field-hint {{ color: @om-muted; font-size: 0.88em; }}
 .mail-settings-signature-field {{ background: alpha(@om-darker-background, 0.2); border-radius: 10px; padding: 10px; margin-top: 4px; }}
