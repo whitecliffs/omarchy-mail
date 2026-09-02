@@ -6069,14 +6069,13 @@ fn open_composer_link_dialog(
         status.set_text("Select some text before adding a link.");
         return;
     }
-    let dialog = gtk::Dialog::builder()
+    let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
         .title("Add link")
+        .default_width(420)
         .build();
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Add link", gtk::ResponseType::Accept);
-    let content = dialog.content_area();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_spacing(10);
     content.set_margin_start(18);
     content.set_margin_end(18);
@@ -6085,34 +6084,55 @@ fn open_composer_link_dialog(
     let entry = gtk::Entry::builder()
         .placeholder_text("https://example.com")
         .build();
-    content.append(&gtk::Label::new(Some("Link address")));
+    let label = gtk::Label::new(Some("Link address"));
+    label.set_xalign(0.0);
+    label.set_mnemonic_widget(Some(&entry));
+    content.append(&label);
     content.append(&entry);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let add = gtk::Button::with_label("Add link");
+    add.add_css_class("suggested-action");
+    actions.append(&cancel);
+    actions.append(&add);
+    content.append(&actions);
+    dialog.set_content(Some(&content));
     let buffer = body.buffer();
     let start_offset = start.offset();
     let end_offset = end.offset();
     let formatting = formatting.clone();
     let status = status.clone();
     let on_changed = on_changed.clone();
-    dialog.connect_response(move |dialog, response| {
-        if response == gtk::ResponseType::Accept {
-            let url = entry.text().trim().to_string();
-            if !(url.starts_with("https://")
-                || url.starts_with("http://")
-                || url.starts_with("mailto:"))
-            {
-                status.set_text("Use an http(s) or mailto link.");
-                return;
-            }
-            let tag = composer_link_tag(&formatting, &url);
-            let start = buffer.iter_at_offset(start_offset);
-            let end = buffer.iter_at_offset(end_offset);
-            buffer.apply_tag(&tag, &start, &end);
-            status.set_text("Link added");
-            on_changed();
+    let dialog_for_cancel = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(dialog) = dialog_for_cancel.upgrade() {
+            dialog.close();
         }
-        dialog.close();
+    });
+    let dialog_for_add = dialog.downgrade();
+    let entry_for_add = entry.clone();
+    add.connect_clicked(move |_| {
+        let url = entry_for_add.text().trim().to_string();
+        if !(url.starts_with("https://")
+            || url.starts_with("http://")
+            || url.starts_with("mailto:"))
+        {
+            status.set_text("Use an http(s) or mailto link.");
+            return;
+        }
+        let tag = composer_link_tag(&formatting, &url);
+        let start = buffer.iter_at_offset(start_offset);
+        let end = buffer.iter_at_offset(end_offset);
+        buffer.apply_tag(&tag, &start, &end);
+        status.set_text("Link added");
+        on_changed();
+        if let Some(dialog) = dialog_for_add.upgrade() {
+            dialog.close();
+        }
     });
     dialog.present();
+    entry.grab_focus();
 }
 
 #[derive(Debug)]
