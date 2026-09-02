@@ -722,11 +722,17 @@ fn queue_move_action(state: &Rc<AppState>, action: UndoAction, status_text: Stri
                 arm_undo(&state_for_result, action);
                 set_status(&state_for_result, &status_text);
             }
-            Ok(Err(error)) => set_status(
-                &state_for_result,
-                &format!("Couldn’t queue that move: {error}"),
-            ),
-            Err(_) => set_status(&state_for_result, "The move worker stopped unexpectedly."),
+            Ok(Err(error)) => {
+                refresh_cached_view(&state_for_result);
+                set_status(
+                    &state_for_result,
+                    &format!("Couldn’t queue that move: {error}"),
+                );
+            }
+            Err(_) => {
+                refresh_cached_view(&state_for_result);
+                set_status(&state_for_result, "The move worker stopped unexpectedly.");
+            }
         }
     });
 }
@@ -2912,14 +2918,39 @@ fn apply_bulk_move(state: &Rc<AppState>, target_folder: &str) {
         return;
     }
     let database = state.database.clone();
+    let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
+        let mut errors = Vec::new();
         for (message_id, account_id, source_folder, target_folder) in updates {
-            let _ = database.move_message_and_queue_action(
+            if let Err(error) = database.move_message_and_queue_action(
                 account_id,
                 message_id,
                 &source_folder,
                 &target_folder,
-            );
+            ) {
+                errors.push(error.to_string());
+            }
+        }
+        let _ = sender.send_blocking(errors);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(errors) if errors.is_empty() => {}
+            Ok(errors) => {
+                refresh_cached_view(&state_for_result);
+                set_status(
+                    &state_for_result,
+                    &format!("Some moves could not be queued: {}", errors.join(" · ")),
+                );
+            }
+            Err(_) => {
+                refresh_cached_view(&state_for_result);
+                set_status(
+                    &state_for_result,
+                    "The batch move worker stopped unexpectedly.",
+                );
+            }
         }
     });
     clear_selected_rows(state);
