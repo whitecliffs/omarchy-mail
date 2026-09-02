@@ -408,6 +408,17 @@ impl Database {
         self.list_messages_filtered(account_id, Some(folder), false)
     }
 
+    pub fn unread_count(&self, account_id: Option<i64>, folder: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let count = connection.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE (?1 IS NULL OR account_id = ?1) AND folder = ?2 AND unread = 1",
+            params![account_id, folder],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn list_messages_filtered(
         &self,
         account_id: Option<i64>,
@@ -934,6 +945,19 @@ mod tests {
             .search_messages("garden OR 1=1")
             .expect("quoted search");
         assert!(punctuation.is_empty());
+    }
+
+    #[test]
+    fn counts_unread_messages_by_mailbox() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        database
+            .upsert_messages(&Message::demo_messages())
+            .expect("insert messages");
+
+        assert_eq!(database.unread_count(None, "Inbox").expect("count"), 2);
+        database.set_unread(1, false).expect("mark read");
+        assert_eq!(database.unread_count(None, "Inbox").expect("count"), 1);
     }
 
     #[test]

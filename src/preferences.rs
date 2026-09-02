@@ -17,6 +17,8 @@ pub struct Preferences {
     pub signatures: HashMap<String, String>,
     #[serde(default)]
     pub allowed_remote_image_senders: Vec<String>,
+    #[serde(default)]
+    pub collapsed_accounts: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -27,6 +29,7 @@ impl Default for Preferences {
             plain_text_warning: false,
             signatures: HashMap::new(),
             allowed_remote_image_senders: Vec::new(),
+            collapsed_accounts: Vec::new(),
         }
     }
 }
@@ -64,6 +67,28 @@ impl Preferences {
         self.allowed_remote_image_senders
             .push(sender_email.to_ascii_lowercase());
         self.allowed_remote_image_senders.sort_unstable();
+    }
+
+    pub fn account_is_collapsed(&self, email: &str) -> bool {
+        self.collapsed_accounts
+            .iter()
+            .any(|account| account.eq_ignore_ascii_case(email.trim()))
+    }
+
+    pub fn set_account_collapsed(&mut self, email: &str, collapsed: bool) {
+        let email = email.trim();
+        if email.is_empty() {
+            return;
+        }
+        if collapsed {
+            if !self.account_is_collapsed(email) {
+                self.collapsed_accounts.push(email.to_ascii_lowercase());
+                self.collapsed_accounts.sort_unstable();
+            }
+        } else {
+            self.collapsed_accounts
+                .retain(|account| !account.eq_ignore_ascii_case(email));
+        }
     }
 }
 
@@ -143,5 +168,15 @@ mod tests {
             preferences.allowed_remote_image_senders,
             vec!["jane@example.com"]
         );
+    }
+
+    #[test]
+    fn remembers_collapsed_accounts_by_email() {
+        let mut preferences = Preferences::default();
+        assert!(!preferences.account_is_collapsed("Jim@Example.com"));
+        preferences.set_account_collapsed(" Jim@Example.com ", true);
+        assert!(preferences.account_is_collapsed("jim@example.com"));
+        preferences.set_account_collapsed("jim@example.com", false);
+        assert!(!preferences.account_is_collapsed("jim@example.com"));
     }
 }

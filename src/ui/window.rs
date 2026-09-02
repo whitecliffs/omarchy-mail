@@ -37,6 +37,7 @@ struct AppState {
     scope: RefCell<MailScope>,
     search_filters: RefCell<SearchFilters>,
     selected_message: RefCell<Option<i64>>,
+    account_expanded: RefCell<HashMap<i64, bool>>,
     narrow_mode: Cell<bool>,
     mobile_mode: Cell<bool>,
     sidebar_revealed: Cell<bool>,
@@ -156,6 +157,7 @@ pub fn build_window(application: &adw::Application) {
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
         search_filters: RefCell::new(SearchFilters::default()),
         selected_message: RefCell::new(None),
+        account_expanded: RefCell::new(HashMap::new()),
         narrow_mode: Cell::new(false),
         mobile_mode: Cell::new(false),
         sidebar_revealed: Cell::new(false),
@@ -564,10 +566,22 @@ fn render_sidebar(state: &Rc<AppState>) {
             .list_messages_filtered(None, Some("Inbox"), false)
             .unwrap_or_else(|_| state.messages.borrow().clone())
     };
-    let unread = inbox_messages
-        .iter()
-        .filter(|message| message.unread)
-        .count();
+    let unread = if state.demo_mode {
+        inbox_messages
+            .iter()
+            .filter(|message| message.unread)
+            .count()
+    } else {
+        state
+            .database
+            .unread_count(None, "Inbox")
+            .unwrap_or_else(|_| {
+                inbox_messages
+                    .iter()
+                    .filter(|message| message.unread)
+                    .count()
+            })
+    };
     let outbox_count = if state.demo_mode {
         0
     } else {
@@ -644,11 +658,23 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
     title.append(&name);
     let expander = gtk::Expander::new(None);
     expander.set_label_widget(Some(&title));
-    expander.set_expanded(true);
 
     let Some(account_id) = account.id else {
+        expander.set_expanded(true);
         return expander;
     };
+    let expanded = state
+        .account_expanded
+        .borrow()
+        .get(&account_id)
+        .copied()
+        .unwrap_or_else(|| {
+            !state
+                .preferences
+                .borrow()
+                .account_is_collapsed(&account.email)
+        });
+    expander.set_expanded(expanded);
     let known_folders = state
         .folders
         .borrow()
@@ -668,10 +694,16 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
                 .map(|sends| Some(sends.len()))
                 .unwrap_or(Some(0))
         } else {
-            known_folders
-                .iter()
-                .find(|folder| folder.name.eq_ignore_ascii_case(name))
-                .map(|folder| folder.unread_count as usize)
+            state
+                .database
+                .unread_count(Some(account_id), name)
+                .ok()
+                .or_else(|| {
+                    known_folders
+                        .iter()
+                        .find(|folder| folder.name.eq_ignore_ascii_case(name))
+                        .map(|folder| folder.unread_count as usize)
+                })
         };
         folders.append(&sidebar_action_row(
             &state,
@@ -697,7 +729,11 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
                 &state,
                 &folder.name,
                 "folder-symbolic",
-                Some(folder.unread_count as usize),
+                state
+                    .database
+                    .unread_count(Some(account_id), &folder.name)
+                    .ok()
+                    .or(Some(folder.unread_count as usize)),
                 MailScope::Account {
                     id: account_id,
                     folder: folder.name.clone(),
@@ -708,6 +744,18 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
         folders.append(&custom_expander);
     }
     expander.set_child(Some(&folders));
+    let account_email = account.email.clone();
+    let state_for_expander = state.clone();
+    expander.connect_expanded_notify(move |expander| {
+        let expanded = expander.is_expanded();
+        state_for_expander
+            .account_expanded
+            .borrow_mut()
+            .insert(account_id, expanded);
+        let mut preferences = state_for_expander.preferences.borrow_mut();
+        preferences.set_account_collapsed(&account_email, !expanded);
+        let _ = preferences::save(&preferences);
+    });
     expander
 }
 
@@ -741,6 +789,9 @@ fn sidebar_action_row(
     scope: MailScope,
 ) -> gtk::Button {
     let row = sidebar_row(label, icon, count);
+    if *state.scope.borrow() == scope {
+        row.add_css_class("selected");
+    }
     let button = gtk::Button::new();
     button.set_has_frame(false);
     button.set_halign(gtk::Align::Fill);
@@ -1811,6 +1862,7 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 10);
         empty.set_valign(gtk::Align::Center);
         empty.set_halign(gtk::Align::Center);
+        empty.set_margin_top(72);
         let title = gtk::Label::new(Some("Select a message to read it"));
         title.add_css_class("mail-empty-title");
         let body = gtk::Label::new(Some("Your conversations will appear here."));

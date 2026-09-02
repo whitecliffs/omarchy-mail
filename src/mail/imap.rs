@@ -523,7 +523,7 @@ fn sync_client<T: Read + Write>(
     discover_folders: bool,
 ) -> Result<SyncSnapshot, ImapError> {
     let mut session = authenticate(client, account, auth)?;
-    let folders = if discover_folders {
+    let mut folders = if discover_folders {
         session
             .list(None, Some("*"))
             .map_err(|error| ImapError::Protocol(error.to_string()))?
@@ -540,6 +540,16 @@ fn sync_client<T: Read + Write>(
     let uids = session
         .uid_search("ALL")
         .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let unread_count = session
+        .uid_search("UNSEEN")
+        .map_err(|error| ImapError::Protocol(error.to_string()))?
+        .len() as u32;
+    if let Some(folder) = folders
+        .iter_mut()
+        .find(|folder| folder.remote_name.eq_ignore_ascii_case(remote_name))
+    {
+        folder.unread_count = unread_count;
+    }
     let mut all_uids = uids.into_iter().collect::<Vec<_>>();
     all_uids.sort_unstable_by(|left, right| right.cmp(left));
     let mut selected = all_uids.clone();
@@ -553,7 +563,7 @@ fn sync_client<T: Read + Write>(
     let mut skipped_messages = 0;
     if !sequence.is_empty() {
         let fetches = session
-            .uid_fetch(sequence, "(RFC822 FLAGS INTERNALDATE)")
+            .uid_fetch(sequence, "(BODY.PEEK[] FLAGS INTERNALDATE)")
             .map_err(|error| ImapError::Protocol(error.to_string()))?;
         for fetch in fetches.iter() {
             match message_from_fetch(fetch, account.id, uidvalidity, local_name) {
@@ -595,7 +605,7 @@ fn fetch_message_client<T: Read + Write>(
         ));
     }
     let fetches = session
-        .uid_fetch(remote_uid.to_string(), "(RFC822 FLAGS INTERNALDATE)")
+        .uid_fetch(remote_uid.to_string(), "(BODY.PEEK[] FLAGS INTERNALDATE)")
         .map_err(|error| ImapError::Protocol(error.to_string()))?;
     let message = fetches
         .iter()
@@ -871,7 +881,17 @@ mod tests {
         assert_eq!(snapshot.messages[0].subject, "A newsletter with images");
         assert_eq!(snapshot.messages[1].remote_uid, Some(1));
         assert_eq!(snapshot.messages[1].subject, "Welcome 😀");
+        assert!(snapshot.messages[1].unread);
+        assert!(!snapshot.messages[0].unread);
         assert!(snapshot.messages[1].starred);
+        assert_eq!(
+            snapshot
+                .folders
+                .iter()
+                .find(|folder| folder.name == "Inbox")
+                .map(|folder| folder.unread_count),
+            Some(1)
+        );
         assert!(snapshot.folders.iter().any(|folder| folder.kind == "sent"));
     }
 
@@ -915,10 +935,15 @@ mod tests {
                     write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
                 }
                 "UID" if line.to_ascii_uppercase().contains("SEARCH") => {
-                    stream.write_all(b"* SEARCH 1 2\r\n")?;
+                    if line.to_ascii_uppercase().contains("UNSEEN") {
+                        stream.write_all(b"* SEARCH 1\r\n")?;
+                    } else {
+                        stream.write_all(b"* SEARCH 1 2\r\n")?;
+                    }
                     write_tagged(&mut stream, tag, "OK UID SEARCH completed")?;
                 }
                 "UID" if line.to_ascii_uppercase().contains("FETCH") => {
+                    assert!(line.to_ascii_uppercase().contains("BODY.PEEK[]"));
                     write_fetch(
                         &mut stream,
                         2,
