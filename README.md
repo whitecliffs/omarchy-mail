@@ -28,6 +28,10 @@ server-safe Move to… and Copy to… destinations, while each account exposes
 custom-folder create, rename, and delete operations. Message lists support
 multi-selection with batch read/unread, star, archive, and trash actions, and
 load cached folders in bounded 100-message pages.
+Pane widths are remembered in the local preferences file, and message-list
+keyboard commands include reply (`r`), forward (`f`), archive (`a`), trash
+(`Delete`), read/unread (`u`), star (`s`), refresh (`Ctrl+R`), and compose
+(`Ctrl+N`).
 
 Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
 refreshes the connection before common server idle limits, falls back to a

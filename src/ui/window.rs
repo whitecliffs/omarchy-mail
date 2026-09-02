@@ -101,6 +101,7 @@ pub fn build_window(application: &adw::Application) {
         Database::open_default().expect("Omarchy Mail could not open its local database");
     let accounts = database.load_accounts().unwrap_or_default();
     let folders = database.load_folders().unwrap_or_default();
+    let preferences = preferences::load();
     let demo_mode = std::env::var("OMARCHY_MAIL_DEMO").as_deref() == Ok("1");
     let (monitor_sender, monitor_receiver) = async_channel::unbounded();
     let (outbox_sender, outbox_receiver) = async_channel::unbounded();
@@ -175,7 +176,7 @@ pub fn build_window(application: &adw::Application) {
 
     let content = gtk::Paned::new(gtk::Orientation::Horizontal);
     content.set_wide_handle(true);
-    content.set_position(258);
+    content.set_position(preferences.sidebar_width.clamp(220, 420));
     content.set_start_child(Some(&sidebar_scroll));
     content.set_resize_start_child(false);
     content.set_shrink_start_child(true);
@@ -193,7 +194,7 @@ pub fn build_window(application: &adw::Application) {
         window: window.clone(),
         database,
         accounts: RefCell::new(accounts),
-        preferences: RefCell::new(preferences::load()),
+        preferences: RefCell::new(preferences),
         folders: RefCell::new(folders),
         messages: RefCell::new(messages),
         sidebar,
@@ -231,7 +232,9 @@ pub fn build_window(application: &adw::Application) {
 
     // The middle pane is inserted after the state exists so its selection can
     // route into the reader without keeping a second source of truth.
-    content.set_end_child(Some(&build_middle_and_reader(state.clone(), &middle)));
+    let reader_pane = build_middle_and_reader(state.clone(), &middle);
+    content.set_end_child(Some(&reader_pane));
+    connect_pane_persistence(&state, &content, &reader_pane);
     connect_header_actions(state.clone(), &compose, &refresh, &settings, &navigation);
     let state_for_search = state.clone();
     search.connect_search_changed(move |entry| {
@@ -329,7 +332,13 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
     let reader = state.reader.clone();
     let pane = gtk::Paned::new(gtk::Orientation::Horizontal);
     pane.set_wide_handle(true);
-    pane.set_position(440);
+    pane.set_position(
+        state
+            .preferences
+            .borrow()
+            .message_list_width
+            .clamp(300, 900),
+    );
     pane.set_start_child(Some(middle));
     pane.set_end_child(Some(&reader));
     pane.set_resize_start_child(false);
@@ -371,6 +380,70 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
         render_reader(&state_for_selection, message);
     });
     pane
+}
+
+fn connect_pane_persistence(
+    state: &Rc<AppState>,
+    sidebar_pane: &gtk::Paned,
+    message_pane: &gtk::Paned,
+) {
+    let pending_sidebar = Rc::new(RefCell::new(None));
+    let state_for_sidebar = state.clone();
+    let pending_for_sidebar = pending_sidebar.clone();
+    let sidebar_pane_for_timer = sidebar_pane.clone();
+    sidebar_pane.connect_position_notify(move |_| {
+        if pending_for_sidebar.borrow().is_some() {
+            return;
+        }
+        let state = state_for_sidebar.clone();
+        let pending = pending_for_sidebar.clone();
+        let pane = sidebar_pane_for_timer.clone();
+        let source = glib::timeout_add_local_once(Duration::from_millis(700), move || {
+            pending.borrow_mut().take();
+            let position = pane.position();
+            if position <= 0 {
+                return;
+            }
+            let result = {
+                let mut preferences = state.preferences.borrow_mut();
+                preferences.sidebar_width = position;
+                preferences::save(&preferences)
+            };
+            if let Err(error) = result {
+                set_status(&state, &format!("Couldn’t save pane width: {error}"));
+            }
+        });
+        *pending_for_sidebar.borrow_mut() = Some(source);
+    });
+
+    let pending_message = Rc::new(RefCell::new(None));
+    let state_for_message = state.clone();
+    let pending_for_message = pending_message.clone();
+    let message_pane_for_timer = message_pane.clone();
+    message_pane.connect_position_notify(move |_| {
+        if pending_for_message.borrow().is_some() {
+            return;
+        }
+        let state = state_for_message.clone();
+        let pending = pending_for_message.clone();
+        let pane = message_pane_for_timer.clone();
+        let source = glib::timeout_add_local_once(Duration::from_millis(700), move || {
+            pending.borrow_mut().take();
+            let position = pane.position();
+            if position <= 0 {
+                return;
+            }
+            let result = {
+                let mut preferences = state.preferences.borrow_mut();
+                preferences.message_list_width = position;
+                preferences::save(&preferences)
+            };
+            if let Err(error) = result {
+                set_status(&state, &format!("Couldn’t save pane width: {error}"));
+            }
+        });
+        *pending_for_message.borrow_mut() = Some(source);
+    });
 }
 
 fn apply_responsive_layout(state: &Rc<AppState>, width: i32) {
@@ -427,6 +500,37 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
         if key == gdk::Key::a && state_for_key.selected_messages.borrow().len() > 1 {
             apply_bulk_move(&state_for_key, "Archive");
             return glib::Propagation::Stop;
+        }
+        if state_for_key.message_list.has_focus() {
+            if let Some(message) = state_for_key.selected_message.borrow().and_then(|id| {
+                state_for_key
+                    .messages
+                    .borrow()
+                    .iter()
+                    .find(|message| message.id == id)
+                    .cloned()
+            }) {
+                match key {
+                    gdk::Key::r => {
+                        open_compose_with_context(
+                            state_for_key.clone(),
+                            Some(ComposeContext::Reply {
+                                message,
+                                reply_all: false,
+                            }),
+                        );
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::f => {
+                        open_compose_with_context(
+                            state_for_key.clone(),
+                            Some(ComposeContext::Forward(message)),
+                        );
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
         }
         let Some(message_id) = *state_for_key.selected_message.borrow() else {
             return glib::Propagation::Proceed;
@@ -6348,6 +6452,18 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             }
         });
     });
+    let send_for_keyboard = send.clone();
+    let send_key_controller = gtk::EventControllerKey::new();
+    send_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    send_key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::Return {
+            send_for_keyboard.emit_clicked();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(send_key_controller);
     let _ = attach;
     window.set_content(Some(&root));
     window.present();

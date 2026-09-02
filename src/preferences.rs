@@ -19,6 +19,10 @@ pub struct Preferences {
     pub allowed_remote_image_senders: Vec<String>,
     #[serde(default)]
     pub collapsed_accounts: Vec<String>,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: i32,
+    #[serde(default = "default_message_list_width")]
+    pub message_list_width: i32,
 }
 
 impl Default for Preferences {
@@ -30,6 +34,8 @@ impl Default for Preferences {
             signatures: HashMap::new(),
             allowed_remote_image_senders: Vec::new(),
             collapsed_accounts: Vec::new(),
+            sidebar_width: default_sidebar_width(),
+            message_list_width: default_message_list_width(),
         }
     }
 }
@@ -130,6 +136,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_sidebar_width() -> i32 {
+    258
+}
+
+fn default_message_list_width() -> i32 {
+    440
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +154,8 @@ mod tests {
         assert!(preferences.block_remote_images);
         assert!(preferences.conversation_view);
         assert!(!preferences.plain_text_warning);
+        assert_eq!(preferences.sidebar_width, 258);
+        assert_eq!(preferences.message_list_width, 440);
     }
 
     #[test]
@@ -178,5 +194,14 @@ mod tests {
         assert!(preferences.account_is_collapsed("jim@example.com"));
         preferences.set_account_collapsed("jim@example.com", false);
         assert!(!preferences.account_is_collapsed("jim@example.com"));
+    }
+
+    #[test]
+    fn older_preference_files_receive_pane_defaults() {
+        let preferences: Preferences =
+            serde_json::from_str(r#"{"block_remote_images":false,"conversation_view":true}"#)
+                .expect("legacy preferences should deserialize");
+        assert_eq!(preferences.sidebar_width, 258);
+        assert_eq!(preferences.message_list_width, 440);
     }
 }

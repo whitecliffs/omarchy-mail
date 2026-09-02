@@ -39,8 +39,8 @@ without making the GTK main loop responsible for network activity.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the desktop experience, including adaptive pane
-  navigation and composable local search filters. Network and disk work stays
-  outside the GTK event loop.
+  navigation, persisted pane geometry, keyboard actions, and composable local
+  search filters. Network and disk work stays outside the GTK event loop.
 
 ## Data boundaries
 
