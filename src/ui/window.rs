@@ -52,6 +52,9 @@ struct AppState {
     selection_bar: gtk::Box,
     selection_count: gtk::Label,
     selected_messages: RefCell<HashSet<i64>>,
+    undo_button: gtk::Button,
+    undo_action: RefCell<Option<UndoAction>>,
+    undo_generation: Cell<u64>,
     load_more: gtk::Button,
     message_offset: Cell<usize>,
     has_more_messages: Cell<bool>,
@@ -83,6 +86,14 @@ enum FolderOperation {
         local_name: String,
         remote_name: String,
     },
+}
+
+#[derive(Clone, Debug)]
+struct UndoAction {
+    account_id: i64,
+    message_id: i64,
+    source_folder: String,
+    target_folder: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,7 +137,7 @@ pub fn build_window(application: &adw::Application) {
     status.set_margin_start(12);
     status.set_margin_end(12);
 
-    let (header, compose, refresh, settings, navigation) = build_header(&status);
+    let (header, compose, refresh, settings, navigation, undo_button) = build_header(&status);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.add_css_class("mail-sidebar");
@@ -220,6 +231,9 @@ pub fn build_window(application: &adw::Application) {
         selection_bar,
         selection_count,
         selected_messages: RefCell::new(HashSet::new()),
+        undo_button,
+        undo_action: RefCell::new(None),
+        undo_generation: Cell::new(0),
         load_more,
         message_offset: Cell::new(if demo_mode {
             Message::demo_messages().len()
@@ -235,6 +249,10 @@ pub fn build_window(application: &adw::Application) {
     let reader_pane = build_middle_and_reader(state.clone(), &middle);
     content.set_end_child(Some(&reader_pane));
     connect_pane_persistence(&state, &content, &reader_pane);
+    let state_for_undo = state.clone();
+    state
+        .undo_button
+        .connect_clicked(move |_| undo_last_action(&state_for_undo));
     connect_header_actions(state.clone(), &compose, &refresh, &settings, &navigation);
     let state_for_search = state.clone();
     search.connect_search_changed(move |entry| {
@@ -282,6 +300,7 @@ fn build_header(
     gtk::Button,
     gtk::Button,
     gtk::Button,
+    gtk::Button,
 ) {
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Omarchy Mail", "Email without the clutter");
@@ -301,8 +320,13 @@ fn build_header(
     let settings = icon_button("emblem-system-symbolic", "Settings");
     settings.set_widget_name("settings-button");
     header.pack_end(&settings);
+    let undo = gtk::Button::with_label("Undo");
+    undo.add_css_class("mail-secondary-button");
+    undo.set_tooltip_text(Some("Undo the most recent queued move"));
+    undo.set_visible(false);
+    header.pack_end(&undo);
     header.pack_end(status);
-    (header, compose, refresh, settings, navigation)
+    (header, compose, refresh, settings, navigation, undo)
 }
 
 fn connect_header_actions(
@@ -656,6 +680,102 @@ fn clear_selected_rows(state: &Rc<AppState>) {
     state.message_list.unselect_all();
     state.selected_messages.borrow_mut().clear();
     update_selection_summary(state);
+}
+
+fn arm_undo(state: &Rc<AppState>, action: UndoAction) {
+    let generation = state.undo_generation.get().wrapping_add(1);
+    state.undo_generation.set(generation);
+    state.undo_action.replace(Some(action));
+    state.undo_button.set_visible(true);
+    let state_for_expiry = state.clone();
+    glib::timeout_add_local_once(Duration::from_secs(8), move || {
+        if state_for_expiry.undo_generation.get() == generation {
+            state_for_expiry.undo_action.replace(None);
+            state_for_expiry.undo_button.set_visible(false);
+        }
+    });
+}
+
+fn queue_move_action(state: &Rc<AppState>, action: UndoAction, status_text: String) {
+    let database = state.database.clone();
+    let action_for_worker = action.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = database
+            .move_message(
+                action_for_worker.message_id,
+                &action_for_worker.target_folder,
+            )
+            .and_then(|_| {
+                database.queue_action(
+                    Some(action_for_worker.account_id),
+                    Some(action_for_worker.message_id),
+                    "move",
+                    &serde_json::json!({
+                        "folder": action_for_worker.target_folder,
+                        "source_folder": action_for_worker.source_folder,
+                    })
+                    .to_string(),
+                )
+            });
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(())) => {
+                arm_undo(&state_for_result, action);
+                set_status(&state_for_result, &status_text);
+            }
+            Ok(Err(error)) => set_status(
+                &state_for_result,
+                &format!("Couldn’t queue that move: {error}"),
+            ),
+            Err(_) => set_status(&state_for_result, "The move worker stopped unexpectedly."),
+        }
+    });
+}
+
+fn undo_last_action(state: &Rc<AppState>) {
+    let Some(action) = state.undo_action.borrow_mut().take() else {
+        state.undo_button.set_visible(false);
+        return;
+    };
+    state
+        .undo_generation
+        .set(state.undo_generation.get().wrapping_add(1));
+    state.undo_button.set_visible(false);
+    let database = state.database.clone();
+    let target_folder = action.target_folder.clone();
+    let action_for_worker = action.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = database.undo_pending_move(
+            action_for_worker.account_id,
+            action_for_worker.message_id,
+            &action_for_worker.source_folder,
+            &action_for_worker.target_folder,
+        );
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(true)) => {
+                refresh_cached_view(&state_for_result);
+                set_status(&state_for_result, &format!("Undid move to {target_folder}"));
+            }
+            Ok(Ok(false)) => set_status(
+                &state_for_result,
+                "That move has already synchronised and can no longer be undone safely.",
+            ),
+            Ok(Err(error)) => set_status(
+                &state_for_result,
+                &format!("Couldn’t undo that move: {error}"),
+            ),
+            Err(_) => set_status(&state_for_result, "The undo worker stopped unexpectedly."),
+        }
+    });
 }
 
 fn selected_message_ids(state: &Rc<AppState>) -> Vec<i64> {
@@ -2604,25 +2724,20 @@ fn apply_message_transfer(
         {
             message.folder = target_folder.to_string();
         }
-        let database = state.database.clone();
-        let target = target_folder.to_string();
-        let source = message.folder.clone();
-        std::thread::spawn(move || {
-            let _ = database.move_message(message_id, &target);
-            let _ = database.queue_action(
-                Some(account_id),
-                Some(message_id),
-                "move",
-                &serde_json::json!({
-                    "folder": target,
-                    "source_folder": source,
-                })
-                .to_string(),
-            );
-        });
+        let source_folder = message.folder.clone();
+        let target_folder = target_folder.to_string();
+        queue_move_action(
+            state,
+            UndoAction {
+                account_id,
+                message_id,
+                source_folder,
+                target_folder: target_folder.clone(),
+            },
+            format!("Moved to {target_folder}"),
+        );
         state.selected_message.replace(None);
         render_reader(state, None);
-        set_status(state, &format!("Moved to {target_folder} — ready to undo"));
     } else {
         let database = state.database.clone();
         let source = message.folder.clone();
@@ -2811,41 +2926,46 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
                 "Trash"
             };
             let (account_id, source_folder) = {
-                let mut messages = state.messages.borrow_mut();
-                let Some(message) = messages.iter_mut().find(|message| message.id == message_id)
-                else {
+                let messages = state.messages.borrow();
+                let Some(message) = messages.iter().find(|message| message.id == message_id) else {
                     return;
                 };
                 let account_id = message.account_id;
                 let source_folder = message.folder.clone();
-                message.folder = folder.to_string();
                 (account_id, source_folder)
             };
-            let database = state.database.clone();
             let folder = folder.to_string();
-            std::thread::spawn(move || {
-                let _ = database.move_message(message_id, &folder);
-                let _ = database.queue_action(
-                    account_id,
-                    Some(message_id),
-                    "move",
-                    &serde_json::json!({
-                        "folder": folder,
-                        "source_folder": source_folder,
-                    })
-                    .to_string(),
-                );
-            });
-            set_status(
-                state,
-                if action == "archive" {
-                    "Archived — ready to undo"
+            if let Some(account_id) = account_id {
+                if let Some(message) = state
+                    .messages
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|message| message.id == message_id)
+                {
+                    message.folder = folder.clone();
+                }
+                let status = if action == "archive" {
+                    "Archived"
                 } else {
-                    "Moved to Trash — ready to undo"
-                },
-            );
-            state.selected_message.replace(None);
-            render_reader(state, None);
+                    "Moved to Trash"
+                };
+                queue_move_action(
+                    state,
+                    UndoAction {
+                        account_id,
+                        message_id,
+                        source_folder,
+                        target_folder: folder,
+                    },
+                    status.into(),
+                );
+            } else {
+                set_status(state, "This message cannot be moved on the server");
+            }
+            if account_id.is_some() {
+                state.selected_message.replace(None);
+                render_reader(state, None);
+            }
         }
         _ => {}
     }

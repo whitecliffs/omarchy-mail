@@ -853,6 +853,53 @@ impl Database {
         Ok(())
     }
 
+    /// Cancels the newest matching queued move and restores the cached folder
+    /// in one transaction. If the sync worker has already removed the action,
+    /// returning false avoids fabricating an unsafe inverse move with a UID
+    /// that may have changed on the destination mailbox.
+    pub fn undo_pending_move(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        source_folder: &str,
+        target_folder: &str,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT id, payload_json
+             FROM pending_actions
+             WHERE account_id = ?1 AND message_id = ?2 AND action = 'move'
+             ORDER BY id DESC",
+        )?;
+        let action_id = statement
+            .query_map(params![account_id, message_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| row.ok())
+            .find_map(|(id, payload)| {
+                let payload = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+                (payload
+                    .get("source_folder")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_folder)
+                    && payload.get("folder").and_then(serde_json::Value::as_str)
+                        == Some(target_folder))
+                .then_some(id)
+            });
+        drop(statement);
+        let Some(action_id) = action_id else {
+            return Ok(false);
+        };
+        transaction.execute("DELETE FROM pending_actions WHERE id = ?1", [action_id])?;
+        transaction.execute(
+            "UPDATE messages SET folder = ?1 WHERE id = ?2",
+            params![source_folder, message_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1447,6 +1494,53 @@ mod tests {
                 .pending_actions(account_id)
                 .expect("reload actions")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn undoes_a_queued_move_without_guessing_a_new_remote_uid() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("save account");
+        let mut message = Message::demo_messages().remove(0);
+        message.account_id = Some(account_id);
+        message.remote_uid = Some(42);
+        message.uidvalidity = Some(7);
+        database.upsert_messages(&[message]).expect("save message");
+        database.move_message(1, "Archive").expect("move cache");
+        database
+            .queue_action(
+                Some(account_id),
+                Some(1),
+                "move",
+                r#"{"folder":"Archive","source_folder":"Inbox"}"#,
+            )
+            .expect("queue move");
+
+        assert!(
+            database
+                .undo_pending_move(account_id, 1, "Inbox", "Archive")
+                .expect("undo move")
+        );
+        assert_eq!(
+            database
+                .list_messages(Some(account_id), "Inbox")
+                .expect("load inbox")
+                .len(),
+            1
+        );
+        assert!(
+            database
+                .pending_actions(account_id)
+                .expect("load actions")
+                .is_empty()
+        );
+        assert!(
+            !database
+                .undo_pending_move(account_id, 1, "Inbox", "Archive")
+                .expect("repeat undo")
         );
     }
 

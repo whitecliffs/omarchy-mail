@@ -134,6 +134,13 @@ it. Copy intentionally does not invent a destination UID in the cache, so the
 destination appears on its next folder refresh rather than risking duplicate
 or recycled local rows.
 
+The single-message Archive, Trash, and Move commands expose a short-lived Undo
+action. Undo is deliberately limited to a still-pending local move: it removes
+the matching pending action and restores the cached source folder in one
+transaction. It does not enqueue an inverse move after synchronization because
+IMAP COPY may assign a different destination UID, and guessing that UID could
+move the wrong message.
+
 The message list uses GTK ListBox multiple selection. Selected IDs are kept
 separately from the reader’s current message, allowing a reader to remain
 open while a batch is prepared. Batch flag changes and moves update the local

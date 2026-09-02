@@ -65,6 +65,12 @@ when the source mailbox UIDVALIDITY still matches. Custom folder mutations
 wait for the server’s CREATE, RENAME, or DELETE acknowledgement before the
 folder cache changes.
 
+Single-message Archive, Trash, and Move actions offer an eight-second Undo
+button while the operation is still queued offline. Undo cancels that pending
+action and restores the cache atomically; once the server has accepted the
+move, it reports that it is too late rather than guessing at a new destination
+UID.
+
 The main window adapts to narrow Hyprland tiles: the reader becomes a focused
 second view with a Messages back action, and very narrow windows expose the
 sidebar through a compact navigation button.
