@@ -118,6 +118,16 @@ discarding an optimistic local read/star toggle. Pending flag actions are
 reapplied after each cache refresh and remain authoritative in the UI until
 the corresponding IMAP operation succeeds.
 
+Mailbox management uses the same authority boundary. CREATE, RENAME, and
+DELETE are issued on a worker and update the local folder map only after a
+successful server response. Message Move to… and Copy to… actions carry the
+source and destination local folder names plus the source UID identity. The
+worker resolves those names to remote mailboxes, checks UIDVALIDITY, then
+performs UID COPY; Move additionally marks the source UID deleted and expunges
+it. Copy intentionally does not invent a destination UID in the cache, so the
+destination appears on its next folder refresh rather than risking duplicate
+or recycled local rows.
+
 The protocol boundary has offline socket integration coverage in the IMAP and
 SMTP modules. The tests run the production clients against temporary local
 servers, so login, folder discovery, UID FETCH literals, MIME parsing, SMTP

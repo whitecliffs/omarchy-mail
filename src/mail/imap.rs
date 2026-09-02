@@ -110,6 +110,108 @@ pub fn test_connection(account: &Account, auth: &AuthMaterial) -> Result<(), Ima
     }
 }
 
+/// Creates a mailbox on the configured IMAP server. Folder mutations are
+/// intentionally kept separate from sync: the local folder map is updated by
+/// the UI only after this operation has been acknowledged by the server.
+pub fn create_folder(
+    account: &Account,
+    auth: &AuthMaterial,
+    remote_name: &str,
+) -> Result<(), ImapError> {
+    mailbox_operation(
+        account,
+        auth,
+        MailboxOperation::Create(remote_name.to_string()),
+    )
+}
+
+/// Renames a mailbox on the configured IMAP server.
+pub fn rename_folder(
+    account: &Account,
+    auth: &AuthMaterial,
+    old_remote_name: &str,
+    new_remote_name: &str,
+) -> Result<(), ImapError> {
+    mailbox_operation(
+        account,
+        auth,
+        MailboxOperation::Rename(old_remote_name.to_string(), new_remote_name.to_string()),
+    )
+}
+
+/// Deletes a mailbox on the configured IMAP server. The caller must prevent
+/// deletion of provider-managed standard folders before reaching this layer.
+pub fn delete_folder(
+    account: &Account,
+    auth: &AuthMaterial,
+    remote_name: &str,
+) -> Result<(), ImapError> {
+    mailbox_operation(
+        account,
+        auth,
+        MailboxOperation::Delete(remote_name.to_string()),
+    )
+}
+
+#[derive(Clone)]
+enum MailboxOperation {
+    Create(String),
+    Rename(String, String),
+    Delete(String),
+}
+
+fn mailbox_operation(
+    account: &Account,
+    auth: &AuthMaterial,
+    operation: MailboxOperation,
+) -> Result<(), ImapError> {
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            mailbox_operation_client(client, account, auth, operation)
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            mailbox_operation_client(client, account, auth, operation)
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            mailbox_operation_client(client, account, auth, operation)
+        }
+    }
+}
+
+fn mailbox_operation_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    auth: &AuthMaterial,
+    operation: MailboxOperation,
+) -> Result<(), ImapError> {
+    let mut session = authenticate(client, account, auth)?;
+    let result = match operation {
+        MailboxOperation::Create(remote_name) => session
+            .create(remote_name)
+            .map_err(|error| ImapError::Protocol(error.to_string())),
+        MailboxOperation::Rename(old_remote_name, new_remote_name) => session
+            .rename(old_remote_name, new_remote_name)
+            .map_err(|error| ImapError::Protocol(error.to_string())),
+        MailboxOperation::Delete(remote_name) => session
+            .delete(remote_name)
+            .map_err(|error| ImapError::Protocol(error.to_string())),
+    };
+    let _ = session.logout();
+    result
+}
+
 fn test_authenticated_client<T: Read + Write>(
     client: imap::Client<T>,
     account: &Account,
@@ -371,7 +473,12 @@ fn reconcile_client<T: Read + Write>(
     // Flags are applied before moves. This preserves the user's intent even
     // when several actions were recorded for the same message offline and a
     // copy operation would otherwise assign it a new UID in the destination.
-    ordered_actions.sort_by_key(|action| (action.action == "move", action.id));
+    ordered_actions.sort_by_key(|action| {
+        (
+            action.action == "move" || action.action == "copy",
+            action.id,
+        )
+    });
     let mut move_sources = HashMap::new();
     for action in actions.iter().filter(|action| action.action == "move") {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(&action.payload_json) else {
@@ -445,7 +552,7 @@ fn reconcile_client<T: Read + Write>(
                     .map_err(|error| ImapError::Protocol(error.to_string()))?;
                 applied.push(action.id);
             }
-            "move" => {
+            "move" | "copy" => {
                 let Some(source_folder) = payload
                     .get("source_folder")
                     .and_then(serde_json::Value::as_str)
@@ -475,12 +582,14 @@ fn reconcile_client<T: Read + Write>(
                 session
                     .uid_copy(&uid_set, &target_remote)
                     .map_err(|error| ImapError::Protocol(error.to_string()))?;
-                session
-                    .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
-                session
-                    .uid_expunge(&uid_set)
-                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                if action.action == "move" {
+                    session
+                        .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+                        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                    session
+                        .uid_expunge(&uid_set)
+                        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                }
                 applied.push(action.id);
             }
             other => {
@@ -893,6 +1002,191 @@ mod tests {
             Some(1)
         );
         assert!(snapshot.folders.iter().any(|folder| folder.kind == "sent"));
+    }
+
+    #[test]
+    fn reconciles_a_copy_action_without_deleting_the_source_message() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake IMAP server");
+        let port = listener.local_addr().expect("server address").port();
+        let server = thread::spawn(move || run_fake_copy_server(listener));
+        let account = account_for_test_server(port);
+        let action = PendingAction {
+            id: 17,
+            account_id: 42,
+            message_id: Some(9001),
+            action: "copy".into(),
+            payload_json: r#"{"folder":"Archive","source_folder":"Inbox"}"#.into(),
+            folder: Some("Inbox".into()),
+            remote_uid: Some(12),
+            uidvalidity: Some(42),
+        };
+        let folders = vec![
+            MailFolder {
+                account_id: 42,
+                name: "Inbox".into(),
+                remote_name: "INBOX".into(),
+                kind: "inbox".into(),
+                unread_count: 0,
+            },
+            MailFolder {
+                account_id: 42,
+                name: "Archive".into(),
+                remote_name: "Archive".into(),
+                kind: "archive".into(),
+                unread_count: 0,
+            },
+        ];
+
+        let applied = reconcile_actions(
+            &account,
+            &AuthMaterial::Password("test-password".into()),
+            &[action],
+            &folders,
+        )
+        .expect("copy action");
+        server
+            .join()
+            .expect("fake IMAP server thread")
+            .expect("IMAP server");
+        assert_eq!(applied, vec![17]);
+    }
+
+    #[test]
+    fn sends_create_rename_and_delete_folder_commands_to_imap() {
+        for (operation, expected_command) in ["create", "rename", "delete"]
+            .into_iter()
+            .zip(["CREATE", "RENAME", "DELETE"])
+        {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake IMAP server");
+            let port = listener.local_addr().expect("server address").port();
+            let server = thread::spawn(move || {
+                run_fake_mailbox_operation_server(listener, expected_command)
+            });
+            let account = account_for_test_server(port);
+            let result = match operation {
+                "create" => create_folder(
+                    &account,
+                    &AuthMaterial::Password("test-password".into()),
+                    "Receipts",
+                ),
+                "rename" => rename_folder(
+                    &account,
+                    &AuthMaterial::Password("test-password".into()),
+                    "Receipts",
+                    "Invoices",
+                ),
+                "delete" => delete_folder(
+                    &account,
+                    &AuthMaterial::Password("test-password".into()),
+                    "Invoices",
+                ),
+                _ => unreachable!(),
+            };
+            result.expect("folder operation");
+            server
+                .join()
+                .expect("fake IMAP server thread")
+                .expect("IMAP server");
+        }
+    }
+
+    fn account_for_test_server(port: u16) -> Account {
+        let mut account = Account::new("jim@example.com", "Jim");
+        account.id = Some(42);
+        account.incoming = ServerConfig {
+            hostname: "127.0.0.1".into(),
+            port,
+            security: SecurityMode::None,
+            username: "jim@example.com".into(),
+            auth: crate::models::AuthMethod::Password,
+        };
+        account
+    }
+
+    fn run_fake_copy_server(listener: TcpListener) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.write_all(b"* OK Omarchy Mail test server ready\r\n")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut saw_copy = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let mut words = line.split_whitespace();
+            let Some(tag) = words.next() else {
+                continue;
+            };
+            let command = words.next().unwrap_or_default().to_ascii_uppercase();
+            match command.as_str() {
+                "LOGIN" => write_tagged(&mut stream, tag, "OK LOGIN completed")?,
+                "SELECT" => {
+                    stream.write_all(
+                        b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                          * 0 EXISTS\r\n\
+                          * 0 RECENT\r\n\
+                          * OK [UIDVALIDITY 42] UIDs valid\r\n\
+                          * OK [UIDNEXT 13] Predicted next UID\r\n",
+                    )?;
+                    write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
+                }
+                "UID" if line.to_ascii_uppercase().contains("COPY") => {
+                    saw_copy = true;
+                    write_tagged(&mut stream, tag, "OK UID COPY completed")?;
+                }
+                "LOGOUT" => {
+                    if !saw_copy {
+                        return Err(std::io::Error::other("UID COPY was not sent"));
+                    }
+                    stream.write_all(b"* BYE Logging out\r\n")?;
+                    write_tagged(&mut stream, tag, "OK LOGOUT completed")?;
+                    break;
+                }
+                _ => write_tagged(&mut stream, tag, "OK command completed")?,
+            }
+        }
+        Ok(())
+    }
+
+    fn run_fake_mailbox_operation_server(
+        listener: TcpListener,
+        expected_command: &str,
+    ) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.write_all(b"* OK Omarchy Mail test server ready\r\n")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut saw_expected = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let mut words = line.split_whitespace();
+            let Some(tag) = words.next() else {
+                continue;
+            };
+            let command = words.next().unwrap_or_default().to_ascii_uppercase();
+            if command == expected_command {
+                saw_expected = true;
+            }
+            match command.as_str() {
+                "LOGIN" => write_tagged(&mut stream, tag, "OK LOGIN completed")?,
+                "LOGOUT" => {
+                    if !saw_expected {
+                        return Err(std::io::Error::other(
+                            "expected folder command was not sent",
+                        ));
+                    }
+                    stream.write_all(b"* BYE Logging out\r\n")?;
+                    write_tagged(&mut stream, tag, "OK LOGOUT completed")?;
+                    break;
+                }
+                _ => write_tagged(&mut stream, tag, "OK command completed")?,
+            }
+        }
+        Ok(())
     }
 
     fn run_fake_imap_server(listener: TcpListener) -> std::io::Result<()> {

@@ -22,7 +22,9 @@ and SMTP can use provider-issued OAuth2 access tokens through native XOAUTH2
 transport support; provider browser authorization remains a follow-up because
 it requires provider-specific client registration. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
-mailbox UIDVALIDITY still matches the server.
+mailbox UIDVALIDITY still matches the server. Message context menus now offer
+server-safe Move to… and Copy to… destinations, while each account exposes
+custom-folder create, rename, and delete operations.
 
 Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
 refreshes the connection before common server idle limits, falls back to a
@@ -44,6 +46,13 @@ The local search index supports responsive prefix searches while treating
 typed FTS punctuation as ordinary text. During synchronisation, one malformed
 MIME message is skipped and reported without preventing the rest of the
 mailbox from being cached.
+
+Message moves and copies are account-local actions. A move updates the cached
+message immediately and queues an IMAP UID COPY plus delete/expunge; a copy
+leaves the source visible and queues only UID COPY. Both are replayed only
+when the source mailbox UIDVALIDITY still matches. Custom folder mutations
+wait for the server’s CREATE, RENAME, or DELETE acknowledgement before the
+folder cache changes.
 
 The main window adapts to narrow Hyprland tiles: the reader becomes a focused
 second view with a Messages back action, and very narrow windows expose the

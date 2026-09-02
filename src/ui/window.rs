@@ -56,6 +56,27 @@ enum MailScope {
     Account { id: i64, folder: String },
 }
 
+#[derive(Clone, Debug)]
+enum FolderOperation {
+    Create {
+        account_id: i64,
+        local_name: String,
+        remote_name: String,
+    },
+    Rename {
+        account_id: i64,
+        old_local_name: String,
+        old_remote_name: String,
+        new_local_name: String,
+        new_remote_name: String,
+    },
+    Delete {
+        account_id: i64,
+        local_name: String,
+        remote_name: String,
+    },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SearchFilters {
     unread: bool,
@@ -748,6 +769,16 @@ fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
         custom_expander.set_child(Some(&custom_rows));
         folders.append(&custom_expander);
     }
+    let new_folder = gtk::Button::with_label("New folder");
+    new_folder.set_has_frame(false);
+    new_folder.set_halign(gtk::Align::Start);
+    new_folder.set_margin_start(12);
+    new_folder.set_margin_top(4);
+    new_folder.add_css_class("mail-sidebar-secondary");
+    let state_for_new_folder = state.clone();
+    new_folder
+        .connect_clicked(move |_| open_new_folder_dialog(state_for_new_folder.clone(), account_id));
+    folders.append(&new_folder);
     expander.set_child(Some(&folders));
     let account_email = account.email.clone();
     let state_for_expander = state.clone();
@@ -802,8 +833,33 @@ fn sidebar_action_row(
     button.set_halign(gtk::Align::Fill);
     button.set_child(Some(&row));
     button.set_tooltip_text(Some(&format!("Show {label}")));
-    let state = state.clone();
-    button.connect_clicked(move |_| select_scope(&state, scope.clone()));
+    let state_for_click = state.clone();
+    let scope_for_click = scope.clone();
+    button.connect_clicked(move |_| select_scope(&state_for_click, scope_for_click.clone()));
+    if let MailScope::Account { id, folder } = &scope {
+        let account_id = *id;
+        let local_name = folder.clone();
+        let state_for_menu = state.clone();
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let Ok(button) = widget.downcast::<gtk::Button>() else {
+                return;
+            };
+            open_folder_menu(
+                state_for_menu.clone(),
+                &button,
+                account_id,
+                &local_name,
+                x,
+                y,
+            );
+        });
+        button.add_controller(gesture);
+    }
     button
 }
 
@@ -1507,6 +1563,464 @@ fn format_message_datetime(value: &str) -> String {
         .to_string()
 }
 
+fn open_folder_menu(
+    state: Rc<AppState>,
+    parent: &gtk::Button,
+    account_id: i64,
+    local_name: &str,
+    x: f64,
+    y: f64,
+) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_parent(parent);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(6);
+    menu.set_margin_bottom(6);
+    menu.set_margin_start(6);
+    menu.set_margin_end(6);
+
+    let new_folder = gtk::Button::with_label("New folder…");
+    new_folder.set_has_frame(false);
+    let state_for_new = state.clone();
+    let popover_for_new = popover.clone();
+    new_folder.connect_clicked(move |_| {
+        open_new_folder_dialog(state_for_new.clone(), account_id);
+        popover_for_new.popdown();
+    });
+    menu.append(&new_folder);
+
+    let folder = state
+        .folders
+        .borrow()
+        .iter()
+        .find(|folder| {
+            folder.account_id == account_id
+                && folder.name.eq_ignore_ascii_case(local_name)
+                && folder.kind == "custom"
+        })
+        .cloned();
+    if let Some(folder) = folder {
+        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        separator.set_margin_top(4);
+        separator.set_margin_bottom(4);
+        menu.append(&separator);
+
+        let rename = gtk::Button::with_label("Rename folder…");
+        rename.set_has_frame(false);
+        let state_for_rename = state.clone();
+        let popover_for_rename = popover.clone();
+        let folder_for_rename = folder.clone();
+        rename.connect_clicked(move |_| {
+            open_rename_folder_dialog(state_for_rename.clone(), folder_for_rename.clone());
+            popover_for_rename.popdown();
+        });
+        menu.append(&rename);
+
+        let delete = gtk::Button::with_label("Delete folder…");
+        delete.set_has_frame(false);
+        let state_for_delete = state.clone();
+        let popover_for_delete = popover.clone();
+        delete.connect_clicked(move |_| {
+            open_delete_folder_dialog(state_for_delete.clone(), folder.clone());
+            popover_for_delete.popdown();
+        });
+        menu.append(&delete);
+    }
+    popover.set_child(Some(&menu));
+    popover.popup();
+}
+
+fn open_new_folder_dialog(state: Rc<AppState>, account_id: i64) {
+    open_folder_name_dialog(state, account_id, None);
+}
+
+fn open_rename_folder_dialog(state: Rc<AppState>, folder: MailFolder) {
+    open_folder_name_dialog(state, folder.account_id, Some(folder));
+}
+
+fn open_folder_name_dialog(state: Rc<AppState>, account_id: i64, existing: Option<MailFolder>) {
+    let renaming = existing.is_some();
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title(if renaming {
+            "Rename folder"
+        } else {
+            "Create folder"
+        })
+        .default_width(460)
+        .default_height(260)
+        .build();
+    window.add_css_class("mail-dialog");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_margin_start(28);
+    root.set_margin_end(28);
+    root.set_margin_top(26);
+    root.set_margin_bottom(26);
+
+    let title = gtk::Label::new(Some(if renaming {
+        "Rename folder"
+    } else {
+        "Create a folder"
+    }));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-reader-subject");
+    root.append(&title);
+    let hint = gtk::Label::new(Some(if renaming {
+        "Choose a new name for this custom mailbox. The server will keep its folder hierarchy."
+    } else {
+        "The new mailbox will be created on your email server and appear under this account."
+    }));
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+    hint.add_css_class("mail-empty-body");
+    hint.set_margin_top(6);
+    hint.set_margin_bottom(16);
+    root.append(&hint);
+
+    let name = gtk::Entry::builder()
+        .placeholder_text("Folder name")
+        .hexpand(true)
+        .build();
+    if let Some(folder) = &existing {
+        name.set_text(&folder.name);
+    }
+    root.append(&form_row("Name", &name));
+
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("mail-danger");
+    status.set_margin_top(12);
+    root.append(&status);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.set_margin_top(18);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label(if renaming { "Rename" } else { "Create" });
+    save.add_css_class("mail-accent-button");
+    actions.append(&cancel);
+    actions.append(&save);
+    root.append(&actions);
+    window.set_content(Some(&root));
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+
+    let state_for_save = state.clone();
+    let window_for_save = window.clone();
+    let existing_for_save = existing.clone();
+    let name_for_save = name.clone();
+    let status_for_save = status.clone();
+    save.connect_clicked(move |button| {
+        let new_name = name_for_save.text().trim().to_string();
+        if new_name.is_empty() {
+            status_for_save.set_text("Enter a folder name.");
+            return;
+        }
+        let operation = if let Some(folder) = &existing_for_save {
+            if folder.name.eq_ignore_ascii_case(&new_name) {
+                status_for_save.set_text("Choose a different folder name.");
+                return;
+            }
+            FolderOperation::Rename {
+                account_id,
+                old_local_name: folder.name.clone(),
+                old_remote_name: folder.remote_name.clone(),
+                new_local_name: new_name.clone(),
+                new_remote_name: renamed_remote_name(&folder.remote_name, &new_name),
+            }
+        } else {
+            FolderOperation::Create {
+                account_id,
+                local_name: new_name.clone(),
+                remote_name: new_name,
+            }
+        };
+        start_folder_operation(
+            state_for_save.clone(),
+            operation,
+            window_for_save.clone(),
+            button.clone(),
+            status_for_save.clone(),
+        );
+    });
+
+    window.present();
+}
+
+fn open_delete_folder_dialog(state: Rc<AppState>, folder: MailFolder) {
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title("Delete folder")
+        .default_width(460)
+        .default_height(260)
+        .build();
+    window.add_css_class("mail-dialog");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_margin_start(28);
+    root.set_margin_end(28);
+    root.set_margin_top(26);
+    root.set_margin_bottom(26);
+    let title = gtk::Label::new(Some("Delete this folder?"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-reader-subject");
+    root.append(&title);
+    let hint = gtk::Label::new(Some(&format!(
+        "“{}” and its messages will be removed from the server. This cannot be undone.",
+        folder.name
+    )));
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+    hint.add_css_class("mail-empty-body");
+    hint.set_margin_top(8);
+    root.append(&hint);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("mail-danger");
+    status.set_margin_top(12);
+    root.append(&status);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.set_margin_top(18);
+    let cancel = gtk::Button::with_label("Cancel");
+    let delete = gtk::Button::with_label("Delete folder");
+    delete.add_css_class("destructive-action");
+    actions.append(&cancel);
+    actions.append(&delete);
+    root.append(&actions);
+    window.set_content(Some(&root));
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let operation = FolderOperation::Delete {
+        account_id: folder.account_id,
+        local_name: folder.name.clone(),
+        remote_name: folder.remote_name.clone(),
+    };
+    let state_for_delete = state.clone();
+    let window_for_delete = window.clone();
+    let status_for_delete = status.clone();
+    delete.connect_clicked(move |button| {
+        start_folder_operation(
+            state_for_delete.clone(),
+            operation.clone(),
+            window_for_delete.clone(),
+            button.clone(),
+            status_for_delete.clone(),
+        );
+    });
+    window.present();
+}
+
+fn renamed_remote_name(old_remote_name: &str, new_local_name: &str) -> String {
+    old_remote_name
+        .rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/{new_local_name}"))
+        .unwrap_or_else(|| new_local_name.to_string())
+}
+
+fn start_folder_operation(
+    state: Rc<AppState>,
+    operation: FolderOperation,
+    window: adw::Window,
+    button: gtk::Button,
+    status: gtk::Label,
+) {
+    let account_id = match &operation {
+        FolderOperation::Create { account_id, .. }
+        | FolderOperation::Rename { account_id, .. }
+        | FolderOperation::Delete { account_id, .. } => *account_id,
+    };
+    let Some(account) = state
+        .accounts
+        .borrow()
+        .iter()
+        .find(|account| account.id == Some(account_id))
+        .cloned()
+    else {
+        status.set_text("This account is no longer available.");
+        return;
+    };
+    button.set_sensitive(false);
+    status.set_text("Updating the mail server…");
+    set_status(&state, "Updating folders…");
+    let database = state.database.clone();
+    let operation_for_worker = operation.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result =
+            mail::credentials::load_auth_material(&account.email, "imap", &account.incoming.auth)
+                .map_err(|error| {
+                    mail::credentials::friendly_load_error("IMAP", &account.incoming.auth, &error)
+                })
+                .and_then(|auth| {
+                    let server_result = match &operation_for_worker {
+                        FolderOperation::Create { remote_name, .. } => {
+                            mail::imap::create_folder(&account, &auth, remote_name)
+                        }
+                        FolderOperation::Rename {
+                            old_remote_name,
+                            new_remote_name,
+                            ..
+                        } => mail::imap::rename_folder(
+                            &account,
+                            &auth,
+                            old_remote_name,
+                            new_remote_name,
+                        ),
+                        FolderOperation::Delete { remote_name, .. } => {
+                            mail::imap::delete_folder(&account, &auth, remote_name)
+                        }
+                    };
+                    server_result.map_err(|error| error.to_string())
+                })
+                .and_then(|_| match &operation_for_worker {
+                    FolderOperation::Create {
+                        account_id,
+                        local_name,
+                        remote_name,
+                    } => database
+                        .create_folder(&MailFolder {
+                            account_id: *account_id,
+                            name: local_name.clone(),
+                            remote_name: remote_name.clone(),
+                            kind: "custom".into(),
+                            unread_count: 0,
+                        })
+                        .map_err(|error| error.to_string()),
+                    FolderOperation::Rename {
+                        account_id,
+                        old_remote_name,
+                        new_local_name,
+                        new_remote_name,
+                        ..
+                    } => database
+                        .rename_folder(
+                            *account_id,
+                            old_remote_name,
+                            new_local_name,
+                            new_remote_name,
+                        )
+                        .map_err(|error| error.to_string()),
+                    FolderOperation::Delete {
+                        account_id,
+                        local_name,
+                        remote_name,
+                    } => database
+                        .delete_folder(*account_id, remote_name, local_name)
+                        .map_err(|error| error.to_string()),
+                });
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(())) => {
+                apply_folder_operation_to_state(&state_for_result, &operation);
+                window.close();
+                set_status(
+                    &state_for_result,
+                    match operation {
+                        FolderOperation::Create { .. } => "Folder created",
+                        FolderOperation::Rename { .. } => "Folder renamed",
+                        FolderOperation::Delete { .. } => "Folder deleted",
+                    },
+                );
+            }
+            Ok(Err(error)) => {
+                button.set_sensitive(true);
+                status.set_text(&format!("Couldn’t update this folder: {error}"));
+                set_status(
+                    &state_for_result,
+                    "The folder change could not be completed",
+                );
+            }
+            Err(_) => {
+                button.set_sensitive(true);
+                status.set_text("The folder worker stopped unexpectedly.");
+            }
+        }
+    });
+}
+
+fn apply_folder_operation_to_state(state: &Rc<AppState>, operation: &FolderOperation) {
+    match operation {
+        FolderOperation::Create {
+            account_id,
+            local_name,
+            remote_name,
+        } => {
+            state.folders.borrow_mut().push(MailFolder {
+                account_id: *account_id,
+                name: local_name.clone(),
+                remote_name: remote_name.clone(),
+                kind: "custom".into(),
+                unread_count: 0,
+            });
+        }
+        FolderOperation::Rename {
+            account_id,
+            old_local_name,
+            old_remote_name,
+            new_local_name,
+            new_remote_name,
+        } => {
+            if let Some(folder) = state.folders.borrow_mut().iter_mut().find(|folder| {
+                folder.account_id == *account_id
+                    && (folder.remote_name == *old_remote_name
+                        || folder.name.eq_ignore_ascii_case(old_local_name))
+            }) {
+                folder.name = new_local_name.clone();
+                folder.remote_name = new_remote_name.clone();
+            }
+            let mut scope = state.scope.borrow_mut();
+            if *scope
+                == (MailScope::Account {
+                    id: *account_id,
+                    folder: old_local_name.clone(),
+                })
+            {
+                *scope = MailScope::Account {
+                    id: *account_id,
+                    folder: new_local_name.clone(),
+                };
+            }
+        }
+        FolderOperation::Delete {
+            account_id,
+            local_name,
+            remote_name,
+        } => {
+            state.folders.borrow_mut().retain(|folder| {
+                !(folder.account_id == *account_id
+                    && (folder.remote_name == *remote_name
+                        || folder.name.eq_ignore_ascii_case(local_name)))
+            });
+            if *state.scope.borrow()
+                == (MailScope::Account {
+                    id: *account_id,
+                    folder: local_name.clone(),
+                })
+            {
+                state.scope.replace(MailScope::Account {
+                    id: *account_id,
+                    folder: "Inbox".into(),
+                });
+            }
+            state.selected_message.replace(None);
+        }
+    }
+    refresh_cached_view(state);
+}
+
 fn open_message_menu(state: Rc<AppState>, row: &gtk::ListBoxRow, message_id: i64, x: f64, y: f64) {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(true);
@@ -1518,12 +2032,38 @@ fn open_message_menu(state: Rc<AppState>, row: &gtk::ListBoxRow, message_id: i64
     menu.set_margin_bottom(6);
     menu.set_margin_start(6);
     menu.set_margin_end(6);
-    for (label, action) in [
-        ("Mark read / unread", "read"),
-        ("Star / unstar", "star"),
-        ("Archive", "archive"),
-        ("Move to Trash", "trash"),
-    ] {
+    for (label, action) in [("Mark read / unread", "read"), ("Star / unstar", "star")] {
+        let button = gtk::Button::with_label(label);
+        button.set_has_frame(false);
+        let state = state.clone();
+        let popover = popover.clone();
+        button.connect_clicked(move |_| {
+            apply_message_action(&state, message_id, action);
+            popover.popdown();
+        });
+        menu.append(&button);
+    }
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    separator.set_margin_top(4);
+    separator.set_margin_bottom(4);
+    menu.append(&separator);
+    for (label, action) in [("Move to…", "move"), ("Copy to…", "copy")] {
+        let button = gtk::Button::with_label(label);
+        button.set_has_frame(false);
+        let state = state.clone();
+        let row = row.clone();
+        let popover = popover.clone();
+        button.connect_clicked(move |_| {
+            open_message_destination_menu(state.clone(), &row, message_id, action);
+            popover.popdown();
+        });
+        menu.append(&button);
+    }
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    separator.set_margin_top(4);
+    separator.set_margin_bottom(4);
+    menu.append(&separator);
+    for (label, action) in [("Archive", "archive"), ("Move to Trash", "trash")] {
         let button = gtk::Button::with_label(label);
         button.set_has_frame(false);
         let state = state.clone();
@@ -1536,6 +2076,191 @@ fn open_message_menu(state: Rc<AppState>, row: &gtk::ListBoxRow, message_id: i64
     }
     popover.set_child(Some(&menu));
     popover.popup();
+}
+
+fn account_destination_folders(state: &Rc<AppState>, account_id: i64) -> Vec<MailFolder> {
+    let mut folders = state
+        .folders
+        .borrow()
+        .iter()
+        .filter(|folder| folder.account_id == account_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (name, remote_name, kind) in [
+        ("Inbox", "INBOX", "inbox"),
+        ("Drafts", "Drafts", "drafts"),
+        ("Sent", "Sent", "sent"),
+        ("Archive", "Archive", "archive"),
+        ("Spam", "Spam", "spam"),
+        ("Trash", "Trash", "trash"),
+    ] {
+        if !folders.iter().any(|folder| {
+            folder.name.eq_ignore_ascii_case(name)
+                || folder.remote_name.eq_ignore_ascii_case(remote_name)
+        }) {
+            folders.push(MailFolder {
+                account_id,
+                name: name.into(),
+                remote_name: remote_name.into(),
+                kind: kind.into(),
+                unread_count: 0,
+            });
+        }
+    }
+    folders.sort_by_key(|folder| (folder.kind == "custom", folder.name.to_ascii_lowercase()));
+    folders
+}
+
+fn open_message_destination_menu(
+    state: Rc<AppState>,
+    row: &gtk::ListBoxRow,
+    message_id: i64,
+    action: &str,
+) {
+    let Some(message) = state
+        .messages
+        .borrow()
+        .iter()
+        .find(|message| message.id == message_id)
+        .cloned()
+    else {
+        return;
+    };
+    let Some(account_id) = message.account_id else {
+        set_status(&state, "This message is not linked to an email account");
+        return;
+    };
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_parent(row);
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.set_margin_top(6);
+    menu.set_margin_bottom(6);
+    menu.set_margin_start(6);
+    menu.set_margin_end(6);
+    let heading = gtk::Label::new(Some(if action == "move" {
+        "Move message to"
+    } else {
+        "Copy message to"
+    }));
+    heading.set_xalign(0.0);
+    heading.add_css_class("mail-section-label");
+    heading.set_margin_start(8);
+    heading.set_margin_end(8);
+    heading.set_margin_bottom(4);
+    menu.append(&heading);
+
+    let destinations = account_destination_folders(&state, account_id);
+    let mut added = false;
+    for folder in destinations {
+        if folder.name.eq_ignore_ascii_case(&message.folder) {
+            continue;
+        }
+        added = true;
+        let button = gtk::Button::with_label(&folder.name);
+        button.set_has_frame(false);
+        button.set_halign(gtk::Align::Fill);
+        let state_for_action = state.clone();
+        let popover_for_action = popover.clone();
+        let action = action.to_string();
+        let target = folder.name.clone();
+        button.connect_clicked(move |_| {
+            apply_message_transfer(&state_for_action, message_id, &action, &target);
+            popover_for_action.popdown();
+        });
+        menu.append(&button);
+    }
+    if !added {
+        let empty = gtk::Label::new(Some("No other folders available"));
+        empty.add_css_class("mail-empty-body");
+        menu.append(&empty);
+    }
+    popover.set_child(Some(&menu));
+    popover.popup();
+}
+
+fn apply_message_transfer(
+    state: &Rc<AppState>,
+    message_id: i64,
+    action: &str,
+    target_folder: &str,
+) {
+    let Some(message) = state
+        .messages
+        .borrow()
+        .iter()
+        .find(|message| message.id == message_id)
+        .cloned()
+    else {
+        return;
+    };
+    if message.folder.eq_ignore_ascii_case(target_folder) {
+        set_status(state, "The message is already in that folder");
+        return;
+    }
+    let (Some(account_id), Some(remote_uid), Some(uidvalidity)) =
+        (message.account_id, message.remote_uid, message.uidvalidity)
+    else {
+        set_status(
+            state,
+            "This message cannot be moved or copied on the server",
+        );
+        return;
+    };
+    if action != "move" && action != "copy" {
+        return;
+    }
+
+    if action == "move" {
+        if let Some(message) = state
+            .messages
+            .borrow_mut()
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.folder = target_folder.to_string();
+        }
+        let database = state.database.clone();
+        let target = target_folder.to_string();
+        let source = message.folder.clone();
+        std::thread::spawn(move || {
+            let _ = database.move_message(message_id, &target);
+            let _ = database.queue_action(
+                Some(account_id),
+                Some(message_id),
+                "move",
+                &serde_json::json!({
+                    "folder": target,
+                    "source_folder": source,
+                })
+                .to_string(),
+            );
+        });
+        state.selected_message.replace(None);
+        render_reader(state, None);
+        set_status(state, &format!("Moved to {target_folder} — ready to undo"));
+    } else {
+        let database = state.database.clone();
+        let source = message.folder.clone();
+        let target = target_folder.to_string();
+        std::thread::spawn(move || {
+            let _ = database.queue_action(
+                Some(account_id),
+                Some(message_id),
+                "copy",
+                &serde_json::json!({
+                    "folder": target,
+                    "source_folder": source,
+                })
+                .to_string(),
+            );
+        });
+        set_status(state, &format!("Copy to {target_folder} queued"));
+    }
+    let _ = remote_uid;
+    let _ = uidvalidity;
+    render_sidebar(state);
+    render_messages(state, state.search_entry.text().as_str());
 }
 
 fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {

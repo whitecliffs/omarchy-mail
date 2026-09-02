@@ -3,7 +3,7 @@ use crate::models::{
     ServerConfig,
 };
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -220,6 +220,72 @@ impl Database {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
+    }
+
+    /// Records a mailbox created on the server. This is intentionally a
+    /// small cache update; IMAP remains authoritative and the next account
+    /// sync can reconcile the metadata if the server presents different
+    /// casing or hierarchy details.
+    pub fn create_folder(&self, folder: &MailFolder) -> Result<()> {
+        self.upsert_folders(std::slice::from_ref(folder))
+    }
+
+    /// Renames cached folder metadata and all cached messages belonging to it
+    /// in one transaction after the IMAP RENAME has succeeded.
+    pub fn rename_folder(
+        &self,
+        account_id: i64,
+        old_remote_name: &str,
+        new_name: &str,
+        new_remote_name: &str,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let old_name: Option<String> = transaction
+            .query_row(
+                "SELECT name FROM folders WHERE account_id = ?1 AND remote_name = ?2",
+                params![account_id, old_remote_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(old_name) = old_name else {
+            return Ok(());
+        };
+        transaction.execute(
+            "UPDATE folders SET name = ?1, remote_name = ?2
+             WHERE account_id = ?3 AND remote_name = ?4",
+            params![new_name, new_remote_name, account_id, old_remote_name],
+        )?;
+        transaction.execute(
+            "UPDATE messages SET folder = ?1
+             WHERE account_id = ?2 AND folder = ?3",
+            params![new_name, account_id, old_name],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Removes cached folder metadata and its cached messages after the IMAP
+    /// DELETE has succeeded. Pending actions for those messages are removed
+    /// by the foreign-key cascade.
+    pub fn delete_folder(
+        &self,
+        account_id: i64,
+        remote_name: &str,
+        local_name: &str,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2",
+            params![account_id, local_name],
+        )?;
+        transaction.execute(
+            "DELETE FROM folders WHERE account_id = ?1 AND remote_name = ?2",
+            params![account_id, remote_name],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn save_draft(
@@ -1140,6 +1206,64 @@ mod tests {
             1
         );
         assert_eq!(database.load_folders().expect("reload folders").len(), 1);
+    }
+
+    #[test]
+    fn updates_cached_messages_when_a_custom_folder_is_renamed_or_deleted() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("account");
+        database
+            .create_folder(&MailFolder {
+                account_id,
+                name: "Receipts".into(),
+                remote_name: "Receipts".into(),
+                kind: "custom".into(),
+                unread_count: 1,
+            })
+            .expect("create folder cache");
+        let mut message = Message::demo_messages().remove(0);
+        message.account_id = Some(account_id);
+        message.folder = "Receipts".into();
+        message.remote_uid = Some(22);
+        message.uidvalidity = Some(8);
+        database.upsert_messages(&[message]).expect("message");
+
+        database
+            .rename_folder(account_id, "Receipts", "Invoices", "Invoices")
+            .expect("rename folder cache");
+        let renamed = database
+            .list_messages(Some(account_id), "Invoices")
+            .expect("renamed messages");
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(
+            database
+                .load_folders()
+                .expect("renamed folders")
+                .iter()
+                .find(|folder| folder.account_id == account_id)
+                .map(|folder| folder.remote_name.as_str()),
+            Some("Invoices")
+        );
+
+        database
+            .delete_folder(account_id, "Invoices", "Invoices")
+            .expect("delete folder cache");
+        assert!(
+            database
+                .list_messages(Some(account_id), "Invoices")
+                .expect("deleted messages")
+                .is_empty()
+        );
+        assert!(
+            database
+                .load_folders()
+                .expect("deleted folders")
+                .iter()
+                .all(|folder| folder.remote_name != "Invoices")
+        );
     }
 
     #[test]
