@@ -626,6 +626,19 @@ impl Database {
         Ok(())
     }
 
+    /// Removes cached messages from a mailbox after the IMAP server has
+    /// acknowledged a permanent deletion. Keeping this separate from the
+    /// remote operation prevents a failed empty-trash request from silently
+    /// discarding offline-readable messages.
+    pub fn delete_messages_in_folder(&self, account_id: i64, folder: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let deleted = connection.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2",
+            params![account_id, folder],
+        )?;
+        Ok(deleted)
+    }
+
     /// Removes cached rows that the server has proven absent from a mailbox.
     /// The caller must provide the mailbox's current UIDVALIDITY and the
     /// complete UID set returned by IMAP; recent-message fetch limits are not
@@ -1257,6 +1270,42 @@ mod tests {
         assert_eq!(archived[0].id, 1);
         assert_eq!(starred.len(), 1);
         assert_eq!(starred[0].id, 1);
+    }
+
+    #[test]
+    fn deletes_only_the_cached_messages_in_an_emptied_folder() {
+        let directory = tempdir().expect("temp directory");
+        let database = Database::open(directory.path()).expect("database");
+        let account_id = database
+            .save_account(&Account::new("jim@example.com", "Jim"))
+            .expect("account");
+        let mut messages = Message::demo_messages();
+        messages.truncate(2);
+        for message in &mut messages {
+            message.account_id = Some(account_id);
+        }
+        database.upsert_messages(&messages).expect("messages");
+        database.move_message(1, "Trash").expect("trash message");
+
+        assert_eq!(
+            database
+                .delete_messages_in_folder(account_id, "Trash")
+                .expect("empty cached trash"),
+            1
+        );
+        assert!(
+            database
+                .list_messages(Some(account_id), "Trash")
+                .expect("trash")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .list_messages(Some(account_id), "Inbox")
+                .expect("inbox")
+                .len(),
+            1
+        );
     }
 
     #[test]

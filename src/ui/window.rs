@@ -36,6 +36,7 @@ struct AppState {
     reader: gtk::Box,
     navigation: gtk::Button,
     search_entry: gtk::SearchEntry,
+    empty_trash_button: gtk::Button,
     search_results: RefCell<Option<(String, Vec<Message>)>>,
     search_generation: Cell<u64>,
     search_pending: Cell<bool>,
@@ -100,6 +101,11 @@ struct UndoAction {
     message_id: i64,
     source_folder: String,
     target_folder: String,
+}
+
+struct EmptyTrashReport {
+    emptied_accounts: Vec<i64>,
+    errors: Vec<String>,
 }
 
 struct SettingsSession {
@@ -172,7 +178,7 @@ pub fn build_window(application: &adw::Application) {
 
     let middle = gtk::Box::new(gtk::Orientation::Vertical, 0);
     middle.add_css_class("mail-middle");
-    let (filter_bar, search, filter_button) = build_filter_bar();
+    let (filter_bar, search, filter_button, empty_trash_button) = build_filter_bar();
     middle.append(&filter_bar);
     let (
         selection_bar,
@@ -228,6 +234,7 @@ pub fn build_window(application: &adw::Application) {
         reader,
         navigation: navigation.clone(),
         search_entry: search.clone(),
+        empty_trash_button: empty_trash_button.clone(),
         search_results: RefCell::new(None),
         search_generation: Cell::new(0),
         search_pending: Cell::new(false),
@@ -279,6 +286,10 @@ pub fn build_window(application: &adw::Application) {
     });
     let state_for_filter = state.clone();
     filter_button.connect_clicked(move |button| open_filter_menu(state_for_filter.clone(), button));
+    let state_for_empty_trash = state.clone();
+    empty_trash_button.connect_clicked(move |_| {
+        open_empty_trash_dialog(state_for_empty_trash.clone());
+    });
     connect_selection_actions(
         state.clone(),
         &mark_read,
@@ -647,7 +658,7 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
     state.window.add_controller(controller);
 }
 
-fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
+fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button, gtk::Button) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar.add_css_class("mail-filter-bar");
 
@@ -661,6 +672,16 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     search.set_widget_name("message-search");
     bar.append(&search);
 
+    let empty_trash = gtk::Button::with_label("Empty Trash");
+    empty_trash.add_css_class("destructive-action");
+    empty_trash.set_tooltip_text(Some(
+        "Permanently delete every message in the selected Trash mailbox",
+    ));
+    empty_trash.set_margin_top(10);
+    empty_trash.set_margin_bottom(10);
+    empty_trash.set_visible(false);
+    bar.append(&empty_trash);
+
     // `view-filter-symbolic` is not provided by the active Omarchy icon theme
     // and falls back to a confusing missing-icon glyph. This native filter
     // glyph is available in the same theme and reads as adjustable filters.
@@ -669,7 +690,7 @@ fn build_filter_bar() -> (gtk::Box, gtk::SearchEntry, gtk::Button) {
     filter.set_margin_bottom(10);
     filter.set_margin_end(12);
     bar.append(&filter);
-    (bar, search, filter)
+    (bar, search, filter, empty_trash)
 }
 
 fn build_selection_bar() -> (
@@ -1351,6 +1372,225 @@ fn select_scope(state: &Rc<AppState>, scope: MailScope) {
     }
 }
 
+fn open_empty_trash_dialog(state: Rc<AppState>) {
+    let scope = state.scope.borrow().clone();
+    let account_ids = match &scope {
+        MailScope::Unified(folder) if folder.eq_ignore_ascii_case("Trash") => None,
+        MailScope::Account { id, folder } if folder.eq_ignore_ascii_case("Trash") => {
+            Some(vec![*id])
+        }
+        _ => return,
+    };
+    let accounts = {
+        let configured = state.accounts.borrow();
+        configured
+            .iter()
+            .filter(|account| {
+                let matches_scope = account_ids.as_ref().is_none_or(|ids| {
+                    account
+                        .id
+                        .is_some_and(|account_id| ids.contains(&account_id))
+                });
+                let available = account_ids.is_some() || account.enabled;
+                matches_scope && available
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if accounts.is_empty() {
+        set_status(&state, "No email accounts are available to empty.");
+        return;
+    }
+
+    let scope_summary = if accounts.len() == 1 {
+        let account = &accounts[0];
+        if account.display_name.trim().is_empty() {
+            account.email.clone()
+        } else {
+            format!("{} ({})", account.display_name, account.email)
+        }
+    } else {
+        format!("{} enabled accounts", accounts.len())
+    };
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title("Empty Trash")
+        .default_width(460)
+        .default_height(260)
+        .build();
+    window.add_css_class("mail-dialog");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_margin_start(28);
+    root.set_margin_end(28);
+    root.set_margin_top(26);
+    root.set_margin_bottom(26);
+    let title = gtk::Label::new(Some("Empty Trash?"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-reader-subject");
+    root.append(&title);
+    let hint = gtk::Label::new(Some(&format!(
+        "Every message in Trash for {scope_summary} will be permanently deleted. This cannot be undone."
+    )));
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+    hint.add_css_class("mail-empty-body");
+    hint.set_margin_top(8);
+    root.append(&hint);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("mail-danger");
+    status.set_margin_top(12);
+    root.append(&status);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.set_margin_top(18);
+    let cancel = gtk::Button::with_label("Cancel");
+    let empty = gtk::Button::with_label("Empty Trash");
+    empty.add_css_class("destructive-action");
+    actions.append(&cancel);
+    actions.append(&empty);
+    root.append(&actions);
+    window.set_content(Some(&root));
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+
+    let state_for_empty = state.clone();
+    let window_for_empty = window.clone();
+    let status_for_empty = status.clone();
+    let cancel_for_empty = cancel.clone();
+    let accounts_for_empty = accounts.clone();
+    empty.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        cancel_for_empty.set_sensitive(false);
+        status_for_empty.set_text("Emptying Trash…");
+        start_empty_trash(
+            state_for_empty.clone(),
+            accounts_for_empty.clone(),
+            window_for_empty.clone(),
+            button.clone(),
+            cancel_for_empty.clone(),
+            status_for_empty.clone(),
+        );
+    });
+
+    window.present();
+}
+
+fn start_empty_trash(
+    state: Rc<AppState>,
+    accounts: Vec<Account>,
+    window: adw::Window,
+    button: gtk::Button,
+    cancel: gtk::Button,
+    status: gtk::Label,
+) {
+    let database = state.database.clone();
+    let folders = state.folders.borrow().clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let mut emptied_accounts = Vec::new();
+        let mut errors = Vec::new();
+        for account in accounts {
+            let result: Result<(), String> = (|| {
+                let account_id = account
+                    .id
+                    .ok_or_else(|| "This account has no local identity yet.".to_string())?;
+                let auth = mail::credentials::load_auth_material(
+                    &account.email,
+                    "imap",
+                    &account.incoming.auth,
+                )
+                .map_err(|error| {
+                    mail::credentials::friendly_load_error("IMAP", &account.incoming.auth, &error)
+                })?;
+
+                let actions = database
+                    .pending_actions(account_id)
+                    .map_err(|error| format!("Couldn’t load queued changes: {error}"))?;
+                if !actions.is_empty() {
+                    let applied =
+                        mail::imap::reconcile_actions(&account, &auth, &actions, &folders)
+                            .map_err(|error| format!("Couldn’t finish queued changes: {error}"))?;
+                    if applied.len() != actions.len() {
+                        return Err(
+                            "Some queued changes could not be reconciled; reconnect and try again."
+                                .into(),
+                        );
+                    }
+                    for action_id in applied {
+                        database
+                            .delete_pending_action(action_id)
+                            .map_err(|error| format!("Couldn’t clear queued change: {error}"))?;
+                    }
+                }
+
+                let remote_name = remote_trash_name(&folders, account_id);
+                mail::imap::empty_trash(&account, &auth, &remote_name)
+                    .map_err(|error| format!("Couldn’t empty Trash: {error}"))?;
+                database
+                    .delete_messages_in_folder(account_id, "Trash")
+                    .map_err(|error| format!("Couldn’t clear the local Trash cache: {error}"))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if let Some(account_id) = account.id {
+                        emptied_accounts.push(account_id);
+                    }
+                }
+                Err(error) => errors.push(format!("{}: {error}", account.email)),
+            }
+        }
+        let _ = sender.send_blocking(EmptyTrashReport {
+            emptied_accounts,
+            errors,
+        });
+    });
+
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(report) if report.errors.is_empty() => {
+                clear_selected_rows(&state_for_result);
+                state_for_result.selected_message.replace(None);
+                window.close();
+                refresh_cached_view(&state_for_result);
+                set_status(&state_for_result, "Trash emptied");
+            }
+            Ok(report) => {
+                if !report.emptied_accounts.is_empty() {
+                    clear_selected_rows(&state_for_result);
+                    state_for_result.selected_message.replace(None);
+                    refresh_cached_view(&state_for_result);
+                }
+                button.set_sensitive(true);
+                cancel.set_sensitive(true);
+                let message = if report.emptied_accounts.is_empty() {
+                    format!("Couldn’t empty Trash: {}", report.errors.join(" · "))
+                } else {
+                    format!(
+                        "Trash emptied for {} account(s), but some accounts failed: {}",
+                        report.emptied_accounts.len(),
+                        report.errors.join(" · ")
+                    )
+                };
+                status.set_text(&message);
+                set_status(&state_for_result, &message);
+            }
+            Err(_) => {
+                button.set_sensitive(true);
+                cancel.set_sensitive(true);
+                status.set_text("The empty-trash worker stopped unexpectedly.");
+            }
+        }
+    });
+}
+
 fn load_messages_for_scope(state: &Rc<AppState>) {
     if state.demo_mode {
         return;
@@ -1669,6 +1909,18 @@ fn default_remote_folder(local_name: &str) -> &str {
     }
 }
 
+fn remote_trash_name(folders: &[MailFolder], account_id: i64) -> String {
+    folders
+        .iter()
+        .find(|folder| {
+            folder.account_id == account_id
+                && (folder.kind.eq_ignore_ascii_case("trash")
+                    || folder.name.eq_ignore_ascii_case("Trash"))
+        })
+        .map(|folder| folder.remote_name.clone())
+        .unwrap_or_else(|| default_remote_folder("Trash").to_string())
+}
+
 fn start_message_search(state: &Rc<AppState>, query: &str) {
     let query = query.trim().to_string();
     let generation = state.search_generation.get().wrapping_add(1);
@@ -1734,6 +1986,21 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         &scope,
         MailScope::Unified(folder) | MailScope::Account { folder, .. } if folder == "Outbox"
     );
+    let is_trash_scope = match &scope {
+        MailScope::Unified(folder) | MailScope::Account { folder, .. } => {
+            folder.eq_ignore_ascii_case("Trash")
+        }
+    };
+    let can_empty_trash = if is_trash_scope && !state.demo_mode {
+        let accounts = state.accounts.borrow();
+        match &scope {
+            MailScope::Unified(_) => accounts.iter().any(|account| account.enabled),
+            MailScope::Account { id, .. } => accounts.iter().any(|account| account.id == Some(*id)),
+        }
+    } else {
+        false
+    };
+    state.empty_trash_button.set_visible(can_empty_trash);
     let messages = if raw_query.is_empty() || state.demo_mode || is_outbox_scope {
         state.messages.borrow().clone()
     } else {

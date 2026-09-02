@@ -152,6 +152,13 @@ The optimistic move and pending-action insert also share one transaction, so a
 local database failure cannot leave the message moved without a durable action
 for reconciliation.
 
+Empty Trash is a separate online-only operation. The UI resolves the selected
+Trash scope to one or all enabled accounts, reconciles any queued actions first,
+then selects the mapped remote Trash mailbox and marks its complete UID range
+deleted before issuing standard IMAP EXPUNGE. The local Trash cache is deleted
+only after the remote operation succeeds; a failed account therefore retains
+its cached messages and can be retried safely.
+
 The message list uses GTK ListBox multiple selection. Selected IDs are kept
 separately from the reader’s current message, allowing a reader to remain
 open while a batch is prepared. Batch flag changes and moves update the local

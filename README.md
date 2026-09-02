@@ -81,6 +81,11 @@ action and restores the cache atomically. Once the server has accepted the
 move, it reports that it is too late rather than guessing at a new destination
 UID.
 
+When viewing Unified Trash or an account’s Trash, the message-list toolbar
+offers Empty Trash. After confirmation it permanently expunges that mailbox on
+the server and removes the corresponding local cache only after the server
+acknowledges the operation.
+
 The main window adapts to narrow Hyprland tiles: the reader becomes a focused
 second view with a Messages back action, and very narrow windows expose the
 sidebar through a compact navigation button.

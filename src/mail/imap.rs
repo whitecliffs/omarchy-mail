@@ -153,11 +153,28 @@ pub fn delete_folder(
     )
 }
 
+/// Permanently removes every message from the selected Trash mailbox. The
+/// mailbox is selected explicitly so this can never expunge messages from a
+/// different folder, and the operation is intentionally kept online-only by
+/// its caller because it cannot be undone.
+pub fn empty_trash(
+    account: &Account,
+    auth: &AuthMaterial,
+    remote_name: &str,
+) -> Result<(), ImapError> {
+    mailbox_operation(
+        account,
+        auth,
+        MailboxOperation::EmptyTrash(remote_name.to_string()),
+    )
+}
+
 #[derive(Clone)]
 enum MailboxOperation {
     Create(String),
     Rename(String, String),
     Delete(String),
+    EmptyTrash(String),
 }
 
 fn mailbox_operation(
@@ -207,6 +224,18 @@ fn mailbox_operation_client<T: Read + Write>(
         MailboxOperation::Delete(remote_name) => session
             .delete(remote_name)
             .map_err(|error| ImapError::Protocol(error.to_string())),
+        MailboxOperation::EmptyTrash(remote_name) => {
+            session
+                .select(remote_name)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            session
+                .uid_store("1:*", "+FLAGS (\\Deleted)")
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            session
+                .expunge()
+                .map(|_| ())
+                .map_err(|error| ImapError::Protocol(error.to_string()))
+        }
     };
     let _ = session.logout();
     result
@@ -1090,6 +1119,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empties_trash_by_marking_every_message_deleted_then_expunging() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake IMAP server");
+        let port = listener.local_addr().expect("server address").port();
+        let server = thread::spawn(move || run_fake_empty_trash_server(listener));
+        let account = account_for_test_server(port);
+
+        empty_trash(
+            &account,
+            &AuthMaterial::Password("test-password".into()),
+            "Trash",
+        )
+        .expect("empty trash");
+
+        server
+            .join()
+            .expect("fake IMAP server thread")
+            .expect("IMAP server");
+    }
+
     fn account_for_test_server(port: u16) -> Account {
         let mut account = Account::new("jim@example.com", "Jim");
         account.id = Some(42);
@@ -1177,6 +1226,67 @@ mod tests {
                     if !saw_expected {
                         return Err(std::io::Error::other(
                             "expected folder command was not sent",
+                        ));
+                    }
+                    stream.write_all(b"* BYE Logging out\r\n")?;
+                    write_tagged(&mut stream, tag, "OK LOGOUT completed")?;
+                    break;
+                }
+                _ => write_tagged(&mut stream, tag, "OK command completed")?,
+            }
+        }
+        Ok(())
+    }
+
+    fn run_fake_empty_trash_server(listener: TcpListener) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        stream.write_all(b"* OK Omarchy Mail test server ready\r\n")?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut saw_store = false;
+        let mut saw_expunge = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let mut words = line.split_whitespace();
+            let Some(tag) = words.next() else {
+                continue;
+            };
+            let command = words.next().unwrap_or_default().to_ascii_uppercase();
+            if command == "UID"
+                && line.to_ascii_uppercase().contains("STORE")
+                && line.contains("1:*")
+            {
+                saw_store = true;
+            }
+            if command == "EXPUNGE" {
+                saw_expunge = true;
+            }
+            match command.as_str() {
+                "LOGIN" => write_tagged(&mut stream, tag, "OK LOGIN completed")?,
+                "SELECT" => {
+                    stream.write_all(
+                        b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                          * 2 EXISTS\r\n\
+                          * 0 RECENT\r\n\
+                          * OK [UIDVALIDITY 42] UIDs valid\r\n\
+                          * OK [UIDNEXT 3] Predicted next UID\r\n",
+                    )?;
+                    write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
+                }
+                "UID" if line.to_ascii_uppercase().contains("STORE") => {
+                    write_tagged(&mut stream, tag, "OK UID STORE completed")?;
+                }
+                "EXPUNGE" => {
+                    stream.write_all(b"* 2 EXPUNGE\r\n* 1 EXPUNGE\r\n")?;
+                    write_tagged(&mut stream, tag, "OK EXPUNGE completed")?;
+                }
+                "LOGOUT" => {
+                    if !saw_store || !saw_expunge {
+                        return Err(std::io::Error::other(
+                            "empty trash did not store deleted flags and expunge",
                         ));
                     }
                     stream.write_all(b"* BYE Logging out\r\n")?;
