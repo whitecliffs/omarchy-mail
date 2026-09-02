@@ -4307,6 +4307,90 @@ fn auth_material_for_secret(method: &AuthMethod, secret: &str) -> mail::credenti
     }
 }
 
+fn oauth_protocols(
+    email: &str,
+    incoming_auth: &gtk::DropDown,
+    outgoing_auth: &gtk::DropDown,
+) -> Vec<String> {
+    if mail::oauth::provider_for_email(email).is_none() {
+        return Vec::new();
+    }
+    let mut protocols = Vec::new();
+    if incoming_auth.selected() == 1 {
+        protocols.push("imap".to_string());
+    }
+    if outgoing_auth.selected() == 1 {
+        protocols.push("smtp".to_string());
+    }
+    protocols
+}
+
+fn update_oauth_button(
+    button: &gtk::Button,
+    email: &str,
+    incoming_auth: &gtk::DropDown,
+    outgoing_auth: &gtk::DropDown,
+) {
+    let available = !oauth_protocols(email, incoming_auth, outgoing_auth).is_empty();
+    button.set_visible(available);
+    if available && let Some(provider) = mail::oauth::provider_for_email(email) {
+        button.set_label(&format!("Authorize with {} in browser…", provider.label()));
+    }
+}
+
+fn start_oauth_authorization(
+    email: String,
+    protocols: Vec<String>,
+    button: gtk::Button,
+    status: gtk::Label,
+) {
+    if protocols.is_empty() {
+        status.set_text("Choose OAuth2 for IMAP or SMTP first.");
+        return;
+    }
+    let request = match mail::oauth::begin(&email) {
+        Ok(request) => request,
+        Err(error) => {
+            status.set_text(&error.to_string());
+            return;
+        }
+    };
+    if let Err(error) = gio::AppInfo::launch_default_for_uri(
+        &request.authorization_url,
+        None::<&gio::AppLaunchContext>,
+    ) {
+        status.set_text(&format!("Couldn’t open the browser: {error}"));
+        return;
+    }
+
+    button.set_sensitive(false);
+    status.set_text("Waiting for browser authorization…");
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = mail::oauth::complete(request)
+            .map_err(|error| error.to_string())
+            .and_then(|tokens| {
+                for protocol in protocols {
+                    mail::credentials::store_oauth2_tokens(&email, &protocol, &tokens)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<(), String>(())
+            });
+        let _ = sender.send_blocking(result);
+    });
+
+    glib::MainContext::default().spawn_local(async move {
+        match receiver.recv().await {
+            Ok(Ok(())) => status.set_text(
+                "Browser sign-in complete. Save the account to use the new authorization.",
+            ),
+            Ok(Err(error)) => status.set_text(&format!("Browser sign-in failed: {error}")),
+            Err(_) => status.set_text("The browser sign-in worker stopped unexpectedly."),
+        }
+        button.set_sensitive(true);
+    });
+}
+
 fn open_account_editor(state: Rc<AppState>, original: Account) {
     let window = adw::Window::builder()
         .transient_for(&state.window)
@@ -4345,6 +4429,12 @@ fn open_account_editor(state: Rc<AppState>, original: Account) {
     scrolled.set_child(Some(&fields_view));
     root.append(&scrolled);
 
+    let oauth_button = gtk::Button::with_label("Authorize in browser…");
+    oauth_button.set_halign(gtk::Align::Start);
+    oauth_button.add_css_class("mail-secondary-button");
+    oauth_button.set_margin_top(12);
+    root.append(&oauth_button);
+
     let status = gtk::Label::new(Some(
         "The email address is the account identity and cannot be changed here.",
     ));
@@ -4353,6 +4443,51 @@ fn open_account_editor(state: Rc<AppState>, original: Account) {
     status.add_css_class("mail-empty-body");
     status.set_margin_top(14);
     root.append(&status);
+
+    update_oauth_button(
+        &oauth_button,
+        &original.email,
+        &fields.incoming_auth,
+        &fields.outgoing_auth,
+    );
+    let oauth_button_for_imap = oauth_button.clone();
+    let fields_for_imap_oauth = fields.clone();
+    let original_email_for_imap_oauth = original.email.clone();
+    fields.incoming_auth.connect_selected_notify(move |_| {
+        update_oauth_button(
+            &oauth_button_for_imap,
+            &original_email_for_imap_oauth,
+            &fields_for_imap_oauth.incoming_auth,
+            &fields_for_imap_oauth.outgoing_auth,
+        );
+    });
+    let oauth_button_for_smtp = oauth_button.clone();
+    let fields_for_smtp_oauth = fields.clone();
+    let original_email_for_smtp_oauth = original.email.clone();
+    fields.outgoing_auth.connect_selected_notify(move |_| {
+        update_oauth_button(
+            &oauth_button_for_smtp,
+            &original_email_for_smtp_oauth,
+            &fields_for_smtp_oauth.incoming_auth,
+            &fields_for_smtp_oauth.outgoing_auth,
+        );
+    });
+    let original_email_for_oauth = original.email.clone();
+    let fields_for_oauth = fields.clone();
+    let oauth_status = status.clone();
+    oauth_button.connect_clicked(move |button| {
+        let protocols = oauth_protocols(
+            &original_email_for_oauth,
+            &fields_for_oauth.incoming_auth,
+            &fields_for_oauth.outgoing_auth,
+        );
+        start_oauth_authorization(
+            original_email_for_oauth.clone(),
+            protocols,
+            button.clone(),
+            oauth_status.clone(),
+        );
+    });
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
@@ -4627,13 +4762,43 @@ fn open_account_dialog(state: Rc<AppState>) {
     details.append(&form_row("SMTP security", &outgoing_security));
     details.append(&form_row("SMTP password / token", &outgoing_password));
     let note = gtk::Label::new(Some(
-        "TLS is used by default. IMAP and SMTP usernames may differ. OAuth2 currently accepts a provider-issued access token; browser authorization will be added next.",
+        "TLS is used by default. IMAP and SMTP usernames may differ. For Gmail or Microsoft accounts, choose OAuth2 above and authorize securely in your browser.",
     ));
     note.set_wrap(true);
     note.add_css_class("mail-empty-body");
     details.append(&note);
     advanced.set_child(Some(&details));
     root.append(&advanced);
+
+    let oauth_button = gtk::Button::with_label("Authorize in browser…");
+    oauth_button.set_halign(gtk::Align::Start);
+    oauth_button.add_css_class("mail-secondary-button");
+    oauth_button.set_margin_top(12);
+    oauth_button.set_visible(false);
+    root.append(&oauth_button);
+
+    let oauth_button_for_imap = oauth_button.clone();
+    let email_for_imap_oauth = email.clone();
+    let outgoing_auth_for_imap_oauth = outgoing_auth.clone();
+    incoming_auth.connect_selected_notify(move |auth| {
+        update_oauth_button(
+            &oauth_button_for_imap,
+            email_for_imap_oauth.text().as_str(),
+            auth,
+            &outgoing_auth_for_imap_oauth,
+        );
+    });
+    let oauth_button_for_smtp = oauth_button.clone();
+    let email_for_smtp_oauth = email.clone();
+    let incoming_auth_for_smtp_oauth = incoming_auth.clone();
+    outgoing_auth.connect_selected_notify(move |auth| {
+        update_oauth_button(
+            &oauth_button_for_smtp,
+            email_for_smtp_oauth.text().as_str(),
+            &incoming_auth_for_smtp_oauth,
+            auth,
+        );
+    });
 
     email.connect_changed({
         let incoming_host = incoming_host.clone();
@@ -4643,7 +4808,16 @@ fn open_account_dialog(state: Rc<AppState>) {
         let outgoing_security = outgoing_security.clone();
         let incoming_username = incoming_username.clone();
         let outgoing_username = outgoing_username.clone();
+        let oauth_button = oauth_button.clone();
+        let incoming_auth = incoming_auth.clone();
+        let outgoing_auth = outgoing_auth.clone();
         move |entry| {
+            update_oauth_button(
+                &oauth_button,
+                entry.text().as_str(),
+                &incoming_auth,
+                &outgoing_auth,
+            );
             if mail::valid_email(entry.text().as_str()) {
                 let (imap_host, imap_port, smtp_host, smtp_port) =
                     mail::discover_servers(entry.text().as_str());
@@ -4669,6 +4843,24 @@ fn open_account_dialog(state: Rc<AppState>) {
     error.set_margin_top(14);
     root.append(&error);
 
+    let email_for_oauth = email.clone();
+    let incoming_auth_for_oauth = incoming_auth.clone();
+    let outgoing_auth_for_oauth = outgoing_auth.clone();
+    let error_for_oauth = error.clone();
+    oauth_button.connect_clicked(move |button| {
+        let protocols = oauth_protocols(
+            email_for_oauth.text().as_str(),
+            &incoming_auth_for_oauth,
+            &outgoing_auth_for_oauth,
+        );
+        start_oauth_authorization(
+            email_for_oauth.text().trim().to_string(),
+            protocols,
+            button.clone(),
+            error_for_oauth.clone(),
+        );
+    });
+
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     actions.set_margin_top(20);
@@ -4691,8 +4883,26 @@ fn open_account_dialog(state: Rc<AppState>) {
             return;
         }
         let secret = password.text().to_string();
-        if secret.is_empty() {
+        let auth_method_for_index = |index| {
+            if index == 1 {
+                AuthMethod::OAuth2
+            } else {
+                AuthMethod::Password
+            }
+        };
+        let incoming_auth_method = auth_method_for_index(incoming_auth.selected());
+        let outgoing_auth_method = auth_method_for_index(outgoing_auth.selected());
+        if incoming_auth_method == AuthMethod::Password && secret.is_empty() {
             error.set_text("Enter your password or app password.");
+            return;
+        }
+        if outgoing_auth_method == AuthMethod::Password
+            && incoming_auth_method == AuthMethod::OAuth2
+            && outgoing_password.text().is_empty()
+        {
+            error.set_text(
+                "Enter an SMTP password when IMAP uses OAuth2, or choose OAuth2 for SMTP too.",
+            );
             return;
         }
         let name = if display_name.text().trim().is_empty() {
@@ -4711,25 +4921,14 @@ fn open_account_dialog(state: Rc<AppState>) {
             outgoing_username.text().trim().to_string()
         };
         let outgoing_secret = if outgoing_password.text().is_empty() {
-            secret.clone()
+            if outgoing_auth_method == AuthMethod::Password {
+                secret.clone()
+            } else {
+                String::new()
+            }
         } else {
             outgoing_password.text().to_string()
         };
-        let auth_method_for_index = |index| {
-            if index == 1 {
-                AuthMethod::OAuth2
-            } else {
-                AuthMethod::Password
-            }
-        };
-        let incoming_auth_method = auth_method_for_index(incoming_auth.selected());
-        let outgoing_auth_method = auth_method_for_index(outgoing_auth.selected());
-        if outgoing_password.text().is_empty() && incoming_auth_method != outgoing_auth_method {
-            error.set_text(
-                "Enter a separate SMTP credential when IMAP and SMTP use different authentication methods.",
-            );
-            return;
-        }
         let security_for_index = |index| match index {
             1 => SecurityMode::StartTls,
             2 => SecurityMode::None,
@@ -4758,32 +4957,40 @@ fn open_account_dialog(state: Rc<AppState>) {
         let database = state_for_save.database.clone();
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = mail::credentials::store_auth_material(
-                &address,
-                "imap",
-                &account.incoming.auth,
-                &secret,
-            )
+            let result = if secret.is_empty() {
+                Ok(())
+            } else {
+                mail::credentials::store_auth_material(
+                    &address,
+                    "imap",
+                    &account.incoming.auth,
+                    &secret,
+                )
                 .map_err(|error| error.to_string())
-                .and_then(|_| {
+            }
+            .and_then(|_| {
+                if outgoing_secret.is_empty() {
+                    Ok(())
+                } else {
                     mail::credentials::store_auth_material(
                         &address,
                         "smtp",
                         &account.outgoing.auth,
                         &outgoing_secret,
                     )
-                        .map_err(|error| error.to_string())
-                })
-                .and_then(|_| {
-                    database
-                        .save_account(&account)
-                        .map_err(|error| error.to_string())
-                        .map(|id| {
-                            let mut account = account;
-                            account.id = Some(id);
-                            account
-                        })
-                });
+                    .map_err(|error| error.to_string())
+                }
+            })
+            .and_then(|_| {
+                database
+                    .save_account(&account)
+                    .map_err(|error| error.to_string())
+                    .map(|id| {
+                        let mut account = account;
+                        account.id = Some(id);
+                        account
+                    })
+            });
             let _ = sender.send_blocking(result);
         });
 

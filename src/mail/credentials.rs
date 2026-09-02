@@ -1,3 +1,4 @@
+use crate::mail::oauth::{self, OAuthTokens};
 use crate::models::AuthMethod;
 use keyring::Entry;
 use std::sync::{Mutex, OnceLock};
@@ -104,6 +105,31 @@ pub fn load_oauth2_token(account_email: &str, protocol: &str) -> Result<String, 
     Ok(entry(account_email, &format!("oauth2:{protocol}"))?.get_password()?)
 }
 
+pub fn store_oauth2_tokens(
+    account_email: &str,
+    protocol: &str,
+    tokens: &OAuthTokens,
+) -> Result<(), CredentialError> {
+    let serialized =
+        serde_json::to_string(tokens).map_err(|_error| CredentialError::VerificationFailed)?;
+    store_oauth2_token(account_email, protocol, &serialized)
+}
+
+pub fn load_oauth2_tokens(
+    account_email: &str,
+    protocol: &str,
+) -> Result<OAuthTokens, CredentialError> {
+    let stored = load_oauth2_token(account_email, protocol)?;
+    if let Ok(tokens) = serde_json::from_str::<OAuthTokens>(&stored) {
+        return Ok(tokens);
+    }
+    Ok(OAuthTokens {
+        access_token: stored,
+        refresh_token: None,
+        expires_at: None,
+    })
+}
+
 #[allow(dead_code)]
 pub fn delete_oauth2_token(account_email: &str, protocol: &str) -> Result<(), CredentialError> {
     let _lock = keyring_lock();
@@ -119,7 +145,23 @@ pub fn load_auth_material(
     match method {
         AuthMethod::Password => load_password(account_email, protocol).map(AuthMaterial::Password),
         AuthMethod::OAuth2 => {
-            load_oauth2_token(account_email, protocol).map(AuthMaterial::OAuth2AccessToken)
+            let mut tokens = load_oauth2_tokens(account_email, protocol)?;
+            if tokens.is_expired()
+                && let (Some(refresh_token), Some(provider)) = (
+                    tokens.refresh_token.as_deref(),
+                    oauth::provider_for_email(account_email),
+                )
+                && let Ok(client_id) = oauth::configured_client_id(provider)
+                && let Ok(mut refreshed) =
+                    oauth::refresh_access_token(provider, &client_id, refresh_token)
+            {
+                if refreshed.refresh_token.is_none() {
+                    refreshed.refresh_token = tokens.refresh_token.clone();
+                }
+                let _ = store_oauth2_tokens(account_email, protocol, &refreshed);
+                tokens = refreshed;
+            }
+            Ok(AuthMaterial::OAuth2AccessToken(tokens.access_token))
         }
     }
 }

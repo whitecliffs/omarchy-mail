@@ -161,6 +161,8 @@ window.omarchy-mail-window {{
 .mail-empty-body {{ color: @om-muted; }}
 .mail-accent-button {{ background: @om-accent; color: @om-darker-background; font-weight: 700; }}
 .mail-accent-button:hover {{ background: @om-light-foreground; }}
+.mail-secondary-button {{ color: @om-light-foreground; border: 1px solid alpha(@om-muted, 0.42); }}
+.mail-secondary-button:hover {{ background: alpha(@om-selection, 0.62); border-color: alpha(@om-accent, 0.58); }}
 .mail-status {{ color: @om-muted; font-size: 0.86em; }}
 .mail-account-title {{ color: @om-light-foreground; font-weight: 700; }}
 .mail-danger {{ color: @om-red; }}

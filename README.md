@@ -19,8 +19,9 @@ attachment re-fetch after cache eviction, a durable offline Outbox,
 and Omarchy theme integration. The cache now reconciles deleted messages and
 server-side mailbox removals using complete UID/UIDVALIDITY snapshots. IMAP
 and SMTP can use provider-issued OAuth2 access tokens through native XOAUTH2
-transport support; provider browser authorization remains a follow-up because
-it requires provider-specific client registration. Read/star/move
+transport support. Gmail and Microsoft accounts can authorize both protocols
+through a PKCE-protected browser flow with a loopback callback; the resulting
+access and refresh tokens stay in Secret Service. Read/star/move
 actions are queued locally and replayed after reconnect when the recorded
 mailbox UIDVALIDITY still matches the server. Message context menus now offer
 server-safe Move to… and Copy to… destinations, while each account exposes
@@ -115,9 +116,10 @@ Add accounts through the graphical setup flow. IMAP and SMTP usernames and
 passwords can differ; secrets are stored separately in the Linux Secret
 Service and never in SQLite. The account model separates authentication
 method from transport security. Password entries and OAuth2 token entries use
-isolated Secret Service slots; the account flow accepts either credential type,
-while provider browser authorization is intentionally not hard-coded into the
-source tree. Open Settings and choose Edit beside an account to review or
+isolated Secret Service slots; the account flow accepts either credential type.
+For Gmail or Microsoft accounts, choose OAuth2 in Connection details and use
+Authorize in browser… to sign in without pasting a token. Open Settings and
+choose Edit beside an account to review or
 change its display name, IMAP/SMTP servers, ports, security, usernames, or
 authentication method. Credential fields stay blank by design: leave them
 empty to preserve an existing keyring entry, or enter only the missing
@@ -131,6 +133,25 @@ Non-secret preferences, including per-account signatures, are stored at
 Draft attachments are safely copied under
 `$XDG_DATA_HOME/omarchy-mail/drafts/` (or `~/.local/share/omarchy-mail/drafts/`)
 so an autosaved draft remains usable if the original file moves.
+
+### Browser sign-in setup
+
+Browser sign-in requires a desktop OAuth client ID registered with the provider;
+client IDs are public identifiers, but client secrets and tokens must never be
+added to the repository. Configure the ID with either an environment variable
+or the optional `~/.config/omarchy-mail/oauth.json` file:
+
+```json
+{
+  "google_client_id": "your-desktop-client-id.apps.googleusercontent.com",
+  "microsoft_client_id": "your-desktop-client-id"
+}
+```
+
+Use `OMARCHY_MAIL_GOOGLE_CLIENT_ID` or
+`OMARCHY_MAIL_MICROSOFT_CLIENT_ID` for a temporary session. The flow uses PKCE,
+opens the system browser, listens only on a random localhost port, validates
+the callback state, and refreshes expired access tokens when possible.
 
 ## Theme integration
 
@@ -148,6 +169,9 @@ palette for live updates.
   connection action can verify the incoming settings before saving.
 - If account setup cannot save a password, ensure a Secret Service provider is
   running in the user session and retry.
+- If browser authorization reports a missing client ID, register a desktop
+  OAuth client with the provider and configure it as described above. Generic
+  IMAP providers can continue to use passwords or provider-issued tokens.
 - If the app starts with fallback colours, inspect
   `~/.local/state/omarchy/current/theme/colors.toml` and relaunch.
 - Use `OMARCHY_MAIL_DEMO=1` to inspect the UI without network credentials.

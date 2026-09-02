@@ -1,6 +1,7 @@
 pub mod credentials;
 pub mod imap;
 pub mod mime;
+pub mod oauth;
 pub mod outbox;
 pub mod smtp;
 pub mod sync;

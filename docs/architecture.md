@@ -14,8 +14,9 @@ without making the GTK main loop responsible for network activity.
   isolated Linux Secret Service entries via the `keyring` crate. `AuthMethod`
   is deliberately separate from TLS transport settings. IMAP performs native
   XOAUTH2 challenge authentication and SMTP selects lettre's XOAUTH2
-  mechanism; provider browser authorization is deferred until provider client
-  registration can be configured without shipping secrets.
+  mechanism. `mail/oauth.rs` implements provider-specific PKCE authorization
+  with a loopback callback, and refreshes access tokens without placing client
+  secrets or tokens in application files.
 - `mail/mime.rs` parses MIME messages, retains normalized `Content-ID` values,
   and sanitises HTML before the UI sees it. HTML is rendered by WebKitGTK 6
   inside the GTK window so email-authored tables, CSS, buttons, and font rules
