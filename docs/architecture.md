@@ -146,6 +146,10 @@ transaction. It does not enqueue an inverse move after synchronization because
 IMAP COPY may assign a different destination UID, and guessing that UID could
 move the wrong message.
 
+The optimistic move and pending-action insert also share one transaction, so a
+local database failure cannot leave the message moved without a durable action
+for reconciliation.
+
 The message list uses GTK ListBox multiple selection. Selected IDs are kept
 separately from the reader’s current message, allowing a reader to remain
 open while a batch is prepared. Batch flag changes and moves update the local

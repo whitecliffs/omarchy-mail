@@ -577,6 +577,45 @@ impl Database {
         Ok(())
     }
 
+    /// Applies an optimistic move and records its replay payload atomically.
+    /// The IMAP worker is still the authority for the remote mailbox; this
+    /// transaction only keeps the local cache and its durable intent aligned.
+    pub fn move_message_and_queue_action(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        source_folder: &str,
+        target_folder: &str,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE messages SET folder = ?1 WHERE id = ?2 AND account_id = ?3",
+            params![target_folder, message_id, account_id],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidValue(format!(
+                "message {message_id} was not found for account {account_id}"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO pending_actions(account_id, message_id, action, payload_json, created_at)
+             VALUES (?1, ?2, 'move', ?3, ?4)",
+            params![
+                account_id,
+                message_id,
+                serde_json::json!({
+                    "folder": target_folder,
+                    "source_folder": source_folder,
+                })
+                .to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn delete_message(&self, message_id: i64) -> Result<()> {
         let connection = self.connection()?;
         connection.execute("DELETE FROM messages WHERE id = ?1", [message_id])?;
@@ -1509,15 +1548,9 @@ mod tests {
         message.remote_uid = Some(42);
         message.uidvalidity = Some(7);
         database.upsert_messages(&[message]).expect("save message");
-        database.move_message(1, "Archive").expect("move cache");
         database
-            .queue_action(
-                Some(account_id),
-                Some(1),
-                "move",
-                r#"{"folder":"Archive","source_folder":"Inbox"}"#,
-            )
-            .expect("queue move");
+            .move_message_and_queue_action(account_id, 1, "Inbox", "Archive")
+            .expect("move and queue");
 
         assert!(
             database

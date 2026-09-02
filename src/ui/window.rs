@@ -707,23 +707,12 @@ fn queue_move_action(state: &Rc<AppState>, action: UndoAction, status_text: Stri
     let action_for_worker = action.clone();
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let result = database
-            .move_message(
-                action_for_worker.message_id,
-                &action_for_worker.target_folder,
-            )
-            .and_then(|_| {
-                database.queue_action(
-                    Some(action_for_worker.account_id),
-                    Some(action_for_worker.message_id),
-                    "move",
-                    &serde_json::json!({
-                        "folder": action_for_worker.target_folder,
-                        "source_folder": action_for_worker.source_folder,
-                    })
-                    .to_string(),
-                )
-            });
+        let result = database.move_message_and_queue_action(
+            action_for_worker.account_id,
+            action_for_worker.message_id,
+            &action_for_worker.source_folder,
+            &action_for_worker.target_folder,
+        );
         let _ = sender.send_blocking(result);
     });
     let state_for_result = state.clone();
@@ -2925,16 +2914,11 @@ fn apply_bulk_move(state: &Rc<AppState>, target_folder: &str) {
     let database = state.database.clone();
     std::thread::spawn(move || {
         for (message_id, account_id, source_folder, target_folder) in updates {
-            let _ = database.move_message(message_id, &target_folder);
-            let _ = database.queue_action(
-                Some(account_id),
-                Some(message_id),
-                "move",
-                &serde_json::json!({
-                    "folder": target_folder,
-                    "source_folder": source_folder,
-                })
-                .to_string(),
+            let _ = database.move_message_and_queue_action(
+                account_id,
+                message_id,
+                &source_folder,
+                &target_folder,
             );
         }
     });

@@ -67,8 +67,9 @@ wait for the server’s CREATE, RENAME, or DELETE acknowledgement before the
 folder cache changes.
 
 Single-message Archive, Trash, and Move actions offer an eight-second Undo
-button while the operation is still queued offline. Undo cancels that pending
-action and restores the cache atomically; once the server has accepted the
+button while the operation is still queued offline. The optimistic cache move
+and its replay action are committed together, and Undo cancels that pending
+action and restores the cache atomically. Once the server has accepted the
 move, it reports that it is too late rather than guessing at a new destination
 UID.
 
