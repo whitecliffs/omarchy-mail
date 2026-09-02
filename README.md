@@ -36,6 +36,9 @@ keyboard commands include reply (`r`), forward (`f`), archive (`a`), trash
 Cached mailbox and Outbox reads run on workers as well, with scope-generation
 checks so a slow folder read cannot replace a newer selection.
 
+Icon-only actions and message rows expose descriptive accessibility labels for
+screen readers, while the visible design remains intentionally quiet.
+
 Each enabled account has an isolated monitor. It uses IMAP IDLE when available,
 refreshes the connection before common server idle limits, falls back to a
 five-minute poll for older servers, and retries transient failures with capped

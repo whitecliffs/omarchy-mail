@@ -1222,6 +1222,10 @@ fn sidebar_action_row(
     count: Option<usize>,
     scope: MailScope,
 ) -> gtk::Button {
+    let accessible_label = match count {
+        Some(count) if count > 0 => format!("Show {label}, {count} unread"),
+        _ => format!("Show {label}"),
+    };
     let row = sidebar_row(label, icon, count);
     if *state.scope.borrow() == scope {
         row.add_css_class("selected");
@@ -1231,6 +1235,7 @@ fn sidebar_action_row(
     button.set_halign(gtk::Align::Fill);
     button.set_child(Some(&row));
     button.set_tooltip_text(Some(&format!("Show {label}")));
+    button.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
     let state_for_click = state.clone();
     let scope_for_click = scope.clone();
     button.connect_clicked(move |_| select_scope(&state_for_click, scope_for_click.clone()));
@@ -2069,6 +2074,23 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     let row = gtk::ListBoxRow::new();
     row.set_widget_name(&format!("message-row-{}", message.id));
     row.add_css_class("mail-message-row");
+    let mut accessible_label = String::new();
+    if message.unread {
+        accessible_label.push_str("Unread. ");
+    }
+    accessible_label.push_str(&message.sender_name);
+    accessible_label.push_str(". ");
+    accessible_label.push_str(&message.subject);
+    if !message.preview.trim().is_empty() {
+        accessible_label.push_str(". ");
+        accessible_label.push_str(&message.preview);
+    }
+    accessible_label.push_str(". ");
+    accessible_label.push_str(&format_message_date(&message.received_at));
+    if message.has_attachments {
+        accessible_label.push_str(". Has attachments");
+    }
+    row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
     if message.unread {
         row.add_css_class("unread");
     }
@@ -7072,6 +7094,7 @@ where
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     let button = gtk::Button::from_icon_name(icon);
     button.set_tooltip_text(Some(tooltip));
+    button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
     button.set_valign(gtk::Align::Center);
     button
 }
