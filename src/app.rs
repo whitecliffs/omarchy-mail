@@ -8,7 +8,11 @@ pub fn run() {
         .build();
 
     application.connect_activate(|application| {
-        crate::ui::build_window(application);
+        if let Some(window) = application.windows().first() {
+            window.present();
+        } else {
+            crate::ui::build_window(application);
+        }
     });
 
     application.run();

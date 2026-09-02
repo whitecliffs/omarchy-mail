@@ -23,6 +23,9 @@ pub struct SyncReport {
 
 #[derive(Debug, Clone)]
 pub struct NotificationMessage {
+    pub message_id: i64,
+    pub account_id: Option<i64>,
+    pub folder: String,
     pub sender: String,
     pub subject: String,
 }
@@ -74,11 +77,49 @@ pub fn notify_new_mail(
         .filter(|subject| !subject.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{fetched} message(s) available in your inbox"));
-    let _ = notify_rust::Notification::new()
+    let mut notification = notify_rust::Notification::new();
+    notification
         .summary(&summary)
         .body(&body)
         .icon("org.omarchy.Mail")
-        .show();
+        .action("default", "Open")
+        .action("mark-read", "Mark Read");
+    let Ok(handle) = notification.show() else {
+        return;
+    };
+    let newest_message = newest_message.cloned();
+    thread::spawn(move || {
+        handle.wait_for_action(|action| match action {
+            "default" | "open" => {
+                let _ = std::process::Command::new("omarchy-mail").spawn();
+            }
+            "mark-read" => {
+                if let Some(message) = newest_message.as_ref() {
+                    mark_notification_message_read(message);
+                }
+            }
+            _ => {}
+        });
+    });
+}
+
+fn mark_notification_message_read(message: &NotificationMessage) {
+    let Ok(database) = Database::open_default() else {
+        return;
+    };
+    if database.set_unread(message.message_id, false).is_err() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "value": false,
+        "folder": message.folder,
+    });
+    let _ = database.queue_action(
+        message.account_id,
+        Some(message.message_id),
+        "read",
+        &payload.to_string(),
+    );
 }
 
 fn load_imap_auth(account: &Account) -> Result<credentials::AuthMaterial, String> {
@@ -345,6 +386,9 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                             Ok(new_messages) => {
                                 let newest_message = if new_messages > 0 {
                                     messages.first().map(|message| NotificationMessage {
+                                        message_id: message.id,
+                                        account_id: message.account_id,
+                                        folder: message.folder.clone(),
                                         sender: if message.sender_name.trim().is_empty() {
                                             message.sender_email.clone()
                                         } else {

@@ -34,10 +34,11 @@ without making the GTK main loop responsible for network activity.
   bounded folder fetches, queued action reconciliation, attachment caching,
   per-account error reports, and long-lived IDLE monitors with a polling
   fallback and capped reconnect backoff. Sync reports carry a small sender and
-  subject summary for native new-mail notifications. A malformed MIME payload
-  is isolated to its message during a mailbox fetch, counted in the sync
-  report, and does not discard the other messages returned by that server
-  response.
+  subject summary for native new-mail notifications. Notification handles wait
+  off the GTK thread for Open and Mark Read actions; the latter updates the
+  cache and queues the UID-safe IMAP flag action. A malformed MIME payload is
+  isolated to its message during a mailbox fetch, counted in the sync report,
+  and does not discard the other messages returned by that server response.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the desktop experience, including adaptive pane

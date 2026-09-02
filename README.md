@@ -48,7 +48,8 @@ on-demand.
 
 New-mail notifications use the newest cached message’s sender and subject when
 available, respect each account’s notification setting, and remain disabled for
-the initial cache warm-up.
+the initial cache warm-up. They offer native Open and Mark Read actions; Open
+also reuses the existing application window instead of creating duplicates.
 
 HTML mail is sanitized and rendered by the system WebKitGTK 6 engine inside
 the native GTK window, so real-world tables, CSS typography, buttons, and
