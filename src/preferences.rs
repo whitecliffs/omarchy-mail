@@ -11,6 +11,8 @@ pub struct Preferences {
     pub block_remote_images: bool,
     #[serde(default = "default_true")]
     pub conversation_view: bool,
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
     #[serde(default)]
     pub plain_text_warning: bool,
     #[serde(default)]
@@ -30,6 +32,7 @@ impl Default for Preferences {
         Self {
             block_remote_images: true,
             conversation_view: true,
+            notifications_enabled: true,
             plain_text_warning: false,
             signatures: HashMap::new(),
             allowed_remote_image_senders: Vec::new(),
@@ -153,6 +156,7 @@ mod tests {
         let preferences = Preferences::default();
         assert!(preferences.block_remote_images);
         assert!(preferences.conversation_view);
+        assert!(preferences.notifications_enabled);
         assert!(!preferences.plain_text_warning);
         assert_eq!(preferences.sidebar_width, 258);
         assert_eq!(preferences.message_list_width, 440);

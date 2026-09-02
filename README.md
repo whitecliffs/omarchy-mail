@@ -142,6 +142,9 @@ Draft attachments are safely copied under
 `$XDG_DATA_HOME/omarchy-mail/drafts/` (or `~/.local/share/omarchy-mail/drafts/`)
 so an autosaved draft remains usable if the original file moves.
 
+Settings includes a global New mail notifications switch and an individual
+Notify switch for each account.
+
 ### Browser sign-in setup
 
 Browser sign-in requires a desktop OAuth client ID registered with the provider;

@@ -1652,7 +1652,10 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
             skipped_messages += report.skipped_messages;
             if let Some(error) = report.error {
                 errors.push(format!("{}: {error}", report.email));
-            } else if notify && report.new_messages > 0 {
+            } else if notify
+                && report.new_messages > 0
+                && notifications_allowed(&state, report.account_id)
+            {
                 crate::mail::sync::notify_new_mail(
                     &report.email,
                     report.new_messages,
@@ -1685,6 +1688,17 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
             );
         }
     });
+}
+
+fn notifications_allowed(state: &AppState, account_id: Option<i64>) -> bool {
+    state.preferences.borrow().notifications_enabled
+        && state
+            .accounts
+            .borrow()
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.notify)
+            .unwrap_or(true)
 }
 
 fn start_account_monitors(state: Rc<AppState>) {
@@ -1751,13 +1765,7 @@ fn listen_for_monitor_reports(
             let should_notify = !report.initial
                 && report.new_messages > 0
                 && report.error.is_none()
-                && state
-                    .accounts
-                    .borrow()
-                    .iter()
-                    .find(|account| account.id == report.account_id)
-                    .map(|account| account.notify)
-                    .unwrap_or(true);
+                && notifications_allowed(&state, report.account_id);
             if should_notify {
                 mail::sync::notify_new_mail(
                     &report.email,
@@ -5200,6 +5208,51 @@ fn open_settings(state: Rc<AppState>) {
             open_account_editor(state_for_edit.clone(), account_for_edit.clone());
         });
         header.append(&edit);
+        let notify_label = gtk::Label::new(Some("Notify"));
+        notify_label.add_css_class("mail-reader-meta");
+        let notify = gtk::Switch::new();
+        notify.set_active(account.notify);
+        notify.set_tooltip_text(Some("Allow new-mail notifications for this account"));
+        let state_for_notify = state.clone();
+        let account_for_notify = account.clone();
+        notify.connect_active_notify(move |switcher| {
+            let mut updated = account_for_notify.clone();
+            updated.notify = switcher.is_active();
+            let database = state_for_notify.database.clone();
+            let state = state_for_notify.clone();
+            let (sender, receiver) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = database
+                    .save_account(&updated)
+                    .map(|_| updated)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send_blocking(result);
+            });
+            glib::MainContext::default().spawn_local(async move {
+                match receiver.recv().await {
+                    Ok(Ok(updated)) => {
+                        if let Some(stored) = state
+                            .accounts
+                            .borrow_mut()
+                            .iter_mut()
+                            .find(|stored| stored.id == updated.id)
+                        {
+                            stored.notify = updated.notify;
+                        }
+                    }
+                    Ok(Err(error)) => set_status(
+                        &state,
+                        &format!("Couldn’t save notification setting: {error}"),
+                    ),
+                    Err(_) => set_status(
+                        &state,
+                        "The notification setting worker stopped unexpectedly.",
+                    ),
+                }
+            });
+        });
+        header.append(&notify_label);
+        header.append(&notify);
         let signature_value = state
             .preferences
             .borrow()
@@ -5328,6 +5381,18 @@ fn open_settings(state: Rc<AppState>) {
         "Group messages into conversations",
         state.preferences.borrow().conversation_view,
         |preferences, active| preferences.conversation_view = active,
+    ));
+
+    let notifications = gtk::Label::new(Some("NOTIFICATIONS"));
+    notifications.set_xalign(0.0);
+    notifications.add_css_class("mail-section-label");
+    notifications.set_margin_top(24);
+    root.append(&notifications);
+    root.append(&preference_switch_row(
+        &state,
+        "New mail notifications",
+        state.preferences.borrow().notifications_enabled,
+        |preferences, active| preferences.notifications_enabled = active,
     ));
 
     let composing = gtk::Label::new(Some("COMPOSING"));

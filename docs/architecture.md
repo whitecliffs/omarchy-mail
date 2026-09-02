@@ -65,6 +65,9 @@ account email so changing a server password does not affect them. Missing or
 invalid preferences fall back to privacy-first defaults. Sender-level remote
 image permissions are stored in the same non-secret preference file; one-time
 message permissions live only for the running window.
+The same preference file stores the global notification switch; each account’s
+notification switch remains in the account record so one account can be quiet
+without silencing the others.
 Queued outgoing messages are durable user data in the `pending_sends` table;
 their selected attachments are copied to
 `XDG_DATA_HOME/omarchy-mail/outbox/` before the queue row is committed. This
