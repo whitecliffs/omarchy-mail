@@ -1447,6 +1447,17 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     date.add_css_class("mail-date");
     trailing.append(&date);
     let markers = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    markers.set_halign(gtk::Align::End);
+    if message.has_attachments {
+        let attachment = gtk::Image::from_icon_name("mail-attachment-symbolic");
+        attachment.add_css_class("mail-attachment");
+        markers.append(&attachment);
+    }
+    if message.thread_size > 1 {
+        let thread = gtk::Label::new(Some(&message.thread_size.to_string()));
+        thread.add_css_class("mail-count");
+        markers.append(&thread);
+    }
     let star = icon_button(
         if message.starred {
             "starred-symbolic"
@@ -1459,16 +1470,6 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     star.set_sensitive(message.id >= 0);
     star.set_widget_name(&format!("star-{}", message.id));
     markers.append(&star);
-    if message.has_attachments {
-        let attachment = gtk::Image::from_icon_name("mail-attachment-symbolic");
-        attachment.add_css_class("mail-attachment");
-        markers.append(&attachment);
-    }
-    if message.thread_size > 1 {
-        let thread = gtk::Label::new(Some(&message.thread_size.to_string()));
-        thread.add_css_class("mail-count");
-        markers.append(&thread);
-    }
     trailing.append(&markers);
     layout.append(&trailing);
     row.set_child(Some(&layout));
