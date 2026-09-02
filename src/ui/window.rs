@@ -39,6 +39,8 @@ struct AppState {
     search_results: RefCell<Option<(String, Vec<Message>)>>,
     search_generation: Cell<u64>,
     search_pending: Cell<bool>,
+    cache_load_generation: Cell<u64>,
+    cache_load_pending: Cell<bool>,
     scope: RefCell<MailScope>,
     search_filters: RefCell<SearchFilters>,
     selected_message: RefCell<Option<i64>>,
@@ -122,9 +124,7 @@ pub fn build_window(application: &adw::Application) {
     let messages = if demo_mode {
         Message::demo_messages()
     } else {
-        database
-            .list_messages_filtered_page(None, Some("Inbox"), false, MESSAGE_PAGE_SIZE, 0)
-            .unwrap_or_default()
+        Vec::new()
     };
 
     let window = adw::ApplicationWindow::builder()
@@ -221,6 +221,8 @@ pub fn build_window(application: &adw::Application) {
         search_results: RefCell::new(None),
         search_generation: Cell::new(0),
         search_pending: Cell::new(false),
+        cache_load_generation: Cell::new(0),
+        cache_load_pending: Cell::new(false),
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
         search_filters: RefCell::new(SearchFilters::default()),
         selected_message: RefCell::new(None),
@@ -244,9 +246,9 @@ pub fn build_window(application: &adw::Application) {
         message_offset: Cell::new(if demo_mode {
             Message::demo_messages().len()
         } else {
-            MESSAGE_PAGE_SIZE
+            0
         }),
-        has_more_messages: Cell::new(!demo_mode),
+        has_more_messages: Cell::new(false),
         demo_mode,
     });
 
@@ -279,6 +281,7 @@ pub fn build_window(application: &adw::Application) {
     state
         .load_more
         .connect_clicked(move |_| load_more_messages(&state_for_load_more));
+    load_messages_for_scope(&state);
     render_sidebar(&state);
     render_messages(&state, "");
     render_reader(&state, None);
@@ -1266,6 +1269,7 @@ fn select_scope(state: &Rc<AppState>, scope: MailScope) {
     };
     state.scope.replace(scope);
     state.selected_message.replace(None);
+    state.messages.replace(Vec::new());
     load_messages_for_scope(state);
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
@@ -1279,47 +1283,98 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
     if state.demo_mode {
         return;
     }
+    let generation = state.cache_load_generation.get().wrapping_add(1);
+    state.cache_load_generation.set(generation);
+    state.cache_load_pending.set(true);
     state.message_offset.set(0);
     state.has_more_messages.set(false);
     let scope = state.scope.borrow().clone();
-    if let Some(account_id) = match scope {
-        MailScope::Unified(folder) if folder == "Outbox" => Some(None),
-        MailScope::Account { id, folder } if folder == "Outbox" => Some(Some(id)),
-        _ => None,
-    } {
-        state
-            .messages
-            .replace(load_outbox_messages(state, account_id));
-        state.message_offset.set(state.messages.borrow().len());
-        return;
-    }
-    let scope = state.scope.borrow().clone();
-    let result = match scope {
-        MailScope::Unified(folder) if folder == "Starred" => state
-            .database
-            .list_messages_filtered_page(None, None, true, MESSAGE_PAGE_SIZE, 0),
-        MailScope::Unified(folder) => state.database.list_messages_filtered_page(
-            None,
-            Some(&folder),
-            false,
-            MESSAGE_PAGE_SIZE,
-            0,
-        ),
-        MailScope::Account { id, folder } => state.database.list_messages_filtered_page(
-            Some(id),
-            Some(&folder),
-            false,
-            MESSAGE_PAGE_SIZE,
-            0,
-        ),
-    };
-    if let Ok(messages) = result {
-        state
-            .has_more_messages
-            .set(messages.len() == MESSAGE_PAGE_SIZE);
-        state.message_offset.set(messages.len());
-        state.messages.replace(messages);
-    }
+    let scope_for_worker = scope.clone();
+    let accounts = state.accounts.borrow().clone();
+    let database = state.database.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = match &scope_for_worker {
+            MailScope::Unified(folder) if folder == "Outbox" => {
+                load_outbox_messages(&database, &accounts, None)
+            }
+            MailScope::Account { id, folder } if folder == "Outbox" => {
+                load_outbox_messages(&database, &accounts, Some(*id))
+            }
+            MailScope::Unified(folder) if folder == "Starred" => {
+                database.list_messages_filtered_page(None, None, true, MESSAGE_PAGE_SIZE, 0)
+            }
+            MailScope::Unified(folder) => database.list_messages_filtered_page(
+                None,
+                Some(folder),
+                false,
+                MESSAGE_PAGE_SIZE,
+                0,
+            ),
+            MailScope::Account { id, folder } => database.list_messages_filtered_page(
+                Some(*id),
+                Some(folder),
+                false,
+                MESSAGE_PAGE_SIZE,
+                0,
+            ),
+        };
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = receiver.recv().await;
+        if state_for_result.cache_load_generation.get() != generation
+            || *state_for_result.scope.borrow() != scope
+        {
+            return;
+        }
+        state_for_result.cache_load_pending.set(false);
+        match result {
+            Ok(Ok(messages)) => {
+                state_for_result
+                    .has_more_messages
+                    .set(messages.len() == MESSAGE_PAGE_SIZE);
+                state_for_result.message_offset.set(messages.len());
+                state_for_result.messages.replace(messages);
+                render_sidebar(&state_for_result);
+                render_messages(
+                    &state_for_result,
+                    state_for_result.search_entry.text().as_str(),
+                );
+                let selected_id = *state_for_result.selected_message.borrow();
+                let selected = selected_id.and_then(|id| {
+                    state_for_result
+                        .messages
+                        .borrow()
+                        .iter()
+                        .find(|message| message.id == id)
+                        .cloned()
+                });
+                render_reader(&state_for_result, selected);
+            }
+            Ok(Err(error)) => {
+                render_messages(
+                    &state_for_result,
+                    state_for_result.search_entry.text().as_str(),
+                );
+                set_status(
+                    &state_for_result,
+                    &format!("Couldn’t load cached messages: {error}"),
+                );
+            }
+            Err(_) => {
+                render_messages(
+                    &state_for_result,
+                    state_for_result.search_entry.text().as_str(),
+                );
+                set_status(
+                    &state_for_result,
+                    "The cached message worker stopped unexpectedly.",
+                );
+            }
+        }
+    });
 }
 
 fn load_more_messages(state: &Rc<AppState>) {
@@ -1341,6 +1396,7 @@ fn load_more_messages(state: &Rc<AppState>) {
         return;
     }
     let offset = state.message_offset.get();
+    let load_generation = state.cache_load_generation.get();
     state.load_more.set_sensitive(false);
     let database = state.database.clone();
     let (sender, receiver) = async_channel::bounded(1);
@@ -1359,7 +1415,9 @@ fn load_more_messages(state: &Rc<AppState>) {
         state_for_result.load_more.set_sensitive(true);
         match receiver.recv().await {
             Ok(Ok(messages)) => {
-                if *state_for_result.scope.borrow() != scope {
+                if state_for_result.cache_load_generation.get() != load_generation
+                    || *state_for_result.scope.borrow() != scope
+                {
                     return;
                 }
                 let loaded = messages.len();
@@ -1394,22 +1452,22 @@ fn load_more_messages(state: &Rc<AppState>) {
     });
 }
 
-fn load_outbox_messages(state: &Rc<AppState>, account_id: Option<i64>) -> Vec<Message> {
-    state
-        .database
-        .pending_sends(account_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|send| {
-            state
-                .accounts
-                .borrow()
-                .iter()
-                .find(|account| account.id == Some(send.account_id))
-                .cloned()
-                .map(|account| pending_send_message(&send, &account))
-        })
-        .collect()
+fn load_outbox_messages(
+    database: &Database,
+    accounts: &[Account],
+    account_id: Option<i64>,
+) -> Result<Vec<Message>, crate::database::DatabaseError> {
+    database.pending_sends(account_id).map(|sends| {
+        sends
+            .into_iter()
+            .filter_map(|send| {
+                accounts
+                    .iter()
+                    .find(|account| account.id == Some(send.account_id))
+                    .map(|account| pending_send_message(&send, account))
+            })
+            .collect()
+    })
 }
 
 fn pending_send_message(send: &PendingSend, account: &Account) -> Message {
@@ -1638,6 +1696,8 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
             ("Searching…", "Looking through your cached messages.")
         } else if !raw_query.is_empty() {
             ("No messages found", "Try a different search.")
+        } else if state.cache_load_pending.get() {
+            ("Loading messages…", "Reading your cached mailbox.")
         } else if is_outbox_scope {
             (
                 "Outbox is clear",

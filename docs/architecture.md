@@ -164,6 +164,11 @@ scope still matches, while search stays bounded to its first indexed page.
 This keeps GTK row creation and initial cache reads bounded for large
 mailboxes without making the SQLite cache authoritative.
 
+The initial mailbox page and Outbox reads use the same worker boundary. A
+per-load generation plus the selected scope are checked before applying a
+result, so switching folders quickly cannot display a late result for an old
+scope.
+
 The protocol boundary has offline socket integration coverage in the IMAP and
 SMTP modules. The tests run the production clients against temporary local
 servers, so login, folder discovery, UID FETCH literals, MIME parsing, SMTP
