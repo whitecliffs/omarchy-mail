@@ -54,9 +54,10 @@ images remain in place as placeholders. Incoming attachments are cached under
 can be saved from the reader.
 
 The local search index supports responsive prefix searches while treating
-typed FTS punctuation as ordinary text. During synchronisation, one malformed
-MIME message is skipped and reported without preventing the rest of the
-mailbox from being cached.
+typed FTS punctuation as ordinary text. Searches run off the GTK thread and
+discard stale results when typing continues. During synchronisation, one
+malformed MIME message is skipped and reported without preventing the rest of
+the mailbox from being cached.
 
 Message moves and copies are account-local actions. A move updates the cached
 message immediately and queues an IMAP UID COPY plus delete/expunge; a copy

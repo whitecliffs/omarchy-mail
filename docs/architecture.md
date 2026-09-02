@@ -119,6 +119,11 @@ Search terms are converted to SQLite FTS5 prefix expressions after quoting
 embedded syntax characters. This keeps the index responsive while ensuring
 operators typed into the search field remain plain search text.
 
+The GTK search callback only starts a bounded worker query. Each query carries
+a generation and exact text check, so results from an older keystroke cannot
+replace a newer search; the UI shows a small searching state while the cache
+is being queried.
+
 Remote refreshes update message metadata and attachment state without
 discarding an optimistic local read/star toggle. Pending flag actions are
 reapplied after each cache refresh and remain authoritative in the UI until

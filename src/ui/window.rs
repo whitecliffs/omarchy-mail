@@ -36,6 +36,9 @@ struct AppState {
     reader: gtk::Box,
     navigation: gtk::Button,
     search_entry: gtk::SearchEntry,
+    search_results: RefCell<Option<(String, Vec<Message>)>>,
+    search_generation: Cell<u64>,
+    search_pending: Cell<bool>,
     scope: RefCell<MailScope>,
     search_filters: RefCell<SearchFilters>,
     selected_message: RefCell<Option<i64>>,
@@ -215,6 +218,9 @@ pub fn build_window(application: &adw::Application) {
         reader,
         navigation: navigation.clone(),
         search_entry: search.clone(),
+        search_results: RefCell::new(None),
+        search_generation: Cell::new(0),
+        search_pending: Cell::new(false),
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
         search_filters: RefCell::new(SearchFilters::default()),
         selected_message: RefCell::new(None),
@@ -256,7 +262,7 @@ pub fn build_window(application: &adw::Application) {
     connect_header_actions(state.clone(), &compose, &refresh, &settings, &navigation);
     let state_for_search = state.clone();
     search.connect_search_changed(move |entry| {
-        render_messages(&state_for_search, entry.text().as_str())
+        start_message_search(&state_for_search, entry.text().as_str())
     });
     let state_for_filter = state.clone();
     filter_button.connect_clicked(move |button| open_filter_menu(state_for_filter.clone(), button));
@@ -1538,6 +1544,56 @@ fn default_remote_folder(local_name: &str) -> &str {
     }
 }
 
+fn start_message_search(state: &Rc<AppState>, query: &str) {
+    let query = query.trim().to_string();
+    let generation = state.search_generation.get().wrapping_add(1);
+    state.search_generation.set(generation);
+    state.search_results.replace(None);
+
+    let is_outbox_scope = matches!(
+        &*state.scope.borrow(),
+        MailScope::Unified(folder) | MailScope::Account { folder, .. } if folder == "Outbox"
+    );
+    if query.is_empty() || state.demo_mode || is_outbox_scope {
+        state.search_pending.set(false);
+        render_messages(state, &query);
+        return;
+    }
+
+    state.search_pending.set(true);
+    render_messages(state, &query);
+    let database = state.database.clone();
+    let query_for_worker = query.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let result = database.search_messages_page(&query_for_worker, MESSAGE_PAGE_SIZE, 0);
+        let _ = sender.send_blocking(result);
+    });
+    let state_for_result = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = receiver.recv().await;
+        if state_for_result.search_generation.get() != generation
+            || state_for_result.search_entry.text().trim() != query
+        {
+            return;
+        }
+        state_for_result.search_pending.set(false);
+        match result {
+            Ok(Ok(messages)) => {
+                state_for_result
+                    .search_results
+                    .replace(Some((query.clone(), messages)));
+                render_messages(&state_for_result, &query);
+            }
+            Ok(Err(error)) => set_status(
+                &state_for_result,
+                &format!("Couldn’t search cached messages: {error}"),
+            ),
+            Err(_) => set_status(&state_for_result, "The search worker stopped unexpectedly."),
+        }
+    });
+}
+
 fn render_messages(state: &Rc<AppState>, query: &str) {
     state.message_list.unselect_all();
     state.selected_messages.borrow_mut().clear();
@@ -1556,9 +1612,12 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         state.messages.borrow().clone()
     } else {
         state
-            .database
-            .search_messages_page(raw_query, MESSAGE_PAGE_SIZE, 0)
-            .unwrap_or_else(|_| state.messages.borrow().clone())
+            .search_results
+            .borrow()
+            .as_ref()
+            .filter(|(search_query, _)| search_query == raw_query)
+            .map(|(_, messages)| messages.clone())
+            .unwrap_or_default()
     };
     let can_load_more = raw_query.is_empty()
         && !state.demo_mode
@@ -1580,7 +1639,9 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         })
         .collect::<Vec<_>>();
     if visible.is_empty() {
-        let (title, subtitle) = if !raw_query.is_empty() {
+        let (title, subtitle) = if !raw_query.is_empty() && state.search_pending.get() {
+            ("Searching…", "Looking through your cached messages.")
+        } else if !raw_query.is_empty() {
             ("No messages found", "Try a different search.")
         } else if is_outbox_scope {
             (
