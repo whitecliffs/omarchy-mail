@@ -1653,7 +1653,11 @@ fn sync_all(state: Rc<AppState>, notify: bool) {
             if let Some(error) = report.error {
                 errors.push(format!("{}: {error}", report.email));
             } else if notify && report.new_messages > 0 {
-                crate::mail::sync::notify_new_mail(&report.email, report.new_messages);
+                crate::mail::sync::notify_new_mail(
+                    &report.email,
+                    report.new_messages,
+                    report.newest_message.as_ref(),
+                );
             }
             if let Ok(folders) = state.database.load_folders() {
                 state.folders.replace(folders);
@@ -1755,7 +1759,11 @@ fn listen_for_monitor_reports(
                     .map(|account| account.notify)
                     .unwrap_or(true);
             if should_notify {
-                mail::sync::notify_new_mail(&report.email, report.new_messages);
+                mail::sync::notify_new_mail(
+                    &report.email,
+                    report.new_messages,
+                    report.newest_message.as_ref(),
+                );
             }
 
             if let Ok(folders) = state.database.load_folders() {

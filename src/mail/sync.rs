@@ -15,9 +15,16 @@ pub struct SyncReport {
     pub email: String,
     pub fetched: usize,
     pub new_messages: usize,
+    pub newest_message: Option<NotificationMessage>,
     pub skipped_messages: usize,
     pub initial: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationMessage {
+    pub sender: String,
+    pub subject: String,
 }
 
 #[derive(Debug)]
@@ -45,13 +52,31 @@ pub struct OutboxReport {
     pub error: Option<String>,
 }
 
-pub fn notify_new_mail(account: &str, fetched: usize) {
+pub fn notify_new_mail(
+    account: &str,
+    fetched: usize,
+    newest_message: Option<&NotificationMessage>,
+) {
     if fetched == 0 {
         return;
     }
+    let summary = newest_message
+        .map(|message| {
+            if message.sender.trim().is_empty() {
+                account.to_string()
+            } else {
+                message.sender.clone()
+            }
+        })
+        .unwrap_or_else(|| account.to_string());
+    let body = newest_message
+        .map(|message| message.subject.trim())
+        .filter(|subject| !subject.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{fetched} message(s) available in your inbox"));
     let _ = notify_rust::Notification::new()
-        .summary(account)
-        .body(&format!("{fetched} message(s) available in your inbox"))
+        .summary(&summary)
+        .body(&body)
         .icon("org.omarchy.Mail")
         .show();
 }
@@ -137,6 +162,7 @@ pub fn spawn_account_monitor(
                         email: account.email.clone(),
                         fetched: 0,
                         new_messages: 0,
+                        newest_message: None,
                         skipped_messages: 0,
                         initial: false,
                         error: Some(error.to_string()),
@@ -157,6 +183,7 @@ pub fn spawn_account_monitor(
                         email: account.email.clone(),
                         fetched: 0,
                         new_messages: 0,
+                        newest_message: None,
                         skipped_messages: 0,
                         initial: false,
                         error: Some(format!("IMAP monitor reconnecting: {error}")),
@@ -316,6 +343,18 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                         });
                         report = Some(match database.upsert_messages(&messages) {
                             Ok(new_messages) => {
+                                let newest_message = if new_messages > 0 {
+                                    messages.first().map(|message| NotificationMessage {
+                                        sender: if message.sender_name.trim().is_empty() {
+                                            message.sender_email.clone()
+                                        } else {
+                                            message.sender_name.clone()
+                                        },
+                                        subject: message.subject.clone(),
+                                    })
+                                } else {
+                                    None
+                                };
                                 let mut cache_error = reconciliation_error.clone();
                                 if let Some(account_id) = account.id
                                     && let Err(error) = database.reapply_pending_actions(account_id)
@@ -353,6 +392,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                                     email: account.email.clone(),
                                     fetched,
                                     new_messages,
+                                    newest_message,
                                     skipped_messages,
                                     initial: false,
                                     error: cache_error,
@@ -363,6 +403,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                                 email: account.email.clone(),
                                 fetched,
                                 new_messages: 0,
+                                newest_message: None,
                                 skipped_messages,
                                 initial: false,
                                 error: Some(error.to_string()),
@@ -383,6 +424,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
                 email: account.email.clone(),
                 fetched: 0,
                 new_messages: 0,
+                newest_message: None,
                 skipped_messages: 0,
                 initial: false,
                 error: last_error,
@@ -393,6 +435,7 @@ fn sync_account_once(account: &Account, database: &Database) -> SyncReport {
             email: account.email.clone(),
             fetched: 0,
             new_messages: 0,
+            newest_message: None,
             skipped_messages: 0,
             initial: false,
             error: Some(error.to_string()),
