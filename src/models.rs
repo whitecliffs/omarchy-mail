@@ -166,6 +166,27 @@ pub struct Message {
     pub thread_size: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarEvent {
+    pub id: i64,
+    pub title: String,
+    pub notes: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub location: String,
+    pub message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: i64,
+    pub title: String,
+    pub notes: String,
+    pub due_at: Option<String>,
+    pub completed: bool,
+    pub message_id: Option<i64>,
+}
+
 impl Message {
     pub fn demo_messages() -> Vec<Self> {
         vec![

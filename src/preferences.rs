@@ -26,6 +26,14 @@ pub struct Preferences {
     pub sidebar_width: i32,
     #[serde(default = "default_message_list_width")]
     pub message_list_width: i32,
+    #[serde(default = "default_date_time_format")]
+    pub date_time_format: String,
+    #[serde(default)]
+    pub icloud_calendar: Option<crate::icloud::CalendarAccount>,
+    #[serde(default = "default_true")]
+    pub show_personal_calendar: bool,
+    #[serde(default)]
+    pub calendar_subscriptions: Vec<crate::subscriptions::Subscription>,
 }
 
 impl Default for Preferences {
@@ -40,6 +48,10 @@ impl Default for Preferences {
             collapsed_accounts: Vec::new(),
             sidebar_width: default_sidebar_width(),
             message_list_width: default_message_list_width(),
+            date_time_format: default_date_time_format(),
+            icloud_calendar: None,
+            show_personal_calendar: true,
+            calendar_subscriptions: Vec::new(),
         }
     }
 }
@@ -150,6 +162,10 @@ fn default_message_list_width() -> i32 {
     440
 }
 
+fn default_date_time_format() -> String {
+    "day-month-24-hour".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +179,7 @@ mod tests {
         assert!(!preferences.plain_text_warning);
         assert_eq!(preferences.sidebar_width, 258);
         assert_eq!(preferences.message_list_width, 440);
+        assert_eq!(preferences.date_time_format, "day-month-24-hour");
     }
 
     #[test]

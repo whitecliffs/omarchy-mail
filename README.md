@@ -4,6 +4,36 @@ Omarchy Mail is a lightweight, native email client for Omarchy Linux. It is
 designed around calm typography, clear hierarchy, and the practical reliability
 of a local cache rather than a dashboard full of unrelated features.
 
+This is an independent community project for Omarchy. It is not an official
+Omarchy component. Contributions, bug reports, and careful testing are welcome.
+
+## Install
+
+On Arch Linux and Omarchy, the recommended installation is the community AUR
+package:
+
+```bash
+yay -S omarchy-mail
+```
+
+The package builds Omarchy Mail from the tagged source release. It installs the
+application, desktop entry, icon, AppStream metadata, Omarchy theme template,
+and the Python calendar dependencies used by iCloud Calendar and calendar
+subscriptions. The first launch opens the account setup flow.
+
+For development or to try the latest checkout:
+
+```bash
+sudo pacman -S --needed webkitgtk-6.0 rust pkgconf libsecret python \
+  python-icalendar python-recurring-ical-events python-defusedxml
+git clone https://github.com/whitecliffs/omarchy-mail.git
+cd omarchy-mail
+cargo test --locked
+OMARCHY_MAIL_DEMO=1 cargo run
+```
+
+The demo mode previews the interface without connecting to an account.
+
 The current working slice includes the GTK4/libadwaita shell, responsive
 three-pane layout, first-run account flow, Secret Service credential storage,
 SQLite/FTS cache, safe MIME boundary, provider discovery, background IMAP
@@ -97,12 +127,12 @@ HTML is sanitized before it is stored in a draft or handed to SMTP.
 
 ## Build and preview
 
-System requirements are the Omarchy GTK stack, WebKitGTK 6, Rust, and a Secret
-Service provider. On this machine GTK4 4.22.4, libadwaita 1.9.3, SQLite,
-libsecret, and Rust 1.98 are available. Install the renderer on Arch with:
+System requirements are GTK4, libadwaita, WebKitGTK 6, Rust, SQLite, and a
+Secret Service provider. On Arch, install the build dependencies with:
 
 ```bash
-sudo pacman -S --needed webkitgtk-6.0
+sudo pacman -S --needed webkitgtk-6.0 rust pkgconf libsecret python \
+  python-icalendar python-recurring-ical-events python-defusedxml
 ```
 
 ```bash
@@ -128,22 +158,17 @@ The uninstall script removes only the development binary, desktop metadata,
 AppStream metadata, icon, and unchanged theme template. It does not remove
 mail data from `~/.local/share/omarchy-mail/`.
 
-For an Arch package, create the release source archive beside
-`packaging/PKGBUILD`, then generate and record its checksum before building:
+To build the Arch package locally from a tagged release:
 
 ```bash
-git archive --format=tar.gz --prefix=omarchy-mail-0.1.0/ \
-  -o packaging/omarchy-mail-0.1.0.tar.gz HEAD
 cd packaging
 makepkg -g
-makepkg --verifysource
 makepkg
 ```
 
-Replace the `sha256sums` value in the PKGBUILD with the output from `makepkg
--g` for a published release. The package installs the desktop and AppStream
-metadata in the normal XDG/system locations, and installs its Omarchy theme
-template into the generator’s packaged template directory.
+The package installs the desktop and AppStream metadata in the normal XDG/system
+locations, and installs its Omarchy theme template into the generator’s packaged
+template directory.
 
 The test suite includes fixture messages for UTF-8 headers, multipart
 attachments, inline and remote images, truncated MIME, and a serialized SMTP
@@ -230,3 +255,21 @@ palette for live updates.
 
 See [docs/architecture.md](docs/architecture.md) for the main design
 decisions and boundaries.
+
+See [docs/icloud-calendar.md](docs/icloud-calendar.md) for iCloud Calendar and
+subscription setup.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Please
+include the provider, desktop environment, and reproduction steps for mail
+issues, and never include real credentials, message contents, tokens, or
+private calendar URLs in bug reports.
+
+## Support and security
+
+Use [GitHub Discussions](https://github.com/whitecliffs/omarchy-mail/discussions)
+for questions and design discussion, and
+[GitHub Issues](https://github.com/whitecliffs/omarchy-mail/issues) for
+reproducible bugs. Report suspected security issues privately to the repository
+maintainer rather than posting credentials or sensitive mail data publicly.

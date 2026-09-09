@@ -1,6 +1,6 @@
 use crate::models::{
-    Account, AttachmentInfo, MailFolder, Message, OutgoingAttachment, PendingAction, PendingSend,
-    ServerConfig,
+    Account, AttachmentInfo, CalendarEvent, MailFolder, Message, OutgoingAttachment, PendingAction,
+    PendingSend, ServerConfig, TodoItem,
 };
 use crate::security;
 use chrono::Utc;
@@ -112,6 +112,40 @@ impl Database {
                 "ALTER TABLE messages ADD COLUMN body_html TEXT;
                  ALTER TABLE pending_sends ADD COLUMN body_html TEXT;
                  UPDATE schema_version SET version = 5;",
+            )?;
+        }
+        if version < 6 {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS calendar_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    starts_at TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    location TEXT NOT NULL DEFAULT '',
+                    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS calendar_events_start_idx
+                    ON calendar_events(starts_at);
+                CREATE TABLE IF NOT EXISTS todo_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    due_at TEXT,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS todo_items_due_idx
+                    ON todo_items(completed, due_at);
+                UPDATE schema_version SET version = 6;",
+            )?;
+        }
+        if version < 7 {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS calendar_sync_links (
+                event_id INTEGER PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+                source TEXT NOT NULL, remote_key TEXT NOT NULL, href TEXT NOT NULL,
+                UNIQUE(source, remote_key)); UPDATE schema_version SET version = 7;",
             )?;
         }
         Ok(())
@@ -568,6 +602,180 @@ impl Database {
         connection.execute(
             "UPDATE messages SET starred = ?1 WHERE id = ?2",
             params![starred as i64, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_calendar_events(&self) -> Result<Vec<CalendarEvent>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, title, notes, starts_at, ends_at, location, message_id
+             FROM calendar_events ORDER BY starts_at, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CalendarEvent {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                notes: row.get(2)?,
+                starts_at: row.get(3)?,
+                ends_at: row.get(4)?,
+                location: row.get(5)?,
+                message_id: row.get(6)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn pending_calendar_events(&self, after: i64) -> Result<Vec<CalendarEvent>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT event_id FROM calendar_sync_links")?;
+        let mapped = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(self
+            .list_calendar_events()?
+            .into_iter()
+            .filter(|e| e.id > after && !mapped.contains(&e.id))
+            .collect())
+    }
+
+    pub fn apply_calendar_snapshot(
+        &self,
+        source: &str,
+        snapshot: &crate::icloud::Snapshot,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let existing = {
+            let mut statement = tx.prepare(
+                "SELECT event_id, remote_key, href FROM calendar_sync_links WHERE source=?1",
+            )?;
+            statement
+                .query_map([source], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut seen = HashSet::new();
+        for remote in &snapshot.events {
+            let id = existing
+                .iter()
+                .find(|(id, key, _)| !seen.contains(id) && key == &remote.key)
+                .or_else(|| {
+                    if existing
+                        .iter()
+                        .filter(|(_, _, href)| href == &remote.href)
+                        .count()
+                        == 1
+                        && snapshot
+                            .events
+                            .iter()
+                            .filter(|e| e.href == remote.href)
+                            .count()
+                            == 1
+                    {
+                        existing
+                            .iter()
+                            .find(|(id, _, href)| !seen.contains(id) && href == &remote.href)
+                    } else {
+                        None
+                    }
+                })
+                .map(|(id, _, _)| *id)
+                .or_else(|| {
+                    snapshot
+                        .uploaded
+                        .iter()
+                        .find(|u| u.href == remote.href && !seen.contains(&u.id))
+                        .map(|u| u.id)
+                });
+            let e = &remote.event;
+            let id = if let Some(id) = id {
+                tx.execute("UPDATE calendar_events SET title=?1, notes=?2, starts_at=?3, ends_at=?4, location=?5 WHERE id=?6",
+                    params![e.title,e.notes,e.starts_at,e.ends_at,e.location,id])?;
+                id
+            } else {
+                tx.execute("INSERT INTO calendar_events(title,notes,starts_at,ends_at,location) VALUES (?1,?2,?3,?4,?5)",
+                    params![e.title,e.notes,e.starts_at,e.ends_at,e.location])?;
+                tx.last_insert_rowid()
+            };
+            tx.execute("INSERT INTO calendar_sync_links(event_id,source,remote_key,href) VALUES (?1,?2,?3,?4)
+                ON CONFLICT(event_id) DO UPDATE SET remote_key=excluded.remote_key,href=excluded.href,source=excluded.source",
+                params![id,source,remote.key,remote.href])?;
+            seen.insert(id);
+        }
+        for (id, _, _) in existing {
+            if !seen.contains(&id) {
+                tx.execute("DELETE FROM calendar_events WHERE id=?1", [id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn create_calendar_event(&self, event: &CalendarEvent) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO calendar_events(title, notes, starts_at, ends_at, location, message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.title,
+                event.notes,
+                event.starts_at,
+                event.ends_at,
+                event.location,
+                event.message_id
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn list_todo_items(&self) -> Result<Vec<TodoItem>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, title, notes, due_at, completed, message_id
+             FROM todo_items ORDER BY completed, due_at IS NULL, due_at, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(TodoItem {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                notes: row.get(2)?,
+                due_at: row.get(3)?,
+                completed: row.get::<_, i64>(4)? != 0,
+                message_id: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn create_todo_item(&self, item: &TodoItem) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO todo_items(title, notes, due_at, completed, message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                item.title,
+                item.notes,
+                item.due_at,
+                item.completed as i64,
+                item.message_id
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn set_todo_completed(&self, todo_id: i64, completed: bool) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE todo_items SET completed = ?1 WHERE id = ?2",
+            params![completed as i64, todo_id],
         )?;
         Ok(())
     }
@@ -1044,6 +1252,120 @@ mod tests {
     use super::*;
     use crate::models::{AuthMethod, OutgoingAttachment, PendingSend, SecurityMode};
     use tempfile::tempdir;
+
+    #[test]
+    fn calendar_sync_reuses_uploaded_ids_and_preserves_local_events() {
+        use crate::icloud::{RemoteEvent, Snapshot, Uploaded};
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        let mut event = CalendarEvent {
+            id: 0,
+            title: "Local".into(),
+            notes: "".into(),
+            starts_at: "2026-09-10 12:00".into(),
+            ends_at: "2026-09-10 13:00".into(),
+            location: "".into(),
+            message_id: None,
+        };
+        let untouched = database.create_calendar_event(&event).unwrap();
+        let uploaded = database.create_calendar_event(&event).unwrap();
+        event.title = "Changed on Apple Calendar".into();
+        let snapshot = Snapshot {
+            events: vec![RemoteEvent {
+                key: "uid#time".into(),
+                href: "/event.ics".into(),
+                event: event.clone(),
+            }],
+            uploaded: vec![Uploaded {
+                id: uploaded,
+                href: "/event.ics".into(),
+            }],
+        };
+        database
+            .apply_calendar_snapshot("icloud", &snapshot)
+            .unwrap();
+        database
+            .apply_calendar_snapshot("icloud", &snapshot)
+            .unwrap();
+        let stored = database.list_calendar_events().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().find(|e| e.id == uploaded).unwrap().title,
+            event.title
+        );
+        assert_eq!(
+            database.pending_calendar_events(0).unwrap()[0].id,
+            untouched
+        );
+        database
+            .apply_calendar_snapshot(
+                "other-calendar",
+                &Snapshot {
+                    events: vec![],
+                    uploaded: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(database.list_calendar_events().unwrap().len(), 2);
+        database
+            .apply_calendar_snapshot(
+                "icloud",
+                &Snapshot {
+                    events: vec![],
+                    uploaded: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(database.list_calendar_events().unwrap()[0].id, untouched);
+        assert_eq!(database.list_calendar_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_calendar_snapshot_rolls_back_updates() {
+        use crate::icloud::{RemoteEvent, Snapshot};
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        let event = CalendarEvent {
+            id: 0,
+            title: "Original".into(),
+            notes: "".into(),
+            starts_at: "2026-09-10 12:00".into(),
+            ends_at: "2026-09-10 13:00".into(),
+            location: "".into(),
+            message_id: None,
+        };
+        let good = Snapshot {
+            events: vec![RemoteEvent {
+                key: "key".into(),
+                href: "/one".into(),
+                event: event.clone(),
+            }],
+            uploaded: vec![],
+        };
+        database.apply_calendar_snapshot("icloud", &good).unwrap();
+        let mut changed = event.clone();
+        changed.title = "Should roll back".into();
+        let bad = Snapshot {
+            events: vec![
+                RemoteEvent {
+                    key: "key".into(),
+                    href: "/one".into(),
+                    event: changed.clone(),
+                },
+                RemoteEvent {
+                    key: "key".into(),
+                    href: "/two".into(),
+                    event: changed,
+                },
+            ],
+            uploaded: vec![],
+        };
+        assert!(database.apply_calendar_snapshot("icloud", &bad).is_err());
+        assert_eq!(
+            database.list_calendar_events().unwrap()[0].title,
+            "Original"
+        );
+    }
 
     #[test]
     fn creates_schema_and_round_trips_account_without_password() {

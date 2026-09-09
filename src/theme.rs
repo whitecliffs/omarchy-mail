@@ -136,7 +136,13 @@ window.omarchy-mail-window {{
 .mail-reader-subject {{ color: @om-light-foreground; font-size: 1.5em; font-weight: 700; }}
 .mail-reader-sender {{ color: @om-light-foreground; font-weight: 700; }}
 .mail-reader-meta {{ color: @om-muted; }}
+button.planner-event {{ min-width: 0; min-height: 0; padding: 2px 0; }}
+button.planner-event:hover {{ background: alpha(@om-selection, 0.5); }}
+.planner-personal {{ color: @om-accent; }}
+.planner-subscription {{ color: @om-yellow; }}
 .mail-reader-body {{ color: @om-foreground; font-size: 1.03em; line-height: 1.5; background: transparent; border: none; padding: 0; }}
+entry.planner-time-segment, entry.planner-time-segment text {{ min-width: 0; min-height: 0; padding: 0; margin: 0; border: none; border-radius: 0; background: transparent; box-shadow: none; outline: none; font-family: monospace; }}
+.planner-time-separator {{ padding: 0; margin: 0; font-family: monospace; }}
 .mail-reader-body text {{ color: @om-foreground; background: transparent; }}
 .mail-html-document {{ color: @om-foreground; }}
 .mail-html-table {{ min-width: 0; }}

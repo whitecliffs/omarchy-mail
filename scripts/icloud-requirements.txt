@@ -1,0 +1,3 @@
+icalendar==6.3.2
+recurring-ical-events==3.8.0
+defusedxml==0.7.1

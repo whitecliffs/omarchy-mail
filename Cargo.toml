@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "A calm, native email client for Omarchy"
 license = "MIT"
-repository = "https://github.com/omarchy/omarchy-mail"
+repository = "https://github.com/whitecliffs/omarchy-mail"
 
 [dependencies]
 adw = { package = "libadwaita", version = "0.8" }

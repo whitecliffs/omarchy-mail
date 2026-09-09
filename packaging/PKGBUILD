@@ -3,19 +3,19 @@ pkgver=0.1.0
 pkgrel=7
 pkgdesc='A calm, native email client for Omarchy'
 arch=('x86_64')
-url='https://github.com/omarchy/omarchy-mail'
+url='https://github.com/whitecliffs/omarchy-mail'
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret' 'openssl')
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'libsecret' 'openssl' 'python' 'python-icalendar' 'python-recurring-ical-events' 'python-defusedxml')
 optdepends=('omarchy-settings: Omarchy theme template generation')
 makedepends=('rust')
 # Cargo's release profile already enables thin LTO.  Disabling makepkg's
 # additional C-level LTO keeps rusqlite's bundled SQLite archive linkable with
 # Arch's lld toolchain while retaining the release optimisation settings.
 options=('!lto')
-# Build from the release archive placed beside this PKGBUILD. When publishing
-# a release, replace SKIP with the archive's sha256 from `makepkg -g`.
-source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+# Build from the immutable tagged source archive published on GitHub. Replace
+# the checksum when publishing a new release.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/whitecliffs/omarchy-mail/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('REPLACE_WITH_RELEASE_SHA256')
 
 build() {
   cd "$pkgname-$pkgver"

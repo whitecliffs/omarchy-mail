@@ -570,8 +570,12 @@ fn reconcile_client<T: Read + Write>(
                         ImapError::InvalidAction(format!("missing value for {}", action.action))
                     })?;
                 let flag = match (action.action.as_str(), value) {
-                    ("read", true) => "+FLAGS (\\Seen)",
-                    ("read", false) => "-FLAGS (\\Seen)",
+                    // The queue stores the local `unread` value (including
+                    // auto-read, bulk actions and notification actions), not
+                    // the inverse IMAP Seen flag. Preserve that queue format
+                    // so previously queued actions are also sent correctly.
+                    ("read", false) => "+FLAGS (\\Seen)",
+                    ("read", true) => "-FLAGS (\\Seen)",
                     ("star", true) => "+FLAGS (\\Flagged)",
                     ("star", false) => "-FLAGS (\\Flagged)",
                     _ => unreachable!(),
@@ -602,6 +606,10 @@ fn reconcile_client<T: Read + Write>(
                     .ok_or_else(|| {
                         ImapError::InvalidAction(format!("unknown mailbox: {target_folder}"))
                     })?;
+                // imap 2.4's uid_copy interpolates this argument verbatim, unlike
+                // select/create. Quote it ourselves so spaces remain in one
+                // mailbox argument and quotes/backslashes cannot alter syntax.
+                let target_argument = quote_mailbox_argument(&target_remote)?;
                 let mailbox = session
                     .select(&source_remote)
                     .map_err(|error| ImapError::Protocol(error.to_string()))?;
@@ -609,8 +617,10 @@ fn reconcile_client<T: Read + Write>(
                     continue;
                 }
                 session
-                    .uid_copy(&uid_set, &target_remote)
-                    .map_err(|error| ImapError::Protocol(error.to_string()))?;
+                    .uid_copy(&uid_set, &target_argument)
+                    .map_err(|error| {
+                        ImapError::Protocol(format!("copy to destination mailbox: {error}"))
+                    })?;
                 if action.action == "move" {
                     session
                         .uid_store(&uid_set, "+FLAGS (\\Deleted)")
@@ -628,6 +638,18 @@ fn reconcile_client<T: Read + Write>(
     }
     let _ = session.logout();
     Ok(applied)
+}
+
+fn quote_mailbox_argument(name: &str) -> Result<String, ImapError> {
+    if name.chars().any(char::is_control) {
+        return Err(ImapError::InvalidAction(
+            "mailbox name contains control characters".into(),
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 fn remote_name_for_local(
@@ -1035,15 +1057,119 @@ mod tests {
 
     #[test]
     fn reconciles_a_copy_action_without_deleting_the_source_message() {
+        check_queued_destination("copy", "Archive", "\"Archive\"");
+    }
+
+    #[test]
+    fn reconciles_read_and_unread_using_the_local_unread_value() {
+        check_queued_flag("read", false, "+FLAGS (\\Seen)");
+        check_queued_flag("read", true, "-FLAGS (\\Seen)");
+    }
+
+    #[test]
+    fn starred_flags_keep_their_existing_polarity() {
+        check_queued_flag("star", true, "+FLAGS (\\Flagged)");
+        check_queued_flag("star", false, "-FLAGS (\\Flagged)");
+    }
+
+    fn check_queued_flag(kind: &str, value: bool, expected_flag: &str) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = format!("UID STORE 12 {expected_flag}");
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.write_all(b"* OK Test server ready\r\n")?;
+            let mut reader = BufReader::new(stream.try_clone()?);
+            let mut line = String::new();
+            let mut selected = false;
+            let mut stored = false;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                if command.starts_with("LOGIN ") {
+                    write_tagged(&mut stream, tag, "OK LOGIN completed")?;
+                } else if command == "SELECT \"INBOX\"" {
+                    selected = true;
+                    stream.write_all(b"* 1 EXISTS\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n")?;
+                    write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
+                } else if command == expected && selected {
+                    stored = true;
+                    write_tagged(&mut stream, tag, "OK STORE completed")?;
+                } else if command == "LOGOUT" {
+                    assert!(stored, "queued flag was never applied");
+                    stream.write_all(b"* BYE Logging out\r\n")?;
+                    write_tagged(&mut stream, tag, "OK LOGOUT completed")?;
+                    return Ok(());
+                } else {
+                    write_tagged(&mut stream, tag, "BAD Unexpected flag or mailbox command")?;
+                    return Err(std::io::Error::other("incorrect queued flag command"));
+                }
+            }
+            Err(std::io::Error::other(
+                "session ended without applying the queued flag",
+            ))
+        });
+        let account = account_for_test_server(port);
+        let action = PendingAction {
+            id: 23,
+            account_id: 42,
+            message_id: Some(9001),
+            action: kind.into(),
+            payload_json: serde_json::json!({"folder":"Inbox", "value":value}).to_string(),
+            folder: Some("Inbox".into()),
+            remote_uid: Some(12),
+            uidvalidity: Some(42),
+        };
+        let folders = vec![MailFolder {
+            account_id: 42,
+            name: "Inbox".into(),
+            remote_name: "INBOX".into(),
+            kind: "inbox".into(),
+            unread_count: 0,
+        }];
+        let applied = reconcile_actions(
+            &account,
+            &AuthMaterial::Password("test-password".into()),
+            &[action],
+            &folders,
+        );
+        server.join().unwrap().expect("fake IMAP server");
+        assert_eq!(applied.expect("queued flag reconciliation"), vec![23]);
+    }
+
+    #[test]
+    fn reconciles_moves_to_mailbox_names_with_spaces_and_escapes() {
+        check_queued_destination("move", "Deleted Items", "\"Deleted Items\"");
+        check_queued_destination(
+            "move",
+            "Folder \\\"quoted\"",
+            "\"Folder \\\\\\\"quoted\\\"\"",
+        );
+    }
+
+    #[test]
+    fn rejects_control_characters_in_mailbox_arguments() {
+        for name in ["Trash\r\nEXPUNGE", "Trash\0", "Trash\n", "Trash\t"] {
+            assert!(quote_mailbox_argument(name).is_err());
+        }
+    }
+
+    fn check_queued_destination(kind: &str, destination: &str, expected_argument: &str) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake IMAP server");
         let port = listener.local_addr().expect("server address").port();
-        let server = thread::spawn(move || run_fake_copy_server(listener));
+        let expected = format!("UID COPY 12 {expected_argument}");
+        let moving = kind == "move";
+        let server = thread::spawn(move || run_fake_copy_server(listener, &expected, moving));
         let account = account_for_test_server(port);
         let action = PendingAction {
             id: 17,
             account_id: 42,
             message_id: Some(9001),
-            action: "copy".into(),
+            action: kind.into(),
             payload_json: r#"{"folder":"Archive","source_folder":"Inbox"}"#.into(),
             folder: Some("Inbox".into()),
             remote_uid: Some(12),
@@ -1060,7 +1186,7 @@ mod tests {
             MailFolder {
                 account_id: 42,
                 name: "Archive".into(),
-                remote_name: "Archive".into(),
+                remote_name: destination.into(),
                 kind: "archive".into(),
                 unread_count: 0,
             },
@@ -1152,11 +1278,17 @@ mod tests {
         account
     }
 
-    fn run_fake_copy_server(listener: TcpListener) -> std::io::Result<()> {
+    fn run_fake_copy_server(
+        listener: TcpListener,
+        expected: &str,
+        moving: bool,
+    ) -> std::io::Result<()> {
         let (mut stream, _) = listener.accept()?;
         stream.write_all(b"* OK Omarchy Mail test server ready\r\n")?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut saw_copy = false;
+        let mut saw_delete = false;
+        let mut saw_expunge = false;
         let mut line = String::new();
         loop {
             line.clear();
@@ -1181,10 +1313,31 @@ mod tests {
                     write_tagged(&mut stream, tag, "OK [READ-WRITE] SELECT completed")?;
                 }
                 "UID" if line.to_ascii_uppercase().contains("COPY") => {
+                    if line.trim_end().split_once(' ').map(|(_, command)| command) != Some(expected)
+                    {
+                        write_tagged(&mut stream, tag, "BAD parse error")?;
+                        return Err(std::io::Error::other(
+                            "destination mailbox was not correctly quoted",
+                        ));
+                    }
                     saw_copy = true;
                     write_tagged(&mut stream, tag, "OK UID COPY completed")?;
                 }
+                "UID" if line.contains("STORE") => {
+                    assert!(moving && saw_copy);
+                    assert!(line.contains("UID STORE 12 +FLAGS (\\Deleted)"));
+                    saw_delete = true;
+                    write_tagged(&mut stream, tag, "OK UID STORE completed")?;
+                }
+                "UID" if line.contains("EXPUNGE") => {
+                    assert!(moving && saw_delete);
+                    assert!(line.contains("UID EXPUNGE 12"));
+                    saw_expunge = true;
+                    write_tagged(&mut stream, tag, "OK UID EXPUNGE completed")?;
+                }
                 "LOGOUT" => {
+                    assert_eq!(saw_delete, moving);
+                    assert_eq!(saw_expunge, moving);
                     if !saw_copy {
                         return Err(std::io::Error::other("UID COPY was not sent"));
                     }

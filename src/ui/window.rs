@@ -1,13 +1,13 @@
 use crate::database::Database;
 use crate::mail;
 use crate::models::{
-    Account, AttachmentInfo, AuthMethod, MailFolder, Message, PendingSend, SecurityMode,
-    ServerConfig,
+    Account, AttachmentInfo, AuthMethod, CalendarEvent, MailFolder, Message, PendingSend,
+    SecurityMode, ServerConfig, TodoItem,
 };
 use crate::preferences;
 use crate::theme;
 use adw::prelude::*;
-use chrono::Datelike;
+use chrono::{Datelike, Local, NaiveDate};
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -30,10 +30,16 @@ struct AppState {
     folders: RefCell<Vec<MailFolder>>,
     messages: RefCell<Vec<Message>>,
     sidebar: gtk::Box,
+    sidebar_structure: RefCell<Option<(Vec<Account>, Vec<MailFolder>)>>,
+    sidebar_rows: RefCell<Vec<(MailScope, gtk::Button, gtk::Box, gtk::Label, String)>>,
     message_list: gtk::ListBox,
+    displayed_messages: RefCell<Vec<Message>>,
+    displayed_date_format: RefCell<String>,
+    refreshing_selection: Cell<bool>,
     middle: gtk::Box,
     sidebar_scroll: gtk::ScrolledWindow,
     reader: gtk::Box,
+    reader_snapshot: RefCell<Option<ReaderSnapshot>>,
     navigation: gtk::Button,
     search_entry: gtk::SearchEntry,
     empty_trash_button: gtk::Button,
@@ -45,6 +51,9 @@ struct AppState {
     scope: RefCell<MailScope>,
     search_filters: RefCell<SearchFilters>,
     selected_message: RefCell<Option<i64>>,
+    read_dwell_generation: Cell<u64>,
+    calendar_sync_busy: Cell<bool>,
+    calendar_sync_status: RefCell<String>,
     account_expanded: RefCell<HashMap<i64, bool>>,
     narrow_mode: Cell<bool>,
     mobile_mode: Cell<bool>,
@@ -72,6 +81,12 @@ struct AppState {
 enum MailScope {
     Unified(String),
     Account { id: i64, folder: String },
+}
+
+#[derive(Clone, Copy)]
+enum PlannerTab {
+    Calendar,
+    Todos,
 }
 
 #[derive(Clone, Debug)]
@@ -228,10 +243,16 @@ pub fn build_window(application: &adw::Application) {
         folders: RefCell::new(folders),
         messages: RefCell::new(messages),
         sidebar,
+        sidebar_structure: RefCell::new(None),
+        sidebar_rows: RefCell::new(Vec::new()),
         middle: middle.clone(),
         sidebar_scroll,
         message_list,
+        displayed_messages: RefCell::new(Vec::new()),
+        displayed_date_format: RefCell::new(String::new()),
+        refreshing_selection: Cell::new(false),
         reader,
+        reader_snapshot: RefCell::new(None),
         navigation: navigation.clone(),
         search_entry: search.clone(),
         empty_trash_button: empty_trash_button.clone(),
@@ -243,6 +264,9 @@ pub fn build_window(application: &adw::Application) {
         scope: RefCell::new(MailScope::Unified("Inbox".into())),
         search_filters: RefCell::new(SearchFilters::default()),
         selected_message: RefCell::new(None),
+        read_dwell_generation: Cell::new(0),
+        calendar_sync_busy: Cell::new(false),
+        calendar_sync_status: RefCell::new("Connect iCloud in Settings → Calendar.".into()),
         account_expanded: RefCell::new(HashMap::new()),
         narrow_mode: Cell::new(false),
         mobile_mode: Cell::new(false),
@@ -270,6 +294,20 @@ pub fn build_window(application: &adw::Application) {
         demo_mode,
     });
 
+    let calendar_state = Rc::downgrade(&state);
+    let initial_calendar_state = calendar_state.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(state) = initial_calendar_state.upgrade() {
+            start_calendar_sync(state);
+        }
+    });
+    glib::timeout_add_local(Duration::from_secs(300), move || {
+        let Some(state) = calendar_state.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        start_calendar_sync(state);
+        glib::ControlFlow::Continue
+    });
     // The middle pane is inserted after the state exists so its selection can
     // route into the reader without keeping a second source of truth.
     let reader_pane = build_middle_and_reader(state.clone(), &middle);
@@ -404,6 +442,9 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
     let message_list = state.message_list.clone();
     let state_for_selected_rows = state.clone();
     message_list.connect_selected_rows_changed(move |list| {
+        if state_for_selected_rows.refreshing_selection.get() {
+            return;
+        }
         let selected = list
             .selected_rows()
             .into_iter()
@@ -418,6 +459,14 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
     });
     let state_for_selection = state.clone();
     message_list.connect_row_selected(move |_, row| {
+        if state_for_selection.refreshing_selection.get() {
+            return;
+        }
+        let generation = state_for_selection
+            .read_dwell_generation
+            .get()
+            .wrapping_add(1);
+        state_for_selection.read_dwell_generation.set(generation);
         let Some(row) = row else { return };
         let id = row
             .widget_name()
@@ -433,6 +482,15 @@ fn build_middle_and_reader(state: Rc<AppState>, middle: &gtk::Box) -> gtk::Paned
                 .cloned()
         });
         render_reader(&state_for_selection, message);
+        if id.is_some_and(|id| {
+            state_for_selection
+                .messages
+                .borrow()
+                .iter()
+                .any(|message| message.id == id && message.unread)
+        }) {
+            schedule_auto_mark_read(state_for_selection.clone(), id.unwrap(), generation);
+        }
     });
     pane
 }
@@ -484,6 +542,10 @@ fn connect_message_selection(state: &Rc<AppState>, row: &gtk::ListBoxRow) {
             list.select_row(Some(&row));
             state_for_click.selection_anchor.set(Some(index));
         }
+        // Selecting a row with the mouse does not necessarily move keyboard
+        // focus away from the sidebar. Keep subsequent Up/Down navigation in
+        // the message list, matching keyboard-driven selection.
+        row.grab_focus();
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     row.add_controller(gesture);
@@ -613,6 +675,10 @@ fn connect_keyboard_shortcuts(state: &Rc<AppState>) {
             return glib::Propagation::Stop;
         }
         if state_for_key.message_list.has_focus() {
+            if key == gdk::Key::Down || key == gdk::Key::Up {
+                navigate_message_row(&state_for_key, if key == gdk::Key::Down { 1 } else { -1 });
+                return glib::Propagation::Stop;
+            }
             if let Some(message) = state_for_key.selected_message.borrow().and_then(|id| {
                 state_for_key
                     .messages
@@ -778,6 +844,68 @@ fn clear_selected_rows(state: &Rc<AppState>) {
     state.selected_messages.borrow_mut().clear();
     state.selection_anchor.set(None);
     update_selection_summary(state);
+}
+
+/// Select and focus a message row after the list has been rebuilt. GTK drops
+/// the old row, and therefore its focus, when a message is moved away.
+fn select_message_row_at(state: &Rc<AppState>, preferred_index: i32) {
+    let list = &state.message_list;
+    let mut index = preferred_index;
+    while index >= 0 {
+        let Some(row) = list.row_at_index(index) else {
+            index -= 1;
+            continue;
+        };
+        if row.widget_name().starts_with("message-row-") {
+            list.unselect_all();
+            list.select_row(Some(&row));
+            row.grab_focus();
+            return;
+        }
+        index -= 1;
+    }
+    state.selected_message.replace(None);
+    render_reader(state, None);
+}
+
+fn navigate_message_row(state: &Rc<AppState>, delta: i32) -> bool {
+    let current_index = state
+        .message_list
+        .selected_row()
+        .map(|row| row.index())
+        .unwrap_or(if delta > 0 { -1 } else { 0 });
+    let next_index = current_index + delta;
+    let Some(row) = state.message_list.row_at_index(next_index) else {
+        return false;
+    };
+    if !row.widget_name().starts_with("message-row-") {
+        return false;
+    }
+    state.message_list.unselect_all();
+    state.message_list.select_row(Some(&row));
+    row.grab_focus();
+    true
+}
+
+const READ_DWELL: Duration = Duration::from_secs(3);
+
+fn schedule_auto_mark_read(state: Rc<AppState>, message_id: i64, generation: u64) {
+    glib::timeout_add_local_once(READ_DWELL, move || {
+        if state.read_dwell_generation.get() != generation
+            || *state.selected_message.borrow() != Some(message_id)
+        {
+            return;
+        }
+        let unread = state
+            .messages
+            .borrow()
+            .iter()
+            .find(|message| message.id == message_id)
+            .is_some_and(|message| message.unread);
+        if unread {
+            apply_message_action(&state, message_id, "read");
+        }
+    });
 }
 
 fn arm_undo(state: &Rc<AppState>, action: UndoAction) {
@@ -1060,6 +1188,70 @@ fn open_filter_menu(state: Rc<AppState>, button: &gtk::Button) {
 }
 
 fn render_sidebar(state: &Rc<AppState>) {
+    let _selection = MessageSelectionRefresh::new(state);
+    let folders = state
+        .folders
+        .borrow()
+        .iter()
+        .cloned()
+        .map(|mut folder| {
+            folder.unread_count = 0;
+            folder
+        })
+        .collect();
+    let structure = (state.accounts.borrow().clone(), folders);
+    if state.sidebar_structure.borrow().as_ref() == Some(&structure) {
+        for (scope, button, row, badge, label) in state.sidebar_rows.borrow().iter() {
+            if *state.scope.borrow() == *scope {
+                row.add_css_class("selected");
+            } else {
+                row.remove_css_class("selected");
+            }
+            let (account_id, folder) = match scope {
+                MailScope::Unified(folder) => (None, folder.as_str()),
+                MailScope::Account { id, folder } => (Some(*id), folder.as_str()),
+            };
+            let count = if folder == "Outbox" {
+                state
+                    .database
+                    .pending_sends(account_id)
+                    .ok()
+                    .map(|sends| sends.len())
+            } else if account_id.is_some() || folder == "Inbox" {
+                if state.demo_mode {
+                    Some(
+                        state
+                            .messages
+                            .borrow()
+                            .iter()
+                            .filter(|message| {
+                                message.unread
+                                    && message.folder.eq_ignore_ascii_case(folder)
+                                    && account_id.is_none_or(|id| message.account_id == Some(id))
+                            })
+                            .count(),
+                    )
+                } else {
+                    state.database.unread_count(account_id, folder).ok()
+                }
+            } else {
+                Some(0)
+            };
+            if let Some(count) = count {
+                badge.set_text(&count.to_string());
+                badge.set_visible(count > 0);
+                let accessible = if count > 0 {
+                    format!("Show {label}, {count} unread")
+                } else {
+                    format!("Show {label}")
+                };
+                button.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+            }
+        }
+        return;
+    }
+    state.sidebar_structure.replace(Some(structure));
+    state.sidebar_rows.borrow_mut().clear();
     clear(&state.sidebar);
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 8);
     inner.set_margin_start(14);
@@ -1121,6 +1313,23 @@ fn render_sidebar(state: &Rc<AppState>) {
             MailScope::Unified(label.into()),
         ));
     }
+    let planner_heading = gtk::Label::new(Some("PLANNER"));
+    planner_heading.set_xalign(0.0);
+    planner_heading.add_css_class("mail-section-label");
+    planner_heading.set_margin_top(14);
+    inner.append(&planner_heading);
+    inner.append(&planner_sidebar_button(
+        state,
+        "Calendar",
+        "x-office-calendar-symbolic",
+        PlannerTab::Calendar,
+    ));
+    inner.append(&planner_sidebar_button(
+        state,
+        "Todo list",
+        "view-list-symbolic",
+        PlannerTab::Todos,
+    ));
     let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
     separator.set_margin_top(12);
     separator.set_margin_bottom(6);
@@ -1153,6 +1362,974 @@ fn render_sidebar(state: &Rc<AppState>) {
     inner.append(&add_account);
 
     state.sidebar.append(&inner);
+}
+
+fn planner_sidebar_button(
+    state: &Rc<AppState>,
+    label: &str,
+    icon: &str,
+    tab: PlannerTab,
+) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_has_frame(false);
+    button.set_halign(gtk::Align::Fill);
+    button.set_child(Some(&sidebar_row(label, icon, None)));
+    button.set_tooltip_text(Some(&format!("Open {label}")));
+    let state_for_click = state.clone();
+    button.connect_clicked(move |_| open_planner_window(state_for_click.clone(), tab, None));
+    button
+}
+
+fn open_planner_window(state: Rc<AppState>, tab: PlannerTab, _linked_message: Option<Message>) {
+    start_calendar_sync(state.clone());
+    let window = adw::Window::builder()
+        .transient_for(&state.window)
+        .modal(false)
+        .title("Planner")
+        .default_width(860)
+        .default_height(620)
+        .build();
+    window.add_css_class("mail-dialog");
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_margin_start(26);
+    root.set_margin_end(26);
+    root.set_margin_top(22);
+    root.set_margin_bottom(22);
+    let title = gtk::Label::new(Some("Planner"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-reader-subject");
+    root.append(&title);
+
+    let stack = gtk::Stack::new();
+    stack.set_vexpand(true);
+    stack.set_margin_top(18);
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    root.append(&switcher);
+    root.append(&stack);
+    stack.add_titled(
+        &build_calendar_page(state.clone(), window.clone()),
+        Some("calendar"),
+        "Calendar",
+    );
+    stack.add_titled(
+        &build_todo_page(state.clone(), window.clone()),
+        Some("todos"),
+        "Todo list",
+    );
+    stack.set_visible_child_name(match tab {
+        PlannerTab::Calendar => "calendar",
+        PlannerTab::Todos => "todos",
+    });
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.set_halign(gtk::Align::End);
+    cancel.set_margin_top(14);
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    root.append(&cancel);
+    window.set_content(Some(&root));
+    window.present();
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannerEvent {
+    event: CalendarEvent,
+    source: String,
+    subscription: bool,
+}
+
+impl std::ops::Deref for PlannerEvent {
+    type Target = CalendarEvent;
+    fn deref(&self) -> &CalendarEvent {
+        &self.event
+    }
+}
+
+fn visible_calendar_events(state: &AppState) -> Vec<PlannerEvent> {
+    combine_calendar_events(
+        &state.preferences.borrow(),
+        state.database.list_calendar_events().unwrap_or_default(),
+        crate::subscriptions::cached,
+    )
+}
+
+fn combine_calendar_events(
+    prefs: &preferences::Preferences,
+    personal: Vec<CalendarEvent>,
+    load_feed: impl Fn(&crate::subscriptions::Subscription) -> Vec<CalendarEvent>,
+) -> Vec<PlannerEvent> {
+    let mut events = Vec::new();
+    if prefs.show_personal_calendar {
+        let name = prefs
+            .icloud_calendar
+            .as_ref()
+            .map(|account| account.calendar_name.as_str())
+            .unwrap_or("Personal calendar");
+        events.extend(personal.into_iter().map(|event| PlannerEvent {
+            event,
+            source: name.into(),
+            subscription: false,
+        }));
+    }
+    for feed in prefs
+        .calendar_subscriptions
+        .iter()
+        .filter(|feed| feed.visible)
+    {
+        events.extend(load_feed(feed).into_iter().map(|event| PlannerEvent {
+            event,
+            source: feed.name.clone(),
+            subscription: true,
+        }));
+    }
+    events.sort_by(|a, b| a.starts_at.cmp(&b.starts_at).then(a.title.cmp(&b.title)));
+    events
+}
+
+fn build_calendar_page(state: Rc<AppState>, window: adw::Window) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let previous = gtk::Button::with_label("‹");
+    previous.set_tooltip_text(Some("Previous month"));
+    let month_label = gtk::Label::new(None);
+    month_label.set_hexpand(true);
+    month_label.set_xalign(0.5);
+    month_label.add_css_class("mail-reader-subject");
+    let next = gtk::Button::with_label("›");
+    next.set_tooltip_text(Some("Next month"));
+    let add = gtk::Button::with_label("New event");
+    let sync = gtk::Button::with_label("Refresh calendars");
+    let state_for_sync = state.clone();
+    sync.connect_clicked(move |_| start_calendar_sync(state_for_sync.clone()));
+    controls.append(&sync);
+    add.add_css_class("mail-accent-button");
+    controls.append(&previous);
+    controls.append(&month_label);
+    controls.append(&next);
+    controls.append(&add);
+    page.append(&controls);
+    let legend = gtk::Label::new(Some(
+        "● Personal / iCloud    ◆ Subscriptions (read-only) · visibility in Settings → Calendar",
+    ));
+    legend.set_xalign(0.0);
+    legend.set_wrap(true);
+    page.append(&legend);
+
+    let sync_status = gtk::Label::new(Some(&state.calendar_sync_status.borrow()));
+    sync_status.set_xalign(0.0);
+    sync_status.set_wrap(true);
+    page.append(&sync_status);
+
+    let calendar = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    calendar.set_vexpand(true);
+    page.append(&calendar);
+    let today = Local::now().date_naive();
+    let month = Rc::new(Cell::new(today.year() * 12 + today.month0() as i32));
+    let events = Rc::new(RefCell::new(visible_calendar_events(&state)));
+    let date_time_format = state.preferences.borrow().date_time_format.clone();
+    render_calendar_month(
+        &calendar,
+        &month_label,
+        month.get(),
+        &events.borrow(),
+        &date_time_format,
+        state.clone(),
+        window.clone().upcast(),
+    );
+
+    let calendar_for_previous = calendar.clone();
+    let label_for_previous = month_label.clone();
+    let month_for_previous = month.clone();
+    let events_for_previous = events.clone();
+    let format_for_previous = date_time_format.clone();
+    let state_for_previous = state.clone();
+    let window_for_previous = window.clone();
+    previous.connect_clicked(move |_| {
+        let value = month_for_previous.get() - 1;
+        month_for_previous.set(value);
+        render_calendar_month(
+            &calendar_for_previous,
+            &label_for_previous,
+            value,
+            &events_for_previous.borrow(),
+            &format_for_previous,
+            state_for_previous.clone(),
+            window_for_previous.clone().upcast(),
+        );
+    });
+    let calendar_for_next = calendar.clone();
+    let label_for_next = month_label.clone();
+    let month_for_next = month.clone();
+    let events_for_next = events.clone();
+    let format_for_next = date_time_format.clone();
+    let state_for_next = state.clone();
+    let window_for_next = window.clone();
+    next.connect_clicked(move |_| {
+        let value = month_for_next.get() + 1;
+        month_for_next.set(value);
+        render_calendar_month(
+            &calendar_for_next,
+            &label_for_next,
+            value,
+            &events_for_next.borrow(),
+            &format_for_next,
+            state_for_next.clone(),
+            window_for_next.clone().upcast(),
+        );
+    });
+    let state_for_add = state.clone();
+    let window_for_add = window.clone();
+    add.connect_clicked(move |_| {
+        open_calendar_event_dialog(
+            state_for_add.clone(),
+            window_for_add.clone().upcast(),
+            None,
+            true,
+            None,
+        )
+    });
+    let weak_calendar = calendar.downgrade();
+    let weak_window = window.downgrade();
+    glib::timeout_add_local(Duration::from_secs(2), move || {
+        let (Some(calendar), Some(window)) = (weak_calendar.upgrade(), weak_window.upgrade())
+        else {
+            return glib::ControlFlow::Break;
+        };
+        sync_status.set_text(&state.calendar_sync_status.borrow());
+        {
+            let latest = visible_calendar_events(&state);
+            if *events.borrow() != latest {
+                *events.borrow_mut() = latest;
+                render_calendar_month(
+                    &calendar,
+                    &month_label,
+                    month.get(),
+                    &events.borrow(),
+                    &date_time_format,
+                    state.clone(),
+                    window.upcast(),
+                );
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+    page
+}
+
+fn start_calendar_sync(state: Rc<AppState>) {
+    let prefs = preferences::load();
+    if prefs.icloud_calendar.is_none() && prefs.calendar_subscriptions.is_empty() {
+        return;
+    }
+    if state.demo_mode || state.calendar_sync_busy.replace(true) {
+        return;
+    }
+    set_status(&state, "Refreshing calendars…");
+    *state.calendar_sync_status.borrow_mut() = "Refreshing calendars…".into();
+    let database = state.database.clone();
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let mut messages = Vec::new();
+        if let Some(account) = prefs.icloud_calendar {
+            messages.push(crate::icloud::sync(&database, &account).unwrap_or_else(|error| error));
+        }
+        for feed in prefs
+            .calendar_subscriptions
+            .iter()
+            .filter(|feed| feed.visible)
+        {
+            messages.push(match crate::subscriptions::refresh(feed) {
+                Ok(count) => format!("{}: {count} events", feed.name),
+                Err(error) => format!("{}: {error}", feed.name),
+            });
+        }
+        let _ = sender.send_blocking(Ok::<_, String>(messages.join(" · ")));
+    });
+    glib::MainContext::default().spawn_local(async move {
+        let result = receiver.recv().await;
+        state.calendar_sync_busy.set(false);
+        let message = match result {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => error,
+            Err(_) => "Calendar sync stopped; local events are retained".into(),
+        };
+        set_status(&state, &message);
+        *state.calendar_sync_status.borrow_mut() = message;
+    });
+}
+
+fn render_calendar_month(
+    calendar: &gtk::Box,
+    month_label: &gtk::Label,
+    month_key: i32,
+    events: &[PlannerEvent],
+    date_time_format: &str,
+    state: Rc<AppState>,
+    planner: gtk::Window,
+) {
+    clear(calendar);
+    let year = month_key.div_euclid(12);
+    let month_number = month_key.rem_euclid(12) as u32 + 1;
+    let Some(first) = NaiveDate::from_ymd_opt(year, month_number, 1) else {
+        return;
+    };
+    month_label.set_text(&first.format("%B %Y").to_string());
+    let days = match month_number {
+        12 => (NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap() - first).num_days(),
+        _ => (NaiveDate::from_ymd_opt(year, month_number + 1, 1).unwrap() - first).num_days(),
+    };
+    let grid = gtk::Grid::new();
+    grid.set_column_homogeneous(true);
+    grid.set_row_homogeneous(true);
+    for (column, name) in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        .into_iter()
+        .enumerate()
+    {
+        let label = gtk::Label::new(Some(name));
+        label.add_css_class("mail-section-label");
+        grid.attach(&label, column as i32, 0, 1, 1);
+    }
+    let offset = first.weekday().num_days_from_sunday() as i32;
+    for day in 1..=days {
+        let date = first + chrono::Duration::days(day - 1);
+        let cell = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        cell.set_margin_start(2);
+        cell.set_margin_end(2);
+        cell.set_margin_top(2);
+        cell.set_margin_bottom(2);
+        cell.add_css_class("mail-message-row");
+        let number = gtk::Label::new(Some(&day.to_string()));
+        number.set_xalign(0.0);
+        if date == Local::now().date_naive() {
+            number.add_css_class("mail-accent-button");
+        }
+        cell.append(&number);
+        for event in events
+            .iter()
+            .filter(|event| event_date(event) == Some(date))
+        {
+            let event_label = gtk::Label::new(Some(&format!(
+                "{} {}",
+                if event.subscription { "◆" } else { "●" },
+                event.title
+            )));
+            event_label.set_xalign(0.0);
+            event_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let event_button = gtk::Button::new();
+            event_button.set_has_frame(false);
+            event_button.add_css_class("planner-event");
+            event_button.set_child(Some(&event_label));
+            event_button.set_tooltip_text(Some(&format!(
+                "{}\n{} – {}\n{}\nClick to view details",
+                event.title,
+                format_planner_datetime(&event.starts_at, date_time_format),
+                format_planner_datetime(&event.ends_at, date_time_format),
+                event.source,
+            )));
+            event_label.add_css_class(if event.subscription {
+                "planner-subscription"
+            } else {
+                "planner-personal"
+            });
+            let event = event.clone();
+            let parent = planner.clone();
+            let format = date_time_format.to_owned();
+            event_button.connect_clicked(move |_| {
+                open_calendar_event_details(&parent, &event, &format);
+            });
+            cell.append(&event_button);
+        }
+        let position = offset + day as i32 - 1;
+        grid.attach(&cell, position % 7, position / 7 + 1, 1, 1);
+        let state_for_date = state.clone();
+        let planner_for_date = planner.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |gesture, presses, x, y| {
+            // Event buttons have their own action; only empty day space creates events.
+            let mut target = gesture
+                .widget()
+                .and_then(|widget| widget.pick(x, y, gtk::PickFlags::DEFAULT));
+            while let Some(widget) = target {
+                if widget.has_css_class("planner-event") {
+                    return;
+                }
+                target = widget.parent();
+            }
+            if presses == 2 {
+                open_calendar_event_dialog(
+                    state_for_date.clone(),
+                    planner_for_date.clone(),
+                    None,
+                    true,
+                    Some(date),
+                );
+            }
+        });
+        cell.add_controller(click);
+    }
+    calendar.append(&grid);
+}
+
+fn event_date(event: &CalendarEvent) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(event.starts_at.get(..10)?, "%Y-%m-%d").ok()
+}
+
+fn open_calendar_event_details(parent: &gtk::Window, event: &PlannerEvent, format: &str) {
+    let dialog = gtk::Window::builder()
+        .title("Event details")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(520)
+        .default_height(420)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let title = gtk::Label::new(Some(&event.title));
+    title.set_xalign(0.0);
+    title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    title.set_selectable(true);
+    title.add_css_class("mail-reader-subject");
+    details.append(&title);
+    for (heading, value) in [
+        (
+            "Calendar",
+            format!(
+                "{}{}",
+                event.source,
+                if event.subscription {
+                    " (subscription · read-only)"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        ("Starts", format_planner_datetime(&event.starts_at, format)),
+        ("Ends", format_planner_datetime(&event.ends_at, format)),
+        ("Location", event.location.clone()),
+        ("Notes", event.notes.clone()),
+    ] {
+        if value.trim().is_empty() {
+            continue;
+        }
+        let caption = gtk::Label::new(Some(heading));
+        caption.set_xalign(0.0);
+        caption.add_css_class("mail-section-label");
+        details.append(&caption);
+        let text = gtk::Label::new(Some(&value));
+        text.set_xalign(0.0);
+        text.set_wrap(true);
+        text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        text.set_selectable(true);
+        details.append(&text);
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&details)
+        .build();
+    content.append(&scroll);
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::End);
+    let weak_dialog = dialog.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(dialog) = weak_dialog.upgrade() {
+            dialog.close();
+        }
+    });
+    content.append(&close);
+    let keys = gtk::EventControllerKey::new();
+    let weak_dialog = dialog.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            if let Some(dialog) = weak_dialog.upgrade() {
+                dialog.close();
+            }
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(keys);
+    dialog.set_child(Some(&content));
+    dialog.present();
+}
+
+fn format_planner_datetime(value: &str, format: &str) -> String {
+    let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M") else {
+        return value.to_string();
+    };
+    if is_us_date_format(format) {
+        parsed.format("%b %-d, %Y %-I:%M %p").to_string()
+    } else if is_12_hour_format(format) {
+        parsed.format("%-d %b %Y %-I:%M %p").to_string()
+    } else {
+        parsed.format("%-d %b %Y %H:%M").to_string()
+    }
+}
+
+fn format_planner_date(value: &str, format: &str) -> String {
+    let Ok(parsed) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+        return value.to_string();
+    };
+    if is_us_date_format(format) {
+        parsed.format("%m/%d/%Y").to_string()
+    } else {
+        parsed.format("%d/%m/%Y").to_string()
+    }
+}
+
+fn is_us_date_format(format: &str) -> bool {
+    matches!(format, "month-day-12-hour" | "us-12-hour")
+}
+
+fn is_12_hour_format(format: &str) -> bool {
+    matches!(format, "month-day-12-hour" | "uk-12-hour" | "us-12-hour")
+}
+
+fn build_todo_page(state: Rc<AppState>, window: adw::Window) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let add = gtk::Button::with_label("New todo");
+    add.set_halign(gtk::Align::Start);
+    add.add_css_class("mail-accent-button");
+    let state_for_add = state.clone();
+    let window_for_add = window.clone();
+    add.connect_clicked(move |_| {
+        open_todo_dialog(
+            state_for_add.clone(),
+            window_for_add.clone().upcast(),
+            None,
+            true,
+        )
+    });
+    page.append(&add);
+
+    let scroll = gtk::ScrolledWindow::builder().vexpand(true).build();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let todos = state.database.list_todo_items().unwrap_or_default();
+    let date_time_format = state.preferences.borrow().date_time_format.clone();
+    if todos.is_empty() {
+        let empty = gtk::Label::new(Some(
+            "No todos yet. Add one here or create one from an email.",
+        ));
+        empty.set_xalign(0.0);
+        empty.add_css_class("mail-empty-body");
+        list.append(&empty);
+    } else {
+        for todo in todos {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let check = gtk::CheckButton::with_label(&todo.title);
+            check.set_active(todo.completed);
+            check.set_hexpand(true);
+            check.set_halign(gtk::Align::Start);
+            let database = state.database.clone();
+            check.connect_toggled(move |check| {
+                let _ = database.set_todo_completed(todo.id, check.is_active());
+            });
+            row.append(&check);
+            if let Some(due) = todo.due_at.as_deref().filter(|due| !due.trim().is_empty()) {
+                let due_label = gtk::Label::new(Some(&format_planner_date(due, &date_time_format)));
+                due_label.add_css_class("mail-reader-meta");
+                row.append(&due_label);
+            }
+            list.append(&row);
+        }
+    }
+    scroll.set_child(Some(&list));
+    page.append(&scroll);
+    page
+}
+
+fn planner_entry(label: &str, value: &str) -> (gtk::Box, gtk::Entry) {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let caption = gtk::Label::new(Some(label));
+    caption.set_xalign(0.0);
+    caption.add_css_class("mail-section-label");
+    row.append(&caption);
+    let entry = gtk::Entry::new();
+    entry.set_text(value);
+    row.append(&entry);
+    (row, entry)
+}
+
+fn planner_notes_editor(label: &str, value: &str) -> (gtk::Box, gtk::TextView) {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let caption = gtk::Label::new(Some(label));
+    caption.set_xalign(0.0);
+    caption.add_css_class("mail-section-label");
+    row.append(&caption);
+    let editor = gtk::TextView::new();
+    editor.set_wrap_mode(gtk::WrapMode::WordChar);
+    editor.set_vexpand(true);
+    editor.set_size_request(-1, 150);
+    editor.buffer().set_text(value);
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&editor)
+        .build();
+    row.append(&scroll);
+    (row, editor)
+}
+
+fn planner_time_picker(label: &str, value: &str) -> (gtk::Box, gtk::Entry, gtk::Entry) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let caption = gtk::Label::new(Some(label));
+    caption.set_width_chars(8);
+    caption.set_xalign(0.0);
+    let time = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    time.set_halign(gtk::Align::Start);
+    time.set_valign(gtk::Align::Center);
+    let (hour, minute) = value
+        .split_once(':')
+        .map(|(hour, minute)| (hour, minute))
+        .unwrap_or(("", ""));
+    let hours = planner_time_segment(hour, "HH");
+    let minutes = planner_time_segment(minute, "MM");
+    let separator = gtk::Label::new(Some(":"));
+    separator.set_selectable(false);
+    separator.set_can_focus(false);
+    separator.add_css_class("planner-time-separator");
+    time.append(&hours);
+    time.append(&separator);
+    time.append(&minutes);
+    row.append(&caption);
+    row.append(&time);
+    (row, hours, minutes)
+}
+
+fn planner_time_segment(value: &str, placeholder: &str) -> gtk::Entry {
+    let entry = gtk::Entry::new();
+    entry.set_text(value);
+    entry.set_placeholder_text(Some(placeholder));
+    entry.set_width_chars(2);
+    entry.set_max_width_chars(2);
+    entry.set_hexpand(false);
+    entry.set_valign(gtk::Align::Center);
+    entry.add_css_class("planner-time-segment");
+    entry.set_max_length(2);
+    entry.set_has_frame(false);
+    entry.set_input_purpose(gtk::InputPurpose::Digits);
+    gtk::prelude::EntryExt::set_alignment(&entry, 0.5);
+    let entry_for_click = entry.clone();
+    let select_segment = gtk::GestureClick::new();
+    select_segment.set_button(1);
+    select_segment.set_propagation_phase(gtk::PropagationPhase::Capture);
+    select_segment.connect_pressed(move |gesture, _, _, _| {
+        entry_for_click.grab_focus();
+        entry_for_click.select_region(0, -1);
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    entry.add_controller(select_segment);
+    entry
+}
+
+fn planner_end_time_picker(
+    label: &str,
+    value: &str,
+    starts_hour: &gtk::Entry,
+    starts_minute: &gtk::Entry,
+) -> (gtk::Box, gtk::Entry, gtk::Entry) {
+    let (row, ends_hour, ends_minute) = planner_time_picker(label, value);
+    let quick = gtk::DropDown::from_strings(&[
+        "Quick end time",
+        "30 minutes",
+        "1 hour",
+        "1.5 hours",
+        "2 hours",
+        "2.5 hours",
+        "3 hours",
+    ]);
+    quick.set_tooltip_text(Some("Choose an end time relative to the start time"));
+    quick.set_width_request(132);
+    let starts_hour_for_quick = starts_hour.clone();
+    let starts_minute_for_quick = starts_minute.clone();
+    let ends_hour_for_quick = ends_hour.clone();
+    let ends_minute_for_quick = ends_minute.clone();
+    quick.connect_selected_notify(move |quick| {
+        let selected = quick.selected();
+        if selected == gtk::INVALID_LIST_POSITION || selected == 0 {
+            return;
+        }
+        let Some((hour, minute)) =
+            parse_planner_time(&starts_hour_for_quick, &starts_minute_for_quick)
+        else {
+            return;
+        };
+        let extra_minutes = (selected as i32) * 30;
+        let total = (hour * 60 + minute + extra_minutes).rem_euclid(24 * 60);
+        ends_hour_for_quick.set_text(&format!("{:02}", total / 60));
+        ends_minute_for_quick.set_text(&format!("{:02}", total % 60));
+    });
+    row.append(&quick);
+    (row, ends_hour, ends_minute)
+}
+
+fn parse_planner_time(hours: &gtk::Entry, minutes: &gtk::Entry) -> Option<(i32, i32)> {
+    let hour = hours.text().parse::<i32>().ok()?;
+    let minute = minutes.text().parse::<i32>().ok()?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    Some((hour, minute))
+}
+
+fn planner_date_picker(
+    label: &str,
+    optional: bool,
+    date_time_format: &str,
+    preset_date: Option<NaiveDate>,
+) -> (gtk::Box, gtk::Calendar, Rc<Cell<bool>>) {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let caption = gtk::Label::new(Some(label));
+    caption.set_xalign(0.0);
+    caption.set_hexpand(true);
+    caption.add_css_class("mail-section-label");
+    let calendar = gtk::Calendar::new();
+    calendar.set_size_request(-1, 180);
+    if let Some(date) = preset_date {
+        calendar.set_year(date.year());
+        calendar.set_month(date.month0() as i32);
+        calendar.set_day(date.day() as i32);
+    }
+    let selected = Rc::new(Cell::new(!optional));
+    let initial_label = if optional {
+        "No date".to_string()
+    } else {
+        calendar_date_text(&calendar, date_time_format)
+    };
+    let date_label = gtk::Label::new(Some(&initial_label));
+    date_label.add_css_class("mail-reader-meta");
+    let toggle = icon_button("x-office-calendar-symbolic", "Choose date");
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_reveal_child(false);
+    revealer.set_child(Some(&calendar));
+    let revealer_for_toggle = revealer.clone();
+    toggle.connect_clicked(move |_| {
+        revealer_for_toggle.set_reveal_child(!revealer_for_toggle.reveals_child());
+    });
+    let label_for_date = date_label.clone();
+    let selected_for_date = selected.clone();
+    let format_for_date = date_time_format.to_string();
+    calendar.connect_day_selected(move |calendar| {
+        label_for_date.set_text(&calendar_date_text(calendar, &format_for_date));
+        selected_for_date.set(true);
+    });
+    header.append(&caption);
+    header.append(&date_label);
+    header.append(&toggle);
+    root.append(&header);
+    root.append(&revealer);
+    (root, calendar, selected)
+}
+
+fn calendar_date_text(calendar: &gtk::Calendar, date_time_format: &str) -> String {
+    format_planner_date(&calendar_date_iso(calendar), date_time_format)
+}
+
+fn calendar_date_iso(calendar: &gtk::Calendar) -> String {
+    calendar
+        .date()
+        .format("%Y-%m-%d")
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn open_calendar_event_dialog(
+    state: Rc<AppState>,
+    planner: gtk::Window,
+    linked_message: Option<Message>,
+    return_to_planner: bool,
+    preset_date: Option<NaiveDate>,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(&planner)
+        .modal(true)
+        .title("New calendar event")
+        .default_width(500)
+        .default_height(700)
+        .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+    root.set_margin_top(22);
+    root.set_margin_bottom(22);
+    let title_value = linked_message
+        .as_ref()
+        .map(|message| message.subject.clone())
+        .unwrap_or_default();
+    let date_time_format = state.preferences.borrow().date_time_format.clone();
+    let (title_row, title) = planner_entry("Title", &title_value);
+    let (starts_date_row, starts_date, _) =
+        planner_date_picker("Start", false, &date_time_format, preset_date);
+    let (starts_time_row, starts_hour, starts_minute) = planner_time_picker("Start time", "09:00");
+    let (ends_date_row, ends_date, _) =
+        planner_date_picker("End", false, &date_time_format, preset_date);
+    let (ends_time_row, ends_hour, ends_minute) =
+        planner_end_time_picker("End time", "10:00", &starts_hour, &starts_minute);
+    // Keep the calendar revealer beneath a shared date/time header.
+    for (date_row, time_row) in [
+        (&starts_date_row, &starts_time_row),
+        (&ends_date_row, &ends_time_row),
+    ] {
+        if let Some(caption) = time_row.first_child() {
+            time_row.remove(&caption);
+        }
+        if let Some(header) = date_row.first_child().and_downcast::<gtk::Box>() {
+            header.append(time_row);
+        }
+    }
+    let (location_row, location) = planner_entry("Location", "");
+    let (notes_row, notes) = planner_entry("Notes", "");
+    root.append(&title_row);
+    root.append(&starts_date_row);
+    root.append(&ends_date_row);
+    root.append(&location_row);
+    root.append(&notes_row);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save event");
+    save.add_css_class("mail-accent-button");
+    actions.append(&cancel);
+    actions.append(&save);
+    root.append(&actions);
+    dialog.set_content(Some(&root));
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| dialog_for_cancel.close());
+    let state_for_save = state.clone();
+    let planner_for_save = planner.clone();
+    let dialog_for_save = dialog.clone();
+    save.connect_clicked(move |_| {
+        if title.text().trim().is_empty() {
+            return;
+        }
+        let Some((starts_hour_value, starts_minute_value)) =
+            parse_planner_time(&starts_hour, &starts_minute)
+        else {
+            starts_hour.add_css_class("error");
+            starts_minute.add_css_class("error");
+            return;
+        };
+        let Some((ends_hour_value, ends_minute_value)) =
+            parse_planner_time(&ends_hour, &ends_minute)
+        else {
+            ends_hour.add_css_class("error");
+            ends_minute.add_css_class("error");
+            return;
+        };
+        let event = CalendarEvent {
+            id: 0,
+            title: title.text().to_string(),
+            notes: notes.text().to_string(),
+            starts_at: planner_datetime(
+                &starts_date.date(),
+                starts_hour_value,
+                starts_minute_value,
+            ),
+            ends_at: planner_datetime(&ends_date.date(), ends_hour_value, ends_minute_value),
+            location: location.text().to_string(),
+            message_id: linked_message.as_ref().map(|message| message.id),
+        };
+        if state_for_save
+            .database
+            .create_calendar_event(&event)
+            .is_ok()
+        {
+            start_calendar_sync(state_for_save.clone());
+            dialog_for_save.close();
+            if return_to_planner {
+                planner_for_save.close();
+                open_planner_window(state_for_save.clone(), PlannerTab::Calendar, None);
+            }
+        }
+    });
+    dialog.present();
+}
+
+fn planner_datetime(date: &glib::DateTime, hour: i32, minute: i32) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        date.year(),
+        date.month(),
+        date.day_of_month(),
+        hour.clamp(0, 23),
+        minute.clamp(0, 59)
+    )
+}
+
+fn open_todo_dialog(
+    state: Rc<AppState>,
+    planner: gtk::Window,
+    linked_message: Option<Message>,
+    return_to_planner: bool,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(&planner)
+        .modal(true)
+        .title("New todo")
+        .default_width(500)
+        .default_height(360)
+        .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+    root.set_margin_top(22);
+    root.set_margin_bottom(22);
+    let title_value = linked_message
+        .as_ref()
+        .map(|message| message.subject.clone())
+        .unwrap_or_default();
+    let date_time_format = state.preferences.borrow().date_time_format.clone();
+    let (title_row, title) = planner_entry("Todo", &title_value);
+    let (due_row, due_date, due_selected) =
+        planner_date_picker("Due date", true, &date_time_format, None);
+    let (notes_row, notes) = planner_notes_editor("Notes", "");
+    for row in [title_row, due_row, notes_row] {
+        root.append(&row);
+    }
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save todo");
+    save.add_css_class("mail-accent-button");
+    actions.append(&cancel);
+    actions.append(&save);
+    root.append(&actions);
+    dialog.set_content(Some(&root));
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| dialog_for_cancel.close());
+    let state_for_save = state.clone();
+    let planner_for_save = planner.clone();
+    let dialog_for_save = dialog.clone();
+    save.connect_clicked(move |_| {
+        if title.text().trim().is_empty() {
+            return;
+        }
+        let item = TodoItem {
+            id: 0,
+            title: title.text().to_string(),
+            notes: text_view_contents(&notes),
+            due_at: due_selected.get().then(|| calendar_date_iso(&due_date)),
+            completed: false,
+            message_id: linked_message.as_ref().map(|message| message.id),
+        };
+        if state_for_save.database.create_todo_item(&item).is_ok() {
+            dialog_for_save.close();
+            if return_to_planner {
+                planner_for_save.close();
+                open_planner_window(state_for_save.clone(), PlannerTab::Todos, None);
+            }
+        }
+    });
+    dialog.present();
 }
 
 fn account_expander(account: &Account, state: Rc<AppState>) -> gtk::Expander {
@@ -1315,7 +2492,11 @@ fn sidebar_action_row(
         Some(count) if count > 0 => format!("Show {label}, {count} unread"),
         _ => format!("Show {label}"),
     };
-    let row = sidebar_row(label, icon, count);
+    let row = sidebar_row(label, icon, None);
+    let badge = gtk::Label::new(Some(&count.unwrap_or_default().to_string()));
+    badge.add_css_class("mail-count");
+    badge.set_visible(count.is_some_and(|count| count > 0));
+    row.append(&badge);
     if *state.scope.borrow() == scope {
         row.add_css_class("selected");
     }
@@ -1325,6 +2506,13 @@ fn sidebar_action_row(
     button.set_child(Some(&row));
     button.set_tooltip_text(Some(&format!("Show {label}")));
     button.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+    state.sidebar_rows.borrow_mut().push((
+        scope.clone(),
+        button.clone(),
+        row.clone(),
+        badge,
+        label.to_string(),
+    ));
     let state_for_click = state.clone();
     let scope_for_click = scope.clone();
     button.connect_clicked(move |_| select_scope(&state_for_click, scope_for_click.clone()));
@@ -1598,6 +2786,8 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
     let generation = state.cache_load_generation.get().wrapping_add(1);
     state.cache_load_generation.set(generation);
     state.cache_load_pending.set(true);
+    // Background sync must not discard pages the user has already loaded.
+    let page_limit = state.messages.borrow().len().max(MESSAGE_PAGE_SIZE);
     state.message_offset.set(0);
     state.has_more_messages.set(false);
     let scope = state.scope.borrow().clone();
@@ -1614,22 +2804,14 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
                 load_outbox_messages(&database, &accounts, Some(*id))
             }
             MailScope::Unified(folder) if folder == "Starred" => {
-                database.list_messages_filtered_page(None, None, true, MESSAGE_PAGE_SIZE, 0)
+                database.list_messages_filtered_page(None, None, true, page_limit, 0)
             }
-            MailScope::Unified(folder) => database.list_messages_filtered_page(
-                None,
-                Some(folder),
-                false,
-                MESSAGE_PAGE_SIZE,
-                0,
-            ),
-            MailScope::Account { id, folder } => database.list_messages_filtered_page(
-                Some(*id),
-                Some(folder),
-                false,
-                MESSAGE_PAGE_SIZE,
-                0,
-            ),
+            MailScope::Unified(folder) => {
+                database.list_messages_filtered_page(None, Some(folder), false, page_limit, 0)
+            }
+            MailScope::Account { id, folder } => {
+                database.list_messages_filtered_page(Some(*id), Some(folder), false, page_limit, 0)
+            }
         };
         let _ = sender.send_blocking(result);
     });
@@ -1646,7 +2828,7 @@ fn load_messages_for_scope(state: &Rc<AppState>) {
             Ok(Ok(messages)) => {
                 state_for_result
                     .has_more_messages
-                    .set(messages.len() == MESSAGE_PAGE_SIZE);
+                    .set(messages.len() == page_limit);
                 state_for_result.message_offset.set(messages.len());
                 state_for_result.messages.replace(messages);
                 render_sidebar(&state_for_result);
@@ -1971,13 +3153,151 @@ fn start_message_search(state: &Rc<AppState>, query: &str) {
     });
 }
 
+// Removing/replacing focused widgets can make GTK select the first row. These
+// are layout side effects, not user navigation: suppress callbacks throughout
+// the refresh and restore selection by identity, never by position.
+struct MessageSelectionRefresh<'a> {
+    state: &'a Rc<AppState>,
+    selected: HashSet<i64>,
+    focused_row: Option<i64>,
+    anchor: Option<i64>,
+    adjustment: Option<(gtk::Adjustment, f64)>,
+    was_refreshing: bool,
+}
+
+fn message_row_id(row: &gtk::ListBoxRow) -> Option<i64> {
+    row.widget_name().strip_prefix("message-row-")?.parse().ok()
+}
+
+impl<'a> MessageSelectionRefresh<'a> {
+    fn new(state: &'a Rc<AppState>) -> Self {
+        let focus = gtk::prelude::GtkWindowExt::focus(&state.window);
+        let focused_row = focus.and_then(|widget| {
+            let row = widget
+                .clone()
+                .downcast::<gtk::ListBoxRow>()
+                .ok()
+                .or_else(|| {
+                    widget
+                        .ancestor(gtk::ListBoxRow::static_type())
+                        .and_downcast::<gtk::ListBoxRow>()
+                })?;
+            (row.parent().as_ref() == Some(state.message_list.upcast_ref()))
+                .then(|| message_row_id(&row))
+                .flatten()
+        });
+        let adjustment = state
+            .message_list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+            .map(|scroll| {
+                let adjustment = scroll.vadjustment();
+                let value = adjustment.value();
+                (adjustment, value)
+            });
+        Self {
+            state,
+            selected: state
+                .message_list
+                .selected_rows()
+                .iter()
+                .filter_map(message_row_id)
+                .collect(),
+            focused_row,
+            anchor: state
+                .selection_anchor
+                .get()
+                .and_then(|index| state.message_list.row_at_index(index))
+                .as_ref()
+                .and_then(message_row_id),
+            adjustment,
+            was_refreshing: state.refreshing_selection.replace(true),
+        }
+    }
+}
+
+impl Drop for MessageSelectionRefresh<'_> {
+    fn drop(&mut self) {
+        let list = &self.state.message_list;
+        let mut retained = HashSet::new();
+        let mut index = 0;
+        let mut anchor = None;
+        while let Some(row) = list.row_at_index(index) {
+            if let Some(id) = message_row_id(&row) {
+                if self.selected.contains(&id) {
+                    if !row.is_selected() {
+                        list.select_row(Some(&row));
+                    }
+                    retained.insert(id);
+                } else if row.is_selected() {
+                    list.unselect_row(&row);
+                }
+                let focus_still_inside = gtk::prelude::GtkWindowExt::focus(&self.state.window)
+                    .is_some_and(|focus| {
+                        focus == *row.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&row)
+                    });
+                if self.focused_row == Some(id) && !focus_still_inside {
+                    row.grab_focus();
+                }
+                if self.anchor == Some(id) {
+                    anchor = Some(index);
+                }
+            }
+            index += 1;
+        }
+        self.state.selected_messages.replace(retained);
+        self.state.selection_anchor.set(anchor);
+        if let Some((adjustment, value)) = &self.adjustment {
+            adjustment.set_value(*value);
+        }
+        self.state.refreshing_selection.set(self.was_refreshing);
+        update_selection_summary(self.state);
+    }
+}
+
+fn row_content(mut message: Message) -> Message {
+    message.unread = false;
+    message.starred = false;
+    message
+}
+
+fn update_message_row_flags(row: &gtk::ListBoxRow, message: &Message, format: &str) {
+    if message.unread {
+        row.add_css_class("unread");
+    } else {
+        row.remove_css_class("unread");
+    }
+    row.update_property(
+        &[gtk::accessible::Property::Label(&message_accessible_label(
+            message, format,
+        ))],
+    );
+    fn visit(widget: &gtk::Widget, message: &Message) {
+        if widget.has_css_class("mail-unread-dot") {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                label.set_text(if message.unread { "●" } else { " " });
+            }
+        }
+        if widget.has_css_class("mail-star") {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                button.set_icon_name(if message.starred {
+                    "starred-symbolic"
+                } else {
+                    "non-starred-symbolic"
+                });
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            visit(&current, message);
+            child = current.next_sibling();
+        }
+    }
+    visit(row.upcast_ref(), message);
+}
+
 fn render_messages(state: &Rc<AppState>, query: &str) {
-    state.message_list.unselect_all();
-    state.selected_messages.borrow_mut().clear();
-    state.selection_anchor.set(None);
-    update_selection_summary(state);
-    clear(&state.message_list);
-    state.load_more.set_visible(false);
+    let _selection = MessageSelectionRefresh::new(state);
     let raw_query = query.trim();
     let query = raw_query.to_lowercase();
     let scope = state.scope.borrow().clone();
@@ -2032,6 +3352,12 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
         })
         .collect::<Vec<_>>();
     if visible.is_empty() {
+        state.displayed_messages.borrow_mut().clear();
+        state.message_list.unselect_all();
+        state.selected_messages.borrow_mut().clear();
+        state.selection_anchor.set(None);
+        update_selection_summary(state);
+        clear(&state.message_list);
         let (title, subtitle) = if !raw_query.is_empty() && state.search_pending.get() {
             ("Searching…", "Looking through your cached messages.")
         } else if !raw_query.is_empty() {
@@ -2058,8 +3384,71 @@ fn render_messages(state: &Rc<AppState>, query: &str) {
     } else {
         visible
     };
+    // Reconcile rows in place when membership/order is unchanged. In particular,
+    // auto-read and no-op sync must not clear selection or steal keyboard focus.
+    let previous = state.displayed_messages.borrow().clone();
+    let date_format = state.preferences.borrow().date_time_format.clone();
+    let format_changed = *state.displayed_date_format.borrow() != date_format;
+    state.displayed_date_format.replace(date_format);
+    if !previous.is_empty()
+        && previous
+            .iter()
+            .map(|message| message.id)
+            .eq(visible.iter().map(|message| message.id))
+    {
+        for (index, message) in visible.iter().enumerate() {
+            if !format_changed && previous[index] == *message {
+                continue;
+            }
+            if let Some(row) = state.message_list.row_at_index(index as i32) {
+                if !format_changed
+                    && row_content(previous[index].clone()) == row_content(message.clone())
+                {
+                    update_message_row_flags(
+                        &row,
+                        message,
+                        &state.preferences.borrow().date_time_format,
+                    );
+                    continue;
+                }
+                let (replacement, star) =
+                    message_row(message, &state.preferences.borrow().date_time_format);
+                let child = replacement.child();
+                replacement.set_child(None::<&gtk::Widget>);
+                row.set_child(child.as_ref());
+                if message.unread {
+                    row.add_css_class("unread");
+                } else {
+                    row.remove_css_class("unread");
+                }
+                row.update_property(&[gtk::accessible::Property::Label(
+                    &message_accessible_label(
+                        message,
+                        &state.preferences.borrow().date_time_format,
+                    ),
+                )]);
+                let state = state.clone();
+                let id = message.id;
+                star.connect_clicked(move |_| {
+                    if id >= 0 {
+                        apply_message_action(&state, id, "star");
+                    }
+                });
+            }
+        }
+        state.displayed_messages.replace(visible);
+        state.load_more.set_visible(can_load_more);
+        return;
+    }
+    state.displayed_messages.replace(visible.clone());
+    state.message_list.unselect_all();
+    state.selected_messages.borrow_mut().clear();
+    state.selection_anchor.set(None);
+    update_selection_summary(state);
+    clear(&state.message_list);
     for message in visible.iter() {
-        let (row, star) = message_row(message);
+        let date_time_format = state.preferences.borrow().date_time_format.clone();
+        let (row, star) = message_row(message, &date_time_format);
         connect_message_selection(state, &row);
         let message_id = message.id;
         let state_for_star = state.clone();
@@ -2407,10 +3796,7 @@ fn listen_for_outbox_reports(
     });
 }
 
-fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
-    let row = gtk::ListBoxRow::new();
-    row.set_widget_name(&format!("message-row-{}", message.id));
-    row.add_css_class("mail-message-row");
+fn message_accessible_label(message: &Message, date_time_format: &str) -> String {
     let mut accessible_label = String::new();
     if message.unread {
         accessible_label.push_str("Unread. ");
@@ -2423,11 +3809,26 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
         accessible_label.push_str(&message.preview);
     }
     accessible_label.push_str(". ");
-    accessible_label.push_str(&format_message_date(&message.received_at));
+    accessible_label.push_str(&format_message_date_with_format(
+        &message.received_at,
+        date_time_format,
+    ));
     if message.has_attachments {
         accessible_label.push_str(". Has attachments");
     }
-    row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+    accessible_label
+}
+
+fn message_row(message: &Message, date_time_format: &str) -> (gtk::ListBoxRow, gtk::Button) {
+    let row = gtk::ListBoxRow::new();
+    row.set_widget_name(&format!("message-row-{}", message.id));
+    row.add_css_class("mail-message-row");
+    row.update_property(
+        &[gtk::accessible::Property::Label(&message_accessible_label(
+            message,
+            date_time_format,
+        ))],
+    );
     if message.unread {
         row.add_css_class("unread");
     }
@@ -2474,7 +3875,10 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
     let trailing = gtk::Box::new(gtk::Orientation::Vertical, 4);
     trailing.set_valign(gtk::Align::Start);
     trailing.set_size_request(96, -1);
-    let date = gtk::Label::new(Some(&format_message_date(&message.received_at)));
+    let date = gtk::Label::new(Some(&format_message_date_with_format(
+        &message.received_at,
+        date_time_format,
+    )));
     date.set_single_line_mode(true);
     date.set_halign(gtk::Align::End);
     date.set_xalign(1.0);
@@ -2511,34 +3915,66 @@ fn message_row(message: &Message) -> (gtk::ListBoxRow, gtk::Button) {
 }
 
 fn format_message_date(value: &str) -> String {
-    format_message_date_at(value, chrono::Local::now().date_naive())
+    format_message_date_with_format(value, "day-month-24-hour")
+}
+
+fn format_message_date_with_format(value: &str, format: &str) -> String {
+    format_message_date_at_with_format(value, chrono::Local::now().date_naive(), format)
 }
 
 fn format_message_date_at(value: &str, today: chrono::NaiveDate) -> String {
+    format_message_date_at_with_format(value, today, "day-month-24-hour")
+}
+
+fn format_message_date_at_with_format(
+    value: &str,
+    today: chrono::NaiveDate,
+    format: &str,
+) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
         return value.to_string();
     };
     let local = parsed.with_timezone(&chrono::Local);
     let date = local.date_naive();
     if date == today {
-        format!("Today, {}", local.format("%H:%M"))
+        if is_12_hour_format(format) {
+            format!("Today, {}", local.format("%-I:%M %p"))
+        } else {
+            format!("Today, {}", local.format("%H:%M"))
+        }
     } else if date == today - chrono::Duration::days(1) {
         "Yesterday".into()
     } else if date.year() == today.year() {
-        local.format("%-d %b").to_string()
+        if is_us_date_format(format) {
+            local.format("%b %-d").to_string()
+        } else {
+            local.format("%-d %b").to_string()
+        }
     } else {
-        local.format("%-d %b %Y").to_string()
+        if is_us_date_format(format) {
+            local.format("%b %-d, %Y").to_string()
+        } else {
+            local.format("%-d %b %Y").to_string()
+        }
     }
 }
 
 fn format_message_datetime(value: &str) -> String {
+    format_message_datetime_with_format(value, "day-month-24-hour")
+}
+
+fn format_message_datetime_with_format(value: &str, format: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
         return value.to_string();
     };
-    parsed
-        .with_timezone(&chrono::Local)
-        .format("%a, %-d %B %Y at %H:%M")
-        .to_string()
+    let local = parsed.with_timezone(&chrono::Local);
+    if is_us_date_format(format) {
+        local.format("%a, %b %-d, %Y at %-I:%M %p").to_string()
+    } else if is_12_hour_format(format) {
+        local.format("%a, %-d %B %Y at %-I:%M %p").to_string()
+    } else {
+        local.format("%a, %-d %B %Y at %H:%M").to_string()
+    }
 }
 
 fn open_folder_menu(
@@ -3388,6 +4824,11 @@ fn apply_bulk_move(state: &Rc<AppState>, target_folder: &str) {
 
 fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
     let mut persist = None;
+    let replacement_row_index = if matches!(action, "archive" | "trash") {
+        state.message_list.selected_row().map(|row| row.index())
+    } else {
+        None
+    };
     match action {
         "read" => {
             let (unread, folder) = {
@@ -3456,10 +4897,6 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
             } else {
                 set_status(state, "This message cannot be moved on the server");
             }
-            if account_id.is_some() {
-                state.selected_message.replace(None);
-                render_reader(state, None);
-            }
         }
         _ => {}
     }
@@ -3488,6 +4925,27 @@ fn apply_message_action(state: &Rc<AppState>, message_id: i64, action: &str) {
     }
     render_sidebar(state);
     render_messages(state, state.search_entry.text().as_str());
+    if let Some(index) = replacement_row_index {
+        select_message_row_at(state, index);
+    }
+}
+
+// Read/star flags affect the list, not the displayed document. Keep the WebView
+// (and its scroll position) alive when sync changes only those flags.
+#[derive(Debug, PartialEq, Eq)]
+struct ReaderSnapshot {
+    selected_id: i64,
+    messages: Vec<Message>,
+    remote_images: Vec<bool>,
+    date_time_format: String,
+    narrow: bool,
+}
+
+fn reader_content(mut message: Message) -> Message {
+    message.unread = false;
+    message.starred = false;
+    message.thread_size = 0;
+    message
 }
 
 fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
@@ -3495,9 +4953,32 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         state.middle.set_visible(message.is_none());
         state.reader.set_visible(message.is_some());
     }
+    let conversation = message
+        .as_ref()
+        .map(|message| conversation_messages(state, message))
+        .unwrap_or_default();
+    let snapshot = message
+        .as_ref()
+        .filter(|message| message.folder != "Outbox")
+        .map(|message| ReaderSnapshot {
+            selected_id: message.id,
+            messages: std::iter::once(message.clone())
+                .chain(conversation.clone())
+                .map(reader_content)
+                .collect(),
+            remote_images: std::iter::once(message)
+                .chain(conversation.iter())
+                .map(|message| remote_images_allowed(state, message))
+                .collect(),
+            date_time_format: state.preferences.borrow().date_time_format.clone(),
+            narrow: state.narrow_mode.get(),
+        });
+    if snapshot.is_some() && *state.reader_snapshot.borrow() == snapshot {
+        return;
+    }
+    state.reader_snapshot.replace(snapshot);
     clear(&state.reader);
     if let Some(message) = message {
-        let conversation = conversation_messages(state, &message);
         let scroll = gtk::ScrolledWindow::builder()
             .vexpand(true)
             .hexpand(true)
@@ -3546,7 +5027,10 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
         let email = gtk::Label::new(Some(&sender_address));
         email.add_css_class("mail-reader-meta");
         sender_line.append(&email);
-        let date = gtk::Label::new(Some(&format_message_datetime(&message.received_at)));
+        let date = gtk::Label::new(Some(&format_message_datetime_with_format(
+            &message.received_at,
+            &state.preferences.borrow().date_time_format,
+        )));
         date.add_css_class("mail-reader-meta");
         date.set_hexpand(true);
         date.set_xalign(1.0);
@@ -3655,6 +5139,33 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
                 });
                 actions.append(&button);
             }
+            let message_for_calendar = message.clone();
+            let state_for_calendar = state.clone();
+            let calendar = gtk::Button::with_label("Add to calendar");
+            calendar.set_has_frame(false);
+            calendar.connect_clicked(move |_| {
+                open_calendar_event_dialog(
+                    state_for_calendar.clone(),
+                    state_for_calendar.window.clone().upcast(),
+                    Some(message_for_calendar.clone()),
+                    false,
+                    None,
+                )
+            });
+            actions.append(&calendar);
+            let message_for_todo = message.clone();
+            let state_for_todo = state.clone();
+            let todo = gtk::Button::with_label("Create todo");
+            todo.set_has_frame(false);
+            todo.connect_clicked(move |_| {
+                open_todo_dialog(
+                    state_for_todo.clone(),
+                    state_for_todo.window.clone().upcast(),
+                    Some(message_for_todo.clone()),
+                    false,
+                )
+            });
+            actions.append(&todo);
             content.append(&actions);
         }
 
@@ -3680,7 +5191,10 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
                 let title = format!(
                     "{}  ·  {}",
                     related.sender_name,
-                    format_message_datetime(&related.received_at)
+                    format_message_datetime_with_format(
+                        &related.received_at,
+                        &state.preferences.borrow().date_time_format,
+                    )
                 );
                 let expander = gtk::Expander::new(Some(&title));
                 expander.add_css_class("mail-conversation-expander");
@@ -5821,6 +7335,7 @@ fn save_settings_session(
                 status.set_text("Settings saved");
                 settings_window.close();
                 set_status(&state_for_result, "Settings saved");
+                start_calendar_sync(state_for_result.clone());
                 if let Some(continuation) = continuation {
                     continuation();
                 }
@@ -5944,6 +7459,326 @@ fn open_unsaved_settings_warning(
     warning.present();
 }
 
+fn render_subscription_settings(
+    list: &gtk::Box,
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    save: gtk::Button,
+) {
+    clear(list);
+    for feed in state.preferences.borrow().calendar_subscriptions.clone() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let show = gtk::CheckButton::with_label(&format!("◆ {}", feed.name));
+        show.set_active(feed.visible);
+        show.set_hexpand(true);
+        let url = feed.url.clone();
+        let state_for_show = state.clone();
+        let session_for_show = session.clone();
+        let save_for_show = save.clone();
+        show.connect_toggled(move |button| {
+            if let Some(feed) = state_for_show
+                .preferences
+                .borrow_mut()
+                .calendar_subscriptions
+                .iter_mut()
+                .find(|feed| feed.url == url)
+            {
+                feed.visible = button.is_active();
+            }
+            mark_settings_dirty(&session_for_show, &save_for_show);
+        });
+        row.append(&show);
+        let remove = gtk::Button::with_label("Remove");
+        remove.set_tooltip_text(Some(
+            "Remove this subscription from Omarchy Mail only. Save Changes to confirm.",
+        ));
+        let state = state.clone();
+        let session = session.clone();
+        let save = save.clone();
+        let list_for_remove = list.clone();
+        remove.connect_clicked(move |_| {
+            state
+                .preferences
+                .borrow_mut()
+                .calendar_subscriptions
+                .retain(|item| item.url != feed.url);
+            mark_settings_dirty(&session, &save);
+            render_subscription_settings(
+                &list_for_remove,
+                state.clone(),
+                session.clone(),
+                save.clone(),
+            );
+        });
+        row.append(&remove);
+        list.append(&row);
+    }
+}
+
+fn build_subscription_settings(
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    save: gtk::Button,
+) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let title = gtk::Label::new(Some("Calendars to display"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-section-label");
+    page.append(&title);
+    let personal =
+        gtk::CheckButton::with_label("● Show personal / iCloud calendar (default for new events)");
+    personal.set_active(state.preferences.borrow().show_personal_calendar);
+    let personal_state = state.clone();
+    let personal_session = session.clone();
+    let personal_save = save.clone();
+    personal.connect_toggled(move |button| {
+        personal_state
+            .preferences
+            .borrow_mut()
+            .show_personal_calendar = button.is_active();
+        mark_settings_dirty(&personal_session, &personal_save);
+    });
+    page.append(&personal);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    render_subscription_settings(&list, state.clone(), session.clone(), save.clone());
+    page.append(&list);
+    let help = gtk::Label::new(Some(
+        "Subscriptions appear alongside your own events. They are read-only, refresh every five minutes while open, and stay cached offline. Add the same link on other devices; feeds are not uploaded to iCloud. Save Changes to keep visibility or subscription changes.",
+    ));
+    help.set_wrap(true);
+    help.set_xalign(0.0);
+    page.append(&help);
+    let (name_row, name) = planner_entry("Subscription name", "");
+    let (url_row, url) = planner_entry("Calendar URL (webcal:// or https://)", "");
+    page.append(&name_row);
+    page.append(&url_row);
+    let add = gtk::Button::with_label("Add subscription");
+    page.append(&add);
+    let status = gtk::Label::new(None);
+    status.set_wrap(true);
+    status.set_xalign(0.0);
+    page.append(&status);
+    add.connect_clicked(move |button| {
+        let label = name.text().trim().to_string();
+        if label.is_empty() {
+            status.set_text("Give the subscription a name.");
+            return;
+        }
+        let address = match crate::subscriptions::normalize_url(url.text().as_str()) {
+            Ok(url) => url,
+            Err(error) => {
+                status.set_text(&error);
+                return;
+            }
+        };
+        if state
+            .preferences
+            .borrow()
+            .calendar_subscriptions
+            .iter()
+            .any(|feed| feed.url == address)
+        {
+            status.set_text("This subscription has already been added.");
+            return;
+        }
+        let feed = crate::subscriptions::Subscription {
+            name: label,
+            url: address,
+            visible: true,
+        };
+        button.set_sensitive(false);
+        status.set_text("Checking and downloading calendar…");
+        let (sender, receiver) = async_channel::bounded(1);
+        let feed_for_worker = feed.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(crate::subscriptions::refresh(&feed_for_worker));
+        });
+        let state = state.clone();
+        let session = session.clone();
+        let save = save.clone();
+        let status = status.clone();
+        let button = button.clone();
+        let list = list.clone();
+        let name = name.clone();
+        let url = url.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = receiver.recv().await;
+            button.set_sensitive(true);
+            if list.root().is_none() {
+                return;
+            }
+            match result {
+                Ok(Ok(count)) => {
+                    state
+                        .preferences
+                        .borrow_mut()
+                        .calendar_subscriptions
+                        .push(feed);
+                    mark_settings_dirty(&session, &save);
+                    render_subscription_settings(&list, state, session, save);
+                    name.set_text("");
+                    url.set_text("");
+                    status.set_text(&format!(
+                        "Downloaded {count} events. Save Changes to keep this subscription."
+                    ));
+                }
+                Ok(Err(error)) => status.set_text(&error),
+                Err(_) => status.set_text("Subscription check stopped. Try again."),
+            }
+        });
+    });
+    page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    page
+}
+
+fn build_icloud_settings(
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    save: gtk::Button,
+) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.append(&build_subscription_settings(
+        state.clone(),
+        session.clone(),
+        save.clone(),
+    ));
+    let help = gtk::Label::new(Some(
+        "Connect iCloud Calendar with your Apple Account and an app-specific password. Events sync every five minutes while the app is open. Recurring events are shown from one year ago to two years ahead. Todos remain local.",
+    ));
+    help.set_wrap(true);
+    help.set_xalign(0.0);
+    page.append(&help);
+    let link = gtk::LinkButton::with_label(
+        "https://support.apple.com/en-gb/102654",
+        "How to create an app-specific password",
+    );
+    link.set_halign(gtk::Align::Start);
+    page.append(&link);
+    let configured = state.preferences.borrow().icloud_calendar.clone();
+    let (email_row, email) = planner_entry(
+        "Apple Account email",
+        configured
+            .as_ref()
+            .map(|a| a.username.as_str())
+            .unwrap_or(""),
+    );
+    page.append(&email_row);
+    let password = gtk::PasswordEntry::new();
+    password.set_placeholder_text(Some(if configured.is_some() {
+        "Password saved in keyring — leave blank to keep it"
+    } else {
+        "App-specific password"
+    }));
+    password.set_show_peek_icon(true);
+    page.append(&password);
+    let upload = gtk::CheckButton::with_label("Also upload my existing local calendar events");
+    page.append(&upload);
+    let status = gtk::Label::new(Some(
+        &configured
+            .as_ref()
+            .map(|a| {
+                format!(
+                    "Connected: {}. Use Save Changes after changing the calendar.",
+                    a.calendar_name
+                )
+            })
+            .unwrap_or("Not connected".into()),
+    ));
+    status.set_wrap(true);
+    status.set_xalign(0.0);
+    page.append(&status);
+    let results = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    if let Some(account) = configured.as_ref() {
+        let saved_calendar = gtk::DropDown::from_strings(&[account.calendar_name.as_str()]);
+        saved_calendar.set_tooltip_text(Some(
+            "Saved calendar. Refresh the list below to choose another.",
+        ));
+        results.append(&saved_calendar);
+    }
+    page.append(&results);
+    let find = gtk::Button::with_label(if configured.is_some() {
+        "Refresh calendar list"
+    } else {
+        "Find iCloud calendars"
+    });
+    page.append(&find);
+    let disconnect = gtk::Button::with_label("Disconnect calendar");
+    page.append(&disconnect);
+    let disconnect_state = state.clone();
+    let disconnect_session = session.clone();
+    let disconnect_save = save.clone();
+    let disconnect_status = status.clone();
+    disconnect.connect_clicked(move |_| {
+        disconnect_state.preferences.borrow_mut().icloud_calendar = None;
+        mark_settings_dirty(&disconnect_session, &disconnect_save);
+        disconnect_status.set_text("Disconnected. Cached events remain on this computer. Save Changes to keep this setting.");
+    });
+    find.connect_clicked(move |button| {
+        if state.calendar_sync_busy.get() { status.set_text("Wait for the current sync to finish."); return; }
+        let username = email.text().trim().to_string();
+        let secret = password.text().to_string();
+        if username.is_empty() { status.set_text("Enter your Apple Account email."); return; }
+        button.set_sensitive(false);
+        status.set_text("Finding iCloud calendars…");
+        let (sender, receiver) = async_channel::bounded(1);
+        let user_for_worker = username.clone();
+        std::thread::spawn(move || {
+            let secret = if secret.is_empty() {
+                mail::credentials::load_password(&user_for_worker,"icloud-calendar")
+                    .map_err(|_| "No saved password for this account. Enter an app-specific password.".to_string())
+            } else { Ok(secret) };
+            let result = secret.and_then(|secret| crate::icloud::discover(&user_for_worker, &secret).and_then(|calendars| {
+                mail::credentials::store_password(&user_for_worker,"icloud-calendar", &secret)
+                    .map_err(|_| "Could not save the password in the system keyring.".to_string())?;
+                Ok(calendars)
+            }));
+            let _ = sender.send_blocking(result);
+        });
+        let state = state.clone(); let session = session.clone(); let save = save.clone();
+        let status = status.clone(); let results = results.clone(); let button = button.clone();
+        let password = password.clone();
+        let include_existing = upload.is_active();
+        glib::MainContext::default().spawn_local(async move {
+            let found = receiver.recv().await;
+            button.set_sensitive(true);
+            if results.root().is_none() { return; }
+            match found {
+                Ok(Ok(calendars)) => {
+                    password.set_text("");
+                    clear(&results);
+                    let names = calendars.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+                    let dropdown = gtk::DropDown::from_strings(&names);
+                    let old = state.preferences.borrow().icloud_calendar.clone();
+                    let selected = old.as_ref().and_then(|account| calendars.iter().position(|calendar| calendar.url == account.calendar_url)).unwrap_or(0) as u32;
+                    dropdown.set_selected(selected);
+                    let cutoff = if include_existing { 0 } else {
+                        state.database.list_calendar_events().unwrap_or_default().iter().map(|e|e.id).max().unwrap_or(0)
+                    };
+                    let namespace = old.as_ref().map(|a|a.namespace.clone()).unwrap_or_else(||glib::uuid_string_random().to_string());
+                    let calendars = Rc::new(calendars);
+                    let configure = Rc::new(move |index: u32| {
+                        if let Some(calendar) = calendars.get(index as usize) {
+                            state.preferences.borrow_mut().icloud_calendar = Some(crate::icloud::CalendarAccount {
+                                username: username.clone(), calendar_url: calendar.url.clone(), calendar_name: calendar.name.clone(),
+                                namespace: namespace.clone(), upload_after: old.as_ref().filter(|a| a.username == username && a.calendar_url == calendar.url)
+                                    .map(|a|if include_existing { 0 } else { a.upload_after }).unwrap_or(cutoff),
+                            });
+                            mark_settings_dirty(&session,&save);
+                        }
+                    });
+                    configure(selected);
+                    dropdown.connect_selected_notify(move |d| configure(d.selected()));
+                    results.append(&dropdown);
+                    status.set_text("Choose a calendar, then Save Changes. Imported events can be edited in Apple Calendar; new Omarchy events upload here.");
+                }
+                Ok(Err(error)) => status.set_text(&error),
+                Err(_) => status.set_text("Calendar connection stopped."),
+            }
+        });
+    });
+    page
+}
+
 fn open_settings(state: Rc<AppState>) {
     let original_account_notifications = state
         .accounts
@@ -5991,18 +7826,42 @@ fn open_settings(state: Rc<AppState>) {
     subtitle.add_css_class("mail-settings-subtitle");
     root.append(&subtitle);
 
+    let pages = gtk::Stack::new();
+    pages.set_vexpand(true);
+    pages.set_vhomogeneous(false);
+    let general_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let accounts_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let calendar_page = build_icloud_settings(state.clone(), session.clone(), save_button.clone());
+    for (name, title, page) in [
+        ("general", "General", &general_page),
+        ("accounts", "Accounts", &accounts_page),
+        ("calendar", "Calendar", &calendar_page),
+    ] {
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(page)
+            .build();
+        pages.add_titled(&scroll, Some(name), title);
+    }
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&pages));
+    switcher.set_halign(gtk::Align::Center);
+    root.append(&switcher);
+    root.append(&pages);
+
     let accounts = gtk::Label::new(Some("ACCOUNTS"));
     accounts.set_xalign(0.0);
     accounts.add_css_class("mail-section-label");
     accounts.set_margin_top(24);
-    root.append(&accounts);
+    accounts_page.append(&accounts);
     let account_summary = gtk::Label::new(Some(&format!(
         "{} configured account(s)",
         state.accounts.borrow().len()
     )));
     account_summary.set_xalign(0.0);
     account_summary.add_css_class("mail-empty-body");
-    root.append(&account_summary);
+    accounts_page.append(&account_summary);
 
     let account_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     account_list.add_css_class("mail-settings-account-list");
@@ -6228,16 +8087,21 @@ fn open_settings(state: Rc<AppState>) {
             });
         });
         row.append(&header);
-        row.append(&notify_row);
-        row.append(&signature_field);
+        let account_details = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        account_details.append(&notify_row);
+        account_details.append(&signature_field);
         let account_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         account_actions.set_halign(gtk::Align::End);
         account_actions.add_css_class("mail-settings-account-actions");
         account_actions.append(&remove);
-        row.append(&account_actions);
+        account_details.append(&account_actions);
+        let expander = gtk::Expander::new(Some("Signature and account options"));
+        expander.set_expanded(false);
+        expander.set_child(Some(&account_details));
+        row.append(&expander);
         account_list.append(&row);
     }
-    root.append(&account_list);
+    accounts_page.append(&account_list);
 
     let reading = gtk::Label::new(Some("READING"));
     reading.set_xalign(0.0);
@@ -6260,6 +8124,40 @@ fn open_settings(state: Rc<AppState>) {
         state.preferences.borrow().conversation_view,
         |preferences, active| preferences.conversation_view = active,
     ));
+    let date_time_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    date_time_row.add_css_class("mail-settings-preference-row");
+    let date_time_label = gtk::Label::new(Some("Date and time format"));
+    date_time_label.set_xalign(0.0);
+    date_time_label.set_hexpand(true);
+    let date_time_format = gtk::DropDown::from_strings(&[
+        "UK · day/month/year · 24-hour",
+        "UK · day/month/year · 12-hour",
+        "US · month/day/year · 12-hour",
+    ]);
+    let current_format = state.preferences.borrow().date_time_format.clone();
+    date_time_format.set_selected(match current_format.as_str() {
+        "uk-12-hour" => 1,
+        "us-12-hour" | "month-day-12-hour" => 2,
+        _ => 0,
+    });
+    let state_for_date_time = state.clone();
+    let session_for_date_time = session.clone();
+    let save_button_for_date_time = save_button.clone();
+    date_time_format.connect_selected_notify(move |dropdown| {
+        let value = match dropdown.selected() {
+            1 => "uk-12-hour",
+            2 => "us-12-hour",
+            _ => "day-month-24-hour",
+        };
+        state_for_date_time
+            .preferences
+            .borrow_mut()
+            .date_time_format = value.into();
+        mark_settings_dirty(&session_for_date_time, &save_button_for_date_time);
+    });
+    date_time_row.append(&date_time_label);
+    date_time_row.append(&date_time_format);
+    root.append(&date_time_row);
 
     let notifications = gtk::Label::new(Some("NOTIFICATIONS"));
     notifications.set_xalign(0.0);
@@ -6288,6 +8186,15 @@ fn open_settings(state: Rc<AppState>) {
         state.preferences.borrow().plain_text_warning,
         |preferences, active| preferences.plain_text_warning = active,
     ));
+
+    // Move preference rows into their own scrolling page, above a fixed footer.
+    let mut preference = Some(reading.clone().upcast::<gtk::Widget>());
+    while let Some(widget) = preference {
+        preference = widget.next_sibling();
+        root.remove(&widget);
+        general_page.append(&widget);
+    }
+    pages.set_visible_child_name("general");
 
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     footer.add_css_class("mail-settings-footer");
@@ -6349,12 +8256,7 @@ fn open_settings(state: Rc<AppState>) {
         }
     });
     window.add_controller(key_controller);
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&root)
-        .build();
-    window.set_content(Some(&scroll));
+    window.set_content(Some(&root));
     window.present();
 }
 
@@ -7809,6 +9711,248 @@ fn set_status(state: &AppState, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_calendar_respects_independent_visibility_and_source() {
+        let event = CalendarEvent {
+            id: 1,
+            title: "Personal event".into(),
+            notes: String::new(),
+            starts_at: "2026-09-10 12:00".into(),
+            ends_at: "2026-09-10 13:00".into(),
+            location: String::new(),
+            message_id: None,
+        };
+        for personal_visible in [false, true] {
+            for feed_visible in [false, true] {
+                let mut prefs = preferences::Preferences::default();
+                prefs.show_personal_calendar = personal_visible;
+                prefs
+                    .calendar_subscriptions
+                    .push(crate::subscriptions::Subscription {
+                        name: "Spurs".into(),
+                        url: "https://example.com/feed.ics".into(),
+                        visible: feed_visible,
+                    });
+                let events = combine_calendar_events(&prefs, vec![event.clone()], |_| {
+                    vec![CalendarEvent {
+                        title: "Fixture".into(),
+                        ..event.clone()
+                    }]
+                });
+                assert_eq!(
+                    events.len(),
+                    usize::from(personal_visible) + usize::from(feed_visible)
+                );
+                assert_eq!(
+                    events.iter().filter(|event| event.subscription).count(),
+                    usize::from(feed_visible)
+                );
+                if feed_visible {
+                    assert!(events.iter().any(|event| event.source == "Spurs"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires a GTK display; uses only an isolated temporary database and demo messages"]
+    fn gtk_refresh_keeps_non_top_email_selected() {
+        adw::init().unwrap();
+        let pump = |duration| {
+            let until = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().pending() {
+                    glib::MainContext::default().iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let vertical = || gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Multiple);
+        let middle = vertical();
+        middle.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&list)
+                .vexpand(true)
+                .build(),
+        );
+        let (monitor_sender, _) = async_channel::unbounded();
+        let (outbox_sender, _) = async_channel::unbounded();
+        let mut messages = Message::demo_messages();
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.folder = "Inbox".into();
+            message.thread_key = Some(format!("test-{index}"));
+            message.unread = true;
+            message.body_html = None;
+            message.attachments.clear();
+        }
+        let state = Rc::new(AppState {
+            window: adw::ApplicationWindow::builder()
+                .title("Mail refresh regression test")
+                .default_width(900)
+                .default_height(600)
+                .build(),
+            database: Database::open(directory.path()).unwrap(),
+            accounts: RefCell::new(Vec::new()),
+            preferences: RefCell::new(preferences::Preferences::default()),
+            folders: RefCell::new(Vec::new()),
+            messages: RefCell::new(messages),
+            sidebar: vertical(),
+            sidebar_structure: RefCell::new(None),
+            sidebar_rows: RefCell::new(Vec::new()),
+            message_list: list,
+            displayed_messages: RefCell::new(Vec::new()),
+            displayed_date_format: RefCell::new(String::new()),
+            refreshing_selection: Cell::new(false),
+            middle: middle.clone(),
+            sidebar_scroll: gtk::ScrolledWindow::new(),
+            reader: vertical(),
+            reader_snapshot: RefCell::new(None),
+            navigation: gtk::Button::new(),
+            search_entry: gtk::SearchEntry::new(),
+            empty_trash_button: gtk::Button::new(),
+            search_results: RefCell::new(None),
+            search_generation: Cell::new(0),
+            search_pending: Cell::new(false),
+            cache_load_generation: Cell::new(0),
+            cache_load_pending: Cell::new(false),
+            scope: RefCell::new(MailScope::Unified("Inbox".into())),
+            search_filters: RefCell::new(SearchFilters::default()),
+            selected_message: RefCell::new(None),
+            read_dwell_generation: Cell::new(0),
+            calendar_sync_busy: Cell::new(false),
+            calendar_sync_status: RefCell::new(String::new()),
+            account_expanded: RefCell::new(HashMap::new()),
+            narrow_mode: Cell::new(false),
+            mobile_mode: Cell::new(false),
+            sidebar_revealed: Cell::new(false),
+            allowed_remote_images: RefCell::new(HashSet::new()),
+            monitor_sender,
+            monitor_stops: RefCell::new(HashMap::new()),
+            outbox_sender,
+            outbox_stops: RefCell::new(HashMap::new()),
+            status: gtk::Label::new(None),
+            selection_bar: vertical(),
+            selection_count: gtk::Label::new(None),
+            selected_messages: RefCell::new(HashSet::new()),
+            selection_anchor: Cell::new(None),
+            undo_button: gtk::Button::new(),
+            undo_action: RefCell::new(None),
+            undo_generation: Cell::new(0),
+            load_more: gtk::Button::new(),
+            message_offset: Cell::new(0),
+            has_more_messages: Cell::new(false),
+            demo_mode: true,
+        });
+        let pane = build_middle_and_reader(state.clone(), &middle);
+        state.window.set_content(Some(&pane));
+        render_messages(&state, "");
+        state.window.present();
+        pump(Duration::from_millis(100));
+        select_message_row_at(&state, 2);
+        let id = state.selected_message.borrow().unwrap();
+        let row = state.message_list.row_at_index(2).unwrap();
+        let original_child = row.child().unwrap();
+        let reader = state.reader.first_child().unwrap();
+        pump(READ_DWELL + Duration::from_millis(150));
+        assert!(
+            !state
+                .messages
+                .borrow()
+                .iter()
+                .find(|message| message.id == id)
+                .unwrap()
+                .unread
+        );
+        assert_eq!(*state.selected_message.borrow(), Some(id));
+        assert_eq!(
+            row.child().unwrap(),
+            original_child,
+            "read flags must not replace focused row content"
+        );
+        assert_eq!(state.reader.first_child().unwrap(), reader);
+        assert!(row.is_selected());
+        // A new arrival changes membership, forcing the rebuild path.
+        let mut incoming = state.messages.borrow()[0].clone();
+        incoming.id = 999999;
+        incoming.thread_key = Some("new-arrival".into());
+        incoming.received_at = "2099-01-01T12:00:00Z".into();
+        state.messages.borrow_mut().push(incoming);
+        render_messages(&state, "");
+        pump(Duration::from_millis(100));
+        assert_eq!(*state.selected_message.borrow(), Some(id));
+        assert_eq!(
+            state
+                .message_list
+                .selected_rows()
+                .iter()
+                .filter_map(message_row_id)
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(state.reader.first_child().unwrap(), reader);
+        for _ in 0..3 {
+            render_sidebar(&state);
+            render_messages(&state, "");
+            rerender_selected_reader(&state);
+            pump(Duration::from_millis(50));
+        }
+        assert_eq!(*state.selected_message.borrow(), Some(id));
+        // The new unrelated message does not change the displayed conversation.
+        assert_eq!(state.reader.first_child().unwrap(), reader);
+        state.window.close();
+    }
+
+    #[test]
+    fn reader_content_ignores_list_only_flags() {
+        let message = Message::demo_messages().remove(0);
+        let mut updated = message.clone();
+        updated.unread = !message.unread;
+        updated.starred = !message.starred;
+        updated.thread_size += 1;
+        assert_eq!(reader_content(message), reader_content(updated));
+    }
+
+    #[test]
+    fn reader_content_detects_document_and_identity_changes() {
+        let message = Message::demo_messages().remove(0);
+        for change in 0..4 {
+            let mut updated = message.clone();
+            match change {
+                0 => updated.body.push_str("new content"),
+                1 => updated.body_html = Some("<p>Updated</p>".into()),
+                2 => updated.id += 1,
+                _ => updated.folder = "Drafts".into(),
+            }
+            assert_ne!(reader_content(message.clone()), reader_content(updated));
+        }
+    }
+
+    #[test]
+    fn reader_snapshot_tracks_permissions_layout_and_new_replies() {
+        let make_snapshot = || ReaderSnapshot {
+            selected_id: 1,
+            messages: vec![reader_content(Message::demo_messages().remove(0))],
+            remote_images: vec![false],
+            date_time_format: "day-month-24-hour".into(),
+            narrow: false,
+        };
+        for change in 0..4 {
+            let mut updated = make_snapshot();
+            match change {
+                0 => updated.remote_images[0] = true,
+                1 => updated.narrow = true,
+                2 => updated.date_time_format = "us-12-hour".into(),
+                _ => updated
+                    .messages
+                    .push(reader_content(Message::demo_messages().remove(1))),
+            }
+            assert_ne!(make_snapshot(), updated);
+        }
+    }
 
     #[test]
     fn groups_messages_by_account_folder_and_thread() {

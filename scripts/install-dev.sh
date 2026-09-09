@@ -7,7 +7,7 @@ data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
 
 cd "$project_dir"
-for command in cargo install pkg-config; do
+for command in cargo install pkg-config python3; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'Missing required command: %s\n' "$command" >&2
     exit 1
@@ -18,6 +18,8 @@ if ! pkg-config --exists webkitgtk-6.0; then
   exit 1
 fi
 cargo build --release --locked
+python3 -m venv "$data_dir/omarchy-mail/icloud-venv"
+"$data_dir/omarchy-mail/icloud-venv/bin/python" -m pip install --disable-pip-version-check -r scripts/icloud-requirements.txt
 install -Dm755 target/release/omarchy-mail "$bin_dir/omarchy-mail"
 install -Dm644 packaging/org.omarchy.Mail.desktop "$data_dir/applications/org.omarchy.Mail.desktop"
 install -Dm644 packaging/org.omarchy.Mail.metainfo.xml "$data_dir/metainfo/org.omarchy.Mail.metainfo.xml"
