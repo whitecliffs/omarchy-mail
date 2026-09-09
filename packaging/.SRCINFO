@@ -1,0 +1,23 @@
+pkgbase = omarchy-mail
+	pkgdesc = A calm, native email client for Omarchy
+	pkgver = 0.1.0
+	pkgrel = 7
+	url = https://github.com/whitecliffs/omarchy-mail
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	depends = gtk4
+	depends = libadwaita
+	depends = webkitgtk-6.0
+	depends = libsecret
+	depends = openssl
+	depends = python
+	depends = python-icalendar
+	depends = python-recurring-ical-events
+	depends = python-defusedxml
+	optdepends = omarchy-settings: Omarchy theme template generation
+	options = !lto
+	source = omarchy-mail-0.1.0.tar.gz::https://github.com/whitecliffs/omarchy-mail/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 16f10795d660398d794973de1d26659d5cc9d60a1a67735cc3bd90005cbd3534
+
+pkgname = omarchy-mail
