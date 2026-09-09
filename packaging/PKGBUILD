@@ -15,7 +15,7 @@ options=('!lto')
 # Build from the immutable tagged source archive published on GitHub. Replace
 # the checksum when publishing a new release.
 source=("$pkgname-$pkgver.tar.gz::https://github.com/whitecliffs/omarchy-mail/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('REPLACE_WITH_RELEASE_SHA256')
+sha256sums=('16f10795d660398d794973de1d26659d5cc9d60a1a67735cc3bd90005cbd3534')
 
 build() {
   cd "$pkgname-$pkgver"
