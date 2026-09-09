@@ -9,30 +9,36 @@ Omarchy component. Contributions, bug reports, and careful testing are welcome.
 
 ## Install
 
-On Arch Linux and Omarchy, the recommended installation is the community AUR
-package:
-
-```bash
-yay -S omarchy-mail
-```
-
-The package builds Omarchy Mail from the tagged source release. It installs the
-application, desktop entry, icon, AppStream metadata, Omarchy theme template,
-and the Python calendar dependencies used by iCloud Calendar and calendar
-subscriptions. The first launch opens the account setup flow.
-
-For development or to try the latest checkout:
+Clone the repository and run the development installer on Arch Linux or
+Omarchy:
 
 ```bash
 sudo pacman -S --needed webkitgtk-6.0 rust pkgconf libsecret python \
   python-icalendar python-recurring-ical-events python-defusedxml
 git clone https://github.com/whitecliffs/omarchy-mail.git
 cd omarchy-mail
-cargo test --locked
-OMARCHY_MAIL_DEMO=1 cargo run
+./scripts/install-dev.sh
+omarchy-mail
 ```
 
-The demo mode previews the interface without connecting to an account.
+The installer builds the application and installs its desktop entry, icon,
+AppStream metadata, theme template, and isolated calendar helper environment.
+The first launch opens the account setup flow.
+
+An AUR package is planned, but is not currently available.
+
+To try the latest checkout without installing it:
+
+```bash
+git clone https://github.com/whitecliffs/omarchy-mail.git
+cd omarchy-mail
+cargo test --locked
+cargo run
+```
+
+`cargo run` starts normal mode and opens the account setup flow. Set
+`OMARCHY_MAIL_DEMO=1` before the command when you want to preview the interface
+without connecting an account.
 
 The current working slice includes the GTK4/libadwaita shell, responsive
 three-pane layout, first-run account flow, Secret Service credential storage,
