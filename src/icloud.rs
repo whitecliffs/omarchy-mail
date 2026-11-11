@@ -26,6 +26,9 @@ pub struct RemoteEvent {
     pub key: String,
     pub href: String,
     pub event: CalendarEvent,
+    /// Part of a recurring series: edited in the provider's own app.
+    #[serde(default)]
+    pub recurring: bool,
 }
 #[derive(Debug, Deserialize)]
 pub struct Uploaded {
@@ -36,6 +39,51 @@ pub struct Uploaded {
 pub struct Snapshot {
     pub events: Vec<RemoteEvent>,
     pub uploaded: Vec<Uploaded>,
+    /// Queued local edits the server accepted.
+    #[serde(default)]
+    pub applied: Vec<i64>,
+    /// Queued edits abandoned because the remote event changed or vanished.
+    #[serde(default)]
+    pub dropped: Vec<i64>,
+}
+
+/// Clears replayed edits, then applies the snapshot. Dropped edits are
+/// cleared first so the remote version replaces the local one.
+pub fn apply_snapshot(
+    database: &Database,
+    source: &str,
+    snapshot: &Snapshot,
+) -> Result<(), String> {
+    let finished = snapshot
+        .applied
+        .iter()
+        .chain(&snapshot.dropped)
+        .copied()
+        .collect::<Vec<_>>();
+    database
+        .clear_calendar_changes(&finished)
+        .map_err(|e| e.to_string())?;
+    database
+        .apply_calendar_snapshot(source, snapshot)
+        .map_err(|e| e.to_string())
+}
+
+pub fn summary(service: &str, snapshot: &Snapshot) -> String {
+    let mut text = format!(
+        "{service} synced: {} events, {} uploaded",
+        snapshot.events.len(),
+        snapshot.uploaded.len()
+    );
+    if !snapshot.applied.is_empty() {
+        text.push_str(&format!(", {} change(s) saved", snapshot.applied.len()));
+    }
+    if !snapshot.dropped.is_empty() {
+        text.push_str(&format!(
+            ", {} edit(s) skipped because the event changed on {service}",
+            snapshot.dropped.len()
+        ));
+    }
+    text
 }
 
 pub(crate) fn worker(request: Value) -> Result<Value, String> {
@@ -88,27 +136,33 @@ pub fn discover(username: &str, password: &str) -> Result<Vec<RemoteCalendar>, S
         .map_err(|_| "Invalid calendar list".into())
 }
 
-pub fn sync(database: &Database, account: &CalendarAccount) -> Result<String, String> {
+pub fn sync(
+    database: &Database,
+    account: &CalendarAccount,
+    upload: bool,
+) -> Result<String, String> {
     let password = credentials::load_password(&account.username, "icloud-calendar").map_err(
         |_| "Cannot read iCloud password from the keyring. Reconnect in Calendar settings.",
     )?;
-    let pending = database
-        .pending_calendar_events(account.upload_after)
+    let pending = if upload {
+        database
+            .pending_calendar_events(account.upload_after)
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    let changes = database
+        .pending_calendar_changes(&account.calendar_url)
         .map_err(|e| e.to_string())?;
     let response = worker(
         json!({"action":"sync", "username":account.username, "password":password,
-        "calendar_url":account.calendar_url, "namespace":account.namespace, "pending":pending}),
+        "calendar_url":account.calendar_url, "namespace":account.namespace, "pending":pending,
+        "changes": changes}),
     )?;
     let snapshot: Snapshot =
         serde_json::from_value(response).map_err(|_| "Invalid calendar snapshot")?;
-    database
-        .apply_calendar_snapshot(&account.calendar_url, &snapshot)
-        .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "iCloud synced: {} events, {} uploaded",
-        snapshot.events.len(),
-        snapshot.uploaded.len()
-    ))
+    apply_snapshot(database, &account.calendar_url, &snapshot)?;
+    Ok(summary("iCloud", &snapshot))
 }
 
 #[cfg(test)]

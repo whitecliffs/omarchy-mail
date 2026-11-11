@@ -5,11 +5,16 @@ password, then choose Find iCloud calendars. Choose a calendar and Save Changes.
 The password is stored in the system keyring, not the preferences or database.
 Passwords are passed to the isolated calendar helper through stdin.
 
-New events upload to the selected calendar. Existing local events stay local
+New events upload to the selected calendar (or to Google Calendar when it is chosen
+under “New events upload to”). Existing local events stay local
 unless you select “Also upload my existing local calendar events” before finding
 calendars. Changes and deletions from iCloud are reflected in the local cache.
-Editing/deleting existing events is currently done in Apple Calendar; the Omarchy
-event editor currently creates events only. No existing remote ICS is rewritten.
+Single (non-recurring) events can be edited or deleted from the event details in the
+planner. Edits are queued and replayed on the next sync: the helper fetches the event,
+changes only the title, notes, location and times (attendees, alarms and other
+properties are kept), and writes it back with the event's ETag. If the event changed
+in Apple Calendar in the meantime, the local edit is skipped and the iCloud version
+wins. Recurring series are still edited in Apple Calendar.
 Tasks remain local because modern Apple Reminders does not provide CalDAV access.
 
 Sync runs on app startup, opening the planner, saving a new event, saving settings,

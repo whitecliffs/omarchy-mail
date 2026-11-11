@@ -3,9 +3,44 @@ use crate::mail::{credentials, imap, outbox, smtp};
 use crate::models::{Account, MailFolder, Message};
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+/// Serialises Outbox delivery so the background monitor, an immediate
+/// "send now", and Undo can never act on the same queued message at once.
+static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
+
+fn outbox_lock() -> std::sync::MutexGuard<'static, ()> {
+    OUTBOX_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sends any due Outbox messages for one account right away.
+pub fn send_due_now(account: &Account, database: &Database) -> OutboxReport {
+    retry_pending_sends(account, database)
+}
+
+/// Removes a queued message if it has not been sent yet. Returns it so the
+/// caller can turn it back into a draft; None means it already went out.
+pub fn cancel_pending_send(
+    database: &Database,
+    send_id: i64,
+) -> Result<Option<crate::models::PendingSend>, String> {
+    let _lock = outbox_lock();
+    let send = database
+        .pending_sends(None)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|send| send.id == send_id);
+    if let Some(send) = &send {
+        database
+            .delete_pending_send(send.id)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(send)
+}
 use std::thread;
 use std::time::Duration;
 
@@ -258,6 +293,7 @@ pub fn spawn_outbox_monitor(
 }
 
 fn retry_pending_sends(account: &Account, database: &Database) -> OutboxReport {
+    let _lock = outbox_lock();
     let account_id = account.id;
     let mut report = OutboxReport {
         email: account.email.clone(),

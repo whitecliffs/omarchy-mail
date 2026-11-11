@@ -20,6 +20,8 @@ use std::sync::{
 use std::time::Duration;
 use webkit6::prelude::*;
 
+mod extras;
+
 const MESSAGE_PAGE_SIZE: usize = 100;
 
 struct AppState {
@@ -54,6 +56,7 @@ struct AppState {
     read_dwell_generation: Cell<u64>,
     calendar_sync_busy: Cell<bool>,
     calendar_sync_status: RefCell<String>,
+    planner: RefCell<Option<PlannerWindow>>,
     account_expanded: RefCell<HashMap<i64, bool>>,
     narrow_mode: Cell<bool>,
     mobile_mode: Cell<bool>,
@@ -70,6 +73,10 @@ struct AppState {
     selection_anchor: Cell<Option<i32>>,
     undo_button: gtk::Button,
     undo_action: RefCell<Option<UndoAction>>,
+    undo_send: RefCell<Option<(i64, Account)>>,
+    undo_send_generation: Cell<u64>,
+    server_search: gtk::Button,
+    auto_backup_running: Cell<bool>,
     undo_generation: Cell<u64>,
     load_more: gtk::Button,
     message_offset: Cell<usize>,
@@ -87,6 +94,11 @@ enum MailScope {
 enum PlannerTab {
     Calendar,
     Todos,
+}
+
+struct PlannerWindow {
+    window: glib::WeakRef<adw::Window>,
+    stack: glib::WeakRef<gtk::Stack>,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +226,15 @@ pub fn build_window(application: &adw::Application) {
     load_more.add_css_class("mail-load-more");
     load_more.set_visible(false);
     middle.append(&load_more);
+    let server_search = gtk::Button::with_label("Search all mail on the server");
+    server_search.set_halign(gtk::Align::Center);
+    server_search.set_margin_bottom(10);
+    server_search.add_css_class("mail-load-more");
+    server_search.set_tooltip_text(Some(
+        "Find older messages that are not cached on this computer",
+    ));
+    server_search.set_visible(false);
+    middle.append(&server_search);
 
     let reader = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reader.add_css_class("mail-reader");
@@ -266,7 +287,10 @@ pub fn build_window(application: &adw::Application) {
         selected_message: RefCell::new(None),
         read_dwell_generation: Cell::new(0),
         calendar_sync_busy: Cell::new(false),
-        calendar_sync_status: RefCell::new("Connect iCloud in Settings → Calendar.".into()),
+        calendar_sync_status: RefCell::new(
+            "Connect iCloud or Google in Settings → Calendar.".into(),
+        ),
+        planner: RefCell::new(None),
         account_expanded: RefCell::new(HashMap::new()),
         narrow_mode: Cell::new(false),
         mobile_mode: Cell::new(false),
@@ -283,6 +307,10 @@ pub fn build_window(application: &adw::Application) {
         selection_anchor: Cell::new(None),
         undo_button,
         undo_action: RefCell::new(None),
+        undo_send: RefCell::new(None),
+        undo_send_generation: Cell::new(0),
+        server_search: server_search.clone(),
+        auto_backup_running: Cell::new(false),
         undo_generation: Cell::new(0),
         load_more,
         message_offset: Cell::new(if demo_mode {
@@ -294,6 +322,9 @@ pub fn build_window(application: &adw::Application) {
         demo_mode,
     });
 
+    if let Some(notice) = crate::backup::take_restore_notice() {
+        set_status(&state, &notice);
+    }
     let calendar_state = Rc::downgrade(&state);
     let initial_calendar_state = calendar_state.clone();
     glib::idle_add_local_once(move || {
@@ -337,6 +368,11 @@ pub fn build_window(application: &adw::Application) {
         &trash_selected,
         &clear_selection,
     );
+    let state_for_server_search = state.clone();
+    state
+        .server_search
+        .connect_clicked(move |_| extras::search_on_server(&state_for_server_search));
+    extras::start_background_timers(&state);
     let state_for_load_more = state.clone();
     state
         .load_more
@@ -912,6 +948,8 @@ fn arm_undo(state: &Rc<AppState>, action: UndoAction) {
     let generation = state.undo_generation.get().wrapping_add(1);
     state.undo_generation.set(generation);
     state.undo_action.replace(Some(action));
+    // The newest action owns the Undo button; a pending send still goes out.
+    state.undo_send.replace(None);
     state.undo_button.set_visible(true);
     let state_for_expiry = state.clone();
     glib::timeout_add_local_once(Duration::from_secs(8), move || {
@@ -958,6 +996,9 @@ fn queue_move_action(state: &Rc<AppState>, action: UndoAction, status_text: Stri
 }
 
 fn undo_last_action(state: &Rc<AppState>) {
+    if extras::undo_send(state) {
+        return;
+    }
     let Some(action) = state.undo_action.borrow_mut().take() else {
         state.undo_button.set_visible(false);
         return;
@@ -1217,6 +1258,10 @@ fn render_sidebar(state: &Rc<AppState>) {
                     .pending_sends(account_id)
                     .ok()
                     .map(|sends| sends.len())
+            } else if folder == "Snoozed" {
+                (!state.demo_mode)
+                    .then(|| state.database.snoozed_count().ok())
+                    .flatten()
             } else if account_id.is_some() || folder == "Inbox" {
                 if state.demo_mode {
                     Some(
@@ -1296,12 +1341,18 @@ fn render_sidebar(state: &Rc<AppState>) {
             .map(|sends| sends.len())
             .unwrap_or_default()
     };
+    let snoozed_count = if state.demo_mode {
+        0
+    } else {
+        state.database.snoozed_count().unwrap_or_default()
+    };
     for (label, icon, count) in [
         ("Inbox", "mail-unread-symbolic", Some(unread)),
         ("Starred", "starred-symbolic", None),
         ("Sent", "mail-send-symbolic", None),
         ("Drafts", "document-save-symbolic", None),
         ("Outbox", "mail-send-symbolic", Some(outbox_count)),
+        ("Snoozed", "alarm-symbolic", Some(snoozed_count)),
         ("Archive", "archive-symbolic", None),
         ("Trash", "user-trash-symbolic", None),
     ] {
@@ -1381,6 +1432,15 @@ fn planner_sidebar_button(
 }
 
 fn open_planner_window(state: Rc<AppState>, tab: PlannerTab, _linked_message: Option<Message>) {
+    let page_name = match tab {
+        PlannerTab::Calendar => "calendar",
+        PlannerTab::Todos => "todos",
+    };
+    if let Some((window, stack)) = live_planner(&state) {
+        stack.set_visible_child_name(page_name);
+        window.present();
+        return;
+    }
     start_calendar_sync(state.clone());
     let window = adw::Window::builder()
         .transient_for(&state.window)
@@ -1418,10 +1478,7 @@ fn open_planner_window(state: Rc<AppState>, tab: PlannerTab, _linked_message: Op
         Some("todos"),
         "Todo list",
     );
-    stack.set_visible_child_name(match tab {
-        PlannerTab::Calendar => "calendar",
-        PlannerTab::Todos => "todos",
-    });
+    stack.set_visible_child_name(page_name);
     let cancel = gtk::Button::with_label("Cancel");
     cancel.set_halign(gtk::Align::End);
     cancel.set_margin_top(14);
@@ -1429,7 +1486,42 @@ fn open_planner_window(state: Rc<AppState>, tab: PlannerTab, _linked_message: Op
     cancel.connect_clicked(move |_| window_for_cancel.close());
     root.append(&cancel);
     window.set_content(Some(&root));
+    *state.planner.borrow_mut() = Some(PlannerWindow {
+        window: window.downgrade(),
+        stack: stack.downgrade(),
+    });
+    let weak_state = Rc::downgrade(&state);
+    window.connect_close_request(move |_| {
+        if let Some(state) = weak_state.upgrade() {
+            state.planner.borrow_mut().take();
+        }
+        glib::Propagation::Proceed
+    });
     window.present();
+}
+
+fn live_planner(state: &AppState) -> Option<(adw::Window, gtk::Stack)> {
+    let planner = state.planner.borrow();
+    let planner = planner.as_ref()?;
+    Some((planner.window.upgrade()?, planner.stack.upgrade()?))
+}
+
+fn refresh_planner_todos(state: &Rc<AppState>) {
+    let Some((window, stack)) = live_planner(state) else {
+        return;
+    };
+    let visible = stack.visible_child_name();
+    if let Some(page) = stack.child_by_name("todos") {
+        stack.remove(&page);
+    }
+    stack.add_titled(
+        &build_todo_page(state.clone(), window),
+        Some("todos"),
+        "Todo list",
+    );
+    if let Some(visible) = visible {
+        stack.set_visible_child_name(&visible);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1450,25 +1542,50 @@ fn visible_calendar_events(state: &AppState) -> Vec<PlannerEvent> {
     combine_calendar_events(
         &state.preferences.borrow(),
         state.database.list_calendar_events().unwrap_or_default(),
+        &state.database.calendar_event_sources().unwrap_or_default(),
         crate::subscriptions::cached,
     )
+}
+
+/// Names the calendar an event came from. Unsynced local events are labelled
+/// with the calendar they will upload to.
+fn personal_source_name(prefs: &preferences::Preferences, source: Option<&String>) -> String {
+    let google = prefs.google_calendar.as_ref();
+    let icloud = prefs.icloud_calendar.as_ref();
+    let from_google = |account: &crate::google_calendar::GoogleCalendarAccount| {
+        format!("Google · {}", account.calendar_name)
+    };
+    let from_icloud =
+        |account: &crate::icloud::CalendarAccount| format!("iCloud · {}", account.calendar_name);
+    match source {
+        Some(source) if source.starts_with("google:") => google
+            .filter(|account| &account.source() == source)
+            .map(from_google)
+            .unwrap_or_else(|| "Google calendar".into()),
+        Some(source) => icloud
+            .filter(|account| &account.calendar_url == source)
+            .map(from_icloud)
+            .unwrap_or_else(|| "iCloud calendar".into()),
+        None => match prefs.upload_calendar() {
+            Some("google") => google.map(from_google),
+            Some(_) => icloud.map(from_icloud),
+            None => None,
+        }
+        .unwrap_or_else(|| "Personal calendar".into()),
+    }
 }
 
 fn combine_calendar_events(
     prefs: &preferences::Preferences,
     personal: Vec<CalendarEvent>,
+    sources: &HashMap<i64, String>,
     load_feed: impl Fn(&crate::subscriptions::Subscription) -> Vec<CalendarEvent>,
 ) -> Vec<PlannerEvent> {
     let mut events = Vec::new();
     if prefs.show_personal_calendar {
-        let name = prefs
-            .icloud_calendar
-            .as_ref()
-            .map(|account| account.calendar_name.as_str())
-            .unwrap_or("Personal calendar");
         events.extend(personal.into_iter().map(|event| PlannerEvent {
+            source: personal_source_name(prefs, sources.get(&event.id)),
             event,
-            source: name.into(),
             subscription: false,
         }));
     }
@@ -1488,138 +1605,16 @@ fn combine_calendar_events(
 }
 
 fn build_calendar_page(state: Rc<AppState>, window: adw::Window) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let previous = gtk::Button::with_label("‹");
-    previous.set_tooltip_text(Some("Previous month"));
-    let month_label = gtk::Label::new(None);
-    month_label.set_hexpand(true);
-    month_label.set_xalign(0.5);
-    month_label.add_css_class("mail-reader-subject");
-    let next = gtk::Button::with_label("›");
-    next.set_tooltip_text(Some("Next month"));
-    let add = gtk::Button::with_label("New event");
-    let sync = gtk::Button::with_label("Refresh calendars");
-    let state_for_sync = state.clone();
-    sync.connect_clicked(move |_| start_calendar_sync(state_for_sync.clone()));
-    controls.append(&sync);
-    add.add_css_class("mail-accent-button");
-    controls.append(&previous);
-    controls.append(&month_label);
-    controls.append(&next);
-    controls.append(&add);
-    page.append(&controls);
-    let legend = gtk::Label::new(Some(
-        "● Personal / iCloud    ◆ Subscriptions (read-only) · visibility in Settings → Calendar",
-    ));
-    legend.set_xalign(0.0);
-    legend.set_wrap(true);
-    page.append(&legend);
-
-    let sync_status = gtk::Label::new(Some(&state.calendar_sync_status.borrow()));
-    sync_status.set_xalign(0.0);
-    sync_status.set_wrap(true);
-    page.append(&sync_status);
-
-    let calendar = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    calendar.set_vexpand(true);
-    page.append(&calendar);
-    let today = Local::now().date_naive();
-    let month = Rc::new(Cell::new(today.year() * 12 + today.month0() as i32));
-    let events = Rc::new(RefCell::new(visible_calendar_events(&state)));
-    let date_time_format = state.preferences.borrow().date_time_format.clone();
-    render_calendar_month(
-        &calendar,
-        &month_label,
-        month.get(),
-        &events.borrow(),
-        &date_time_format,
-        state.clone(),
-        window.clone().upcast(),
-    );
-
-    let calendar_for_previous = calendar.clone();
-    let label_for_previous = month_label.clone();
-    let month_for_previous = month.clone();
-    let events_for_previous = events.clone();
-    let format_for_previous = date_time_format.clone();
-    let state_for_previous = state.clone();
-    let window_for_previous = window.clone();
-    previous.connect_clicked(move |_| {
-        let value = month_for_previous.get() - 1;
-        month_for_previous.set(value);
-        render_calendar_month(
-            &calendar_for_previous,
-            &label_for_previous,
-            value,
-            &events_for_previous.borrow(),
-            &format_for_previous,
-            state_for_previous.clone(),
-            window_for_previous.clone().upcast(),
-        );
-    });
-    let calendar_for_next = calendar.clone();
-    let label_for_next = month_label.clone();
-    let month_for_next = month.clone();
-    let events_for_next = events.clone();
-    let format_for_next = date_time_format.clone();
-    let state_for_next = state.clone();
-    let window_for_next = window.clone();
-    next.connect_clicked(move |_| {
-        let value = month_for_next.get() + 1;
-        month_for_next.set(value);
-        render_calendar_month(
-            &calendar_for_next,
-            &label_for_next,
-            value,
-            &events_for_next.borrow(),
-            &format_for_next,
-            state_for_next.clone(),
-            window_for_next.clone().upcast(),
-        );
-    });
-    let state_for_add = state.clone();
-    let window_for_add = window.clone();
-    add.connect_clicked(move |_| {
-        open_calendar_event_dialog(
-            state_for_add.clone(),
-            window_for_add.clone().upcast(),
-            None,
-            true,
-            None,
-        )
-    });
-    let weak_calendar = calendar.downgrade();
-    let weak_window = window.downgrade();
-    glib::timeout_add_local(Duration::from_secs(2), move || {
-        let (Some(calendar), Some(window)) = (weak_calendar.upgrade(), weak_window.upgrade())
-        else {
-            return glib::ControlFlow::Break;
-        };
-        sync_status.set_text(&state.calendar_sync_status.borrow());
-        {
-            let latest = visible_calendar_events(&state);
-            if *events.borrow() != latest {
-                *events.borrow_mut() = latest;
-                render_calendar_month(
-                    &calendar,
-                    &month_label,
-                    month.get(),
-                    &events.borrow(),
-                    &date_time_format,
-                    state.clone(),
-                    window.upcast(),
-                );
-            }
-        }
-        glib::ControlFlow::Continue
-    });
-    page
+    extras::build_calendar_page(state, window)
 }
 
 fn start_calendar_sync(state: Rc<AppState>) {
     let prefs = preferences::load();
-    if prefs.icloud_calendar.is_none() && prefs.calendar_subscriptions.is_empty() {
+    if prefs.icloud_calendar.is_none()
+        && prefs.google_calendar.is_none()
+        && prefs.google_tasks.is_none()
+        && prefs.calendar_subscriptions.is_empty()
+    {
         return;
     }
     if state.demo_mode || state.calendar_sync_busy.replace(true) {
@@ -1631,8 +1626,24 @@ fn start_calendar_sync(state: Rc<AppState>) {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let mut messages = Vec::new();
-        if let Some(account) = prefs.icloud_calendar {
-            messages.push(crate::icloud::sync(&database, &account).unwrap_or_else(|error| error));
+        let upload = prefs.upload_calendar();
+        if let Some(account) = prefs.icloud_calendar.as_ref() {
+            messages.push(
+                crate::icloud::sync(&database, account, upload == Some("icloud"))
+                    .unwrap_or_else(|error| error),
+            );
+        }
+        if let Some(account) = prefs.google_calendar.as_ref() {
+            messages.push(
+                crate::google_calendar::sync(&database, account, upload == Some("google"))
+                    .unwrap_or_else(|error| format!("Google: {error}")),
+            );
+        }
+        if let Some(account) = prefs.google_tasks.as_ref() {
+            messages.push(
+                crate::google_tasks::sync(&database, account)
+                    .unwrap_or_else(|error| format!("Google Tasks: {error}")),
+            );
         }
         for feed in prefs
             .calendar_subscriptions
@@ -1656,6 +1667,10 @@ fn start_calendar_sync(state: Rc<AppState>) {
         };
         set_status(&state, &message);
         *state.calendar_sync_status.borrow_mut() = message;
+        // Tasks may have changed both ways; redraw an open todo list.
+        if state.preferences.borrow().google_tasks.is_some() {
+            refresh_planner_todos(&state);
+        }
     });
 }
 
@@ -1735,8 +1750,9 @@ fn render_calendar_month(
             let event = event.clone();
             let parent = planner.clone();
             let format = date_time_format.to_owned();
+            let state_for_details = state.clone();
             event_button.connect_clicked(move |_| {
-                open_calendar_event_details(&parent, &event, &format);
+                extras::open_event_details(&state_for_details, &parent, &event, &format);
             });
             cell.append(&event_button);
         }
@@ -1763,6 +1779,8 @@ fn render_calendar_month(
                     None,
                     true,
                     Some(date),
+                    None,
+                    None,
                 );
             }
         });
@@ -1773,91 +1791,6 @@ fn render_calendar_month(
 
 fn event_date(event: &CalendarEvent) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(event.starts_at.get(..10)?, "%Y-%m-%d").ok()
-}
-
-fn open_calendar_event_details(parent: &gtk::Window, event: &PlannerEvent, format: &str) {
-    let dialog = gtk::Window::builder()
-        .title("Event details")
-        .transient_for(parent)
-        .modal(true)
-        .default_width(520)
-        .default_height(420)
-        .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    content.set_margin_top(20);
-    content.set_margin_bottom(20);
-    content.set_margin_start(20);
-    content.set_margin_end(20);
-    let details = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let title = gtk::Label::new(Some(&event.title));
-    title.set_xalign(0.0);
-    title.set_wrap(true);
-    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    title.set_selectable(true);
-    title.add_css_class("mail-reader-subject");
-    details.append(&title);
-    for (heading, value) in [
-        (
-            "Calendar",
-            format!(
-                "{}{}",
-                event.source,
-                if event.subscription {
-                    " (subscription · read-only)"
-                } else {
-                    ""
-                }
-            ),
-        ),
-        ("Starts", format_planner_datetime(&event.starts_at, format)),
-        ("Ends", format_planner_datetime(&event.ends_at, format)),
-        ("Location", event.location.clone()),
-        ("Notes", event.notes.clone()),
-    ] {
-        if value.trim().is_empty() {
-            continue;
-        }
-        let caption = gtk::Label::new(Some(heading));
-        caption.set_xalign(0.0);
-        caption.add_css_class("mail-section-label");
-        details.append(&caption);
-        let text = gtk::Label::new(Some(&value));
-        text.set_xalign(0.0);
-        text.set_wrap(true);
-        text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        text.set_selectable(true);
-        details.append(&text);
-    }
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&details)
-        .build();
-    content.append(&scroll);
-    let close = gtk::Button::with_label("Close");
-    close.set_halign(gtk::Align::End);
-    let weak_dialog = dialog.downgrade();
-    close.connect_clicked(move |_| {
-        if let Some(dialog) = weak_dialog.upgrade() {
-            dialog.close();
-        }
-    });
-    content.append(&close);
-    let keys = gtk::EventControllerKey::new();
-    let weak_dialog = dialog.downgrade();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Escape {
-            if let Some(dialog) = weak_dialog.upgrade() {
-                dialog.close();
-            }
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    dialog.add_controller(keys);
-    dialog.set_child(Some(&content));
-    dialog.present();
 }
 
 fn format_planner_datetime(value: &str, format: &str) -> String {
@@ -1905,6 +1838,7 @@ fn build_todo_page(state: Rc<AppState>, window: adw::Window) -> gtk::Box {
             window_for_add.clone().upcast(),
             None,
             true,
+            None,
         )
     });
     page.append(&add);
@@ -1923,20 +1857,44 @@ fn build_todo_page(state: Rc<AppState>, window: adw::Window) -> gtk::Box {
     } else {
         for todo in todos {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let check = gtk::CheckButton::with_label(&todo.title);
+            let check = gtk::CheckButton::new();
             check.set_active(todo.completed);
-            check.set_hexpand(true);
             check.set_halign(gtk::Align::Start);
+            check.set_tooltip_text(Some("Mark todo complete"));
             let database = state.database.clone();
+            let todo_id = todo.id;
             check.connect_toggled(move |check| {
-                let _ = database.set_todo_completed(todo.id, check.is_active());
+                let _ = database.set_todo_completed(todo_id, check.is_active());
             });
             row.append(&check);
+            let edit = gtk::Button::new();
+            edit.set_has_frame(false);
+            edit.set_hexpand(true);
+            edit.set_tooltip_text(Some("View and edit todo"));
+            let details = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let title = gtk::Label::new(Some(&todo.title));
+            title.set_xalign(0.0);
+            title.set_hexpand(true);
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            details.append(&title);
             if let Some(due) = todo.due_at.as_deref().filter(|due| !due.trim().is_empty()) {
                 let due_label = gtk::Label::new(Some(&format_planner_date(due, &date_time_format)));
                 due_label.add_css_class("mail-reader-meta");
-                row.append(&due_label);
+                details.append(&due_label);
             }
+            edit.set_child(Some(&details));
+            let state_for_edit = state.clone();
+            let window_for_edit = window.clone();
+            edit.connect_clicked(move |_| {
+                open_todo_dialog(
+                    state_for_edit.clone(),
+                    window_for_edit.clone().upcast(),
+                    None,
+                    true,
+                    Some(todo.clone()),
+                );
+            });
+            row.append(&edit);
             list.append(&row);
         }
     }
@@ -2098,8 +2056,8 @@ fn planner_date_picker(
         calendar.set_month(date.month0() as i32);
         calendar.set_day(date.day() as i32);
     }
-    let selected = Rc::new(Cell::new(!optional));
-    let initial_label = if optional {
+    let selected = Rc::new(Cell::new(!optional || preset_date.is_some()));
+    let initial_label = if !selected.get() {
         "No date".to_string()
     } else {
         calendar_date_text(&calendar, date_time_format)
@@ -2125,6 +2083,19 @@ fn planner_date_picker(
     header.append(&caption);
     header.append(&date_label);
     header.append(&toggle);
+    if optional {
+        let clear = gtk::Button::with_label("Clear");
+        clear.set_tooltip_text(Some("Remove due date"));
+        let selected_for_clear = selected.clone();
+        let label_for_clear = date_label.clone();
+        let revealer_for_clear = revealer.clone();
+        clear.connect_clicked(move |_| {
+            selected_for_clear.set(false);
+            label_for_clear.set_text("No date");
+            revealer_for_clear.set_reveal_child(false);
+        });
+        header.append(&clear);
+    }
     root.append(&header);
     root.append(&revealer);
     (root, calendar, selected)
@@ -2148,11 +2119,22 @@ fn open_calendar_event_dialog(
     linked_message: Option<Message>,
     return_to_planner: bool,
     preset_date: Option<NaiveDate>,
+    todo: Option<TodoItem>,
+    existing: Option<CalendarEvent>,
 ) {
+    let preset_date = preset_date.or_else(|| existing.as_ref().and_then(event_date));
+    let end_date = existing
+        .as_ref()
+        .and_then(|event| NaiveDate::parse_from_str(event.ends_at.get(..10)?, "%Y-%m-%d").ok())
+        .or(preset_date);
     let dialog = adw::Window::builder()
         .transient_for(&planner)
         .modal(true)
-        .title("New calendar event")
+        .title(if existing.is_some() {
+            "Edit calendar event"
+        } else {
+            "New calendar event"
+        })
         .default_width(500)
         .default_height(700)
         .build();
@@ -2161,19 +2143,38 @@ fn open_calendar_event_dialog(
     root.set_margin_end(24);
     root.set_margin_top(22);
     root.set_margin_bottom(22);
-    let title_value = linked_message
+    let title_value = existing
         .as_ref()
-        .map(|message| message.subject.clone())
+        .map(|event| event.title.clone())
+        .or_else(|| todo.as_ref().map(|todo| todo.title.clone()))
+        .or_else(|| {
+            linked_message
+                .as_ref()
+                .map(|message| message.subject.clone())
+        })
         .unwrap_or_default();
     let date_time_format = state.preferences.borrow().date_time_format.clone();
     let (title_row, title) = planner_entry("Title", &title_value);
     let (starts_date_row, starts_date, _) =
         planner_date_picker("Start", false, &date_time_format, preset_date);
-    let (starts_time_row, starts_hour, starts_minute) = planner_time_picker("Start time", "09:00");
+    let time_of = |value: Option<&String>, fallback: &'static str| {
+        value
+            .and_then(|value| value.get(11..16))
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let (starts_time_row, starts_hour, starts_minute) = planner_time_picker(
+        "Start time",
+        &time_of(existing.as_ref().map(|e| &e.starts_at), "09:00"),
+    );
     let (ends_date_row, ends_date, _) =
-        planner_date_picker("End", false, &date_time_format, preset_date);
-    let (ends_time_row, ends_hour, ends_minute) =
-        planner_end_time_picker("End time", "10:00", &starts_hour, &starts_minute);
+        planner_date_picker("End", false, &date_time_format, end_date);
+    let (ends_time_row, ends_hour, ends_minute) = planner_end_time_picker(
+        "End time",
+        &time_of(existing.as_ref().map(|e| &e.ends_at), "10:00"),
+        &starts_hour,
+        &starts_minute,
+    );
     // Keep the calendar revealer beneath a shared date/time header.
     for (date_row, time_row) in [
         (&starts_date_row, &starts_time_row),
@@ -2186,8 +2187,16 @@ fn open_calendar_event_dialog(
             header.append(time_row);
         }
     }
-    let (location_row, location) = planner_entry("Location", "");
-    let (notes_row, notes) = planner_entry("Notes", "");
+    let (location_row, location) = planner_entry(
+        "Location",
+        existing.as_ref().map(|e| e.location.as_str()).unwrap_or(""),
+    );
+    let notes_value = existing
+        .as_ref()
+        .map(|event| event.notes.as_str())
+        .or_else(|| todo.as_ref().map(|todo| todo.notes.as_str()))
+        .unwrap_or_default();
+    let (notes_row, notes) = planner_notes_editor("Notes", notes_value);
     root.append(&title_row);
     root.append(&starts_date_row);
     root.append(&ends_date_row);
@@ -2205,7 +2214,6 @@ fn open_calendar_event_dialog(
     let dialog_for_cancel = dialog.clone();
     cancel.connect_clicked(move |_| dialog_for_cancel.close());
     let state_for_save = state.clone();
-    let planner_for_save = planner.clone();
     let dialog_for_save = dialog.clone();
     save.connect_clicked(move |_| {
         if title.text().trim().is_empty() {
@@ -2226,9 +2234,9 @@ fn open_calendar_event_dialog(
             return;
         };
         let event = CalendarEvent {
-            id: 0,
+            id: existing.as_ref().map(|e| e.id).unwrap_or(0),
             title: title.text().to_string(),
-            notes: notes.text().to_string(),
+            notes: text_view_contents(&notes),
             starts_at: planner_datetime(
                 &starts_date.date(),
                 starts_hour_value,
@@ -2236,17 +2244,27 @@ fn open_calendar_event_dialog(
             ),
             ends_at: planner_datetime(&ends_date.date(), ends_hour_value, ends_minute_value),
             location: location.text().to_string(),
-            message_id: linked_message.as_ref().map(|message| message.id),
+            message_id: existing
+                .as_ref()
+                .and_then(|e| e.message_id)
+                .or_else(|| todo.as_ref().and_then(|todo| todo.message_id))
+                .or_else(|| linked_message.as_ref().map(|message| message.id)),
         };
-        if state_for_save
-            .database
-            .create_calendar_event(&event)
-            .is_ok()
-        {
+        let saved = if existing.is_some() {
+            state_for_save
+                .database
+                .update_calendar_event(&event)
+                .is_ok()
+        } else {
+            state_for_save
+                .database
+                .create_calendar_event(&event)
+                .is_ok()
+        };
+        if saved {
             start_calendar_sync(state_for_save.clone());
             dialog_for_save.close();
             if return_to_planner {
-                planner_for_save.close();
                 open_planner_window(state_for_save.clone(), PlannerTab::Calendar, None);
             }
         }
@@ -2270,11 +2288,16 @@ fn open_todo_dialog(
     planner: gtk::Window,
     linked_message: Option<Message>,
     return_to_planner: bool,
+    existing_todo: Option<TodoItem>,
 ) {
     let dialog = adw::Window::builder()
         .transient_for(&planner)
         .modal(true)
-        .title("New todo")
+        .title(if existing_todo.is_some() {
+            "Edit todo"
+        } else {
+            "New todo"
+        })
         .default_width(500)
         .default_height(360)
         .build();
@@ -2283,25 +2306,68 @@ fn open_todo_dialog(
     root.set_margin_end(24);
     root.set_margin_top(22);
     root.set_margin_bottom(22);
-    let title_value = linked_message
+    let title_value = existing_todo
         .as_ref()
-        .map(|message| message.subject.clone())
+        .map(|todo| todo.title.clone())
+        .or_else(|| {
+            linked_message
+                .as_ref()
+                .map(|message| message.subject.clone())
+        })
         .unwrap_or_default();
     let date_time_format = state.preferences.borrow().date_time_format.clone();
     let (title_row, title) = planner_entry("Todo", &title_value);
+    let preset_date = existing_todo
+        .as_ref()
+        .and_then(|todo| todo.due_at.as_deref())
+        .and_then(|due| NaiveDate::parse_from_str(due, "%Y-%m-%d").ok());
     let (due_row, due_date, due_selected) =
-        planner_date_picker("Due date", true, &date_time_format, None);
-    let (notes_row, notes) = planner_notes_editor("Notes", "");
+        planner_date_picker("Due date", true, &date_time_format, preset_date);
+    let notes_value = existing_todo
+        .as_ref()
+        .map(|todo| todo.notes.as_str())
+        .unwrap_or_default();
+    let (notes_row, notes) = planner_notes_editor("Notes", notes_value);
     for row in [title_row, due_row, notes_row] {
         root.append(&row);
     }
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
+    let add_to_calendar = gtk::Button::with_label("Add to calendar");
+    add_to_calendar.set_tooltip_text(Some("Save this todo and create a calendar event"));
     let save = gtk::Button::with_label("Save todo");
     save.add_css_class("mail-accent-button");
+    if let Some(todo) = existing_todo.as_ref() {
+        let delete = gtk::Button::with_label("Delete");
+        delete.add_css_class("mail-danger");
+        let state_for_delete = state.clone();
+        let dialog_for_delete = dialog.clone();
+        let todo_id = todo.id;
+        delete.connect_clicked(move |_| {
+            match state_for_delete.database.delete_todo_item(todo_id) {
+                Ok(()) => {
+                    dialog_for_delete.close();
+                    refresh_planner_todos(&state_for_delete);
+                    if state_for_delete.preferences.borrow().google_tasks.is_some() {
+                        start_calendar_sync(state_for_delete.clone());
+                    }
+                }
+                Err(error) => set_status(
+                    &state_for_delete,
+                    &format!("Couldn’t delete the todo: {error}"),
+                ),
+            }
+        });
+        actions.append(&delete);
+    }
     actions.append(&cancel);
+    actions.append(&add_to_calendar);
     actions.append(&save);
+    let error = gtk::Label::new(None);
+    error.set_wrap(true);
+    error.set_xalign(0.0);
+    root.append(&error);
     root.append(&actions);
     dialog.set_content(Some(&root));
     let dialog_for_cancel = dialog.clone();
@@ -2309,26 +2375,59 @@ fn open_todo_dialog(
     let state_for_save = state.clone();
     let planner_for_save = planner.clone();
     let dialog_for_save = dialog.clone();
-    save.connect_clicked(move |_| {
+    let save_todo = Rc::new(move |add_to_calendar: bool| {
         if title.text().trim().is_empty() {
+            error.set_text("Enter a title for this todo.");
+            title.grab_focus();
             return;
         }
-        let item = TodoItem {
-            id: 0,
+        let mut item = TodoItem {
+            id: existing_todo.as_ref().map(|todo| todo.id).unwrap_or(0),
             title: title.text().to_string(),
             notes: text_view_contents(&notes),
             due_at: due_selected.get().then(|| calendar_date_iso(&due_date)),
-            completed: false,
-            message_id: linked_message.as_ref().map(|message| message.id),
+            completed: existing_todo.as_ref().is_some_and(|todo| todo.completed),
+            message_id: existing_todo
+                .as_ref()
+                .and_then(|todo| todo.message_id)
+                .or_else(|| linked_message.as_ref().map(|message| message.id)),
         };
-        if state_for_save.database.create_todo_item(&item).is_ok() {
-            dialog_for_save.close();
-            if return_to_planner {
-                planner_for_save.close();
-                open_planner_window(state_for_save.clone(), PlannerTab::Todos, None);
-            }
+        let result = if existing_todo.is_some() {
+            state_for_save.database.update_todo_item(&item)
+        } else {
+            state_for_save
+                .database
+                .create_todo_item(&item)
+                .map(|id| item.id = id)
+        };
+        if let Err(err) = result {
+            error.set_text(&format!("Could not save todo: {err}"));
+            return;
+        }
+        dialog_for_save.close();
+        refresh_planner_todos(&state_for_save);
+        if return_to_planner {
+            open_planner_window(state_for_save.clone(), PlannerTab::Todos, None);
+        }
+        if add_to_calendar {
+            let preset_date = item
+                .due_at
+                .as_deref()
+                .and_then(|due| NaiveDate::parse_from_str(due, "%Y-%m-%d").ok());
+            open_calendar_event_dialog(
+                state_for_save.clone(),
+                planner_for_save.clone(),
+                None,
+                return_to_planner,
+                preset_date,
+                Some(item),
+                None,
+            );
         }
     });
+    let save_todo_for_calendar = save_todo.clone();
+    add_to_calendar.connect_clicked(move |_| save_todo_for_calendar(true));
+    save.connect_clicked(move |_| save_todo(false));
     dialog.present();
 }
 
@@ -3017,6 +3116,8 @@ fn pending_send_message(send: &PendingSend, account: &Account) -> Message {
         has_attachments: !attachments.is_empty(),
         attachments,
         thread_size: 1,
+        list_unsubscribe: None,
+        list_unsubscribe_one_click: false,
     }
 }
 
@@ -3105,6 +3206,9 @@ fn remote_trash_name(folders: &[MailFolder], account_id: i64) -> String {
 
 fn start_message_search(state: &Rc<AppState>, query: &str) {
     let query = query.trim().to_string();
+    state
+        .server_search
+        .set_visible(!query.is_empty() && !state.demo_mode);
     let generation = state.search_generation.get().wrapping_add(1);
     state.search_generation.set(generation);
     state.search_results.replace(None);
@@ -5150,9 +5254,14 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
                     Some(message_for_calendar.clone()),
                     false,
                     None,
+                    None,
+                    None,
                 )
             });
-            actions.append(&calendar);
+            // Secondary tools sit on their own row so the main actions never overflow.
+            let secondary = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            secondary.set_margin_top(6);
+            secondary.append(&calendar);
             let message_for_todo = message.clone();
             let state_for_todo = state.clone();
             let todo = gtk::Button::with_label("Create todo");
@@ -5163,10 +5272,13 @@ fn render_reader(state: &Rc<AppState>, message: Option<Message>) {
                     state_for_todo.window.clone().upcast(),
                     Some(message_for_todo.clone()),
                     false,
+                    None,
                 )
             });
-            actions.append(&todo);
+            secondary.append(&todo);
+            extras::append_message_tools(&secondary, &content, state, &message);
             content.append(&actions);
+            content.append(&secondary);
         }
 
         let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
@@ -5273,11 +5385,25 @@ fn compare_received_newest(left: &Message, right: &Message) -> std::cmp::Orderin
 }
 
 fn append_outbox_controls(content: &gtk::Box, state: &Rc<AppState>, send: &PendingSend) {
-    let status = gtk::Label::new(Some(if send.retryable {
-        "Waiting to send when the connection is available."
-    } else {
-        "This message needs attention before it can be sent."
-    }));
+    let scheduled = mail::outbox::is_scheduled(send).then(|| {
+        send.next_attempt_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| {
+                format!(
+                    "Scheduled to send {}. Choose Send now to send it immediately.",
+                    at.with_timezone(&Local).format("%a %-d %b at %H:%M")
+                )
+            })
+            .unwrap_or_default()
+    });
+    let status = gtk::Label::new(Some(&scheduled.clone().unwrap_or_else(|| {
+        if send.retryable {
+            "Waiting to send when the connection is available.".into()
+        } else {
+            "This message needs attention before it can be sent.".into()
+        }
+    })));
     status.set_xalign(0.0);
     status.set_wrap(true);
     status.add_css_class(if send.retryable {
@@ -5298,7 +5424,11 @@ fn append_outbox_controls(content: &gtk::Box, state: &Rc<AppState>, send: &Pendi
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     actions.set_margin_top(18);
-    let retry = gtk::Button::with_label("Retry now");
+    let retry = gtk::Button::with_label(if scheduled.is_some() {
+        "Send now"
+    } else {
+        "Retry now"
+    });
     retry.add_css_class("mail-accent-button");
     let delete = gtk::Button::with_label("Discard");
     delete.add_css_class("mail-danger");
@@ -7525,8 +7655,7 @@ fn build_subscription_settings(
     title.set_xalign(0.0);
     title.add_css_class("mail-section-label");
     page.append(&title);
-    let personal =
-        gtk::CheckButton::with_label("● Show personal / iCloud calendar (default for new events)");
+    let personal = gtk::CheckButton::with_label("● Show personal calendars (iCloud / Google)");
     personal.set_active(state.preferences.borrow().show_personal_calendar);
     let personal_state = state.clone();
     let personal_session = session.clone();
@@ -7779,6 +7908,525 @@ fn build_icloud_settings(
     page
 }
 
+fn build_new_event_calendar_setting(
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    save: gtk::Button,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_margin_top(6);
+    let label = gtk::Label::new(Some("New events upload to"));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+    let choices = ["Automatic (iCloud first)", "iCloud", "Google"];
+    let dropdown = gtk::DropDown::from_strings(&choices);
+    dropdown.set_tooltip_text(Some(
+        "When both iCloud and Google are connected, events you create in Omarchy Mail upload to one of them only.",
+    ));
+    dropdown.set_selected(
+        match state.preferences.borrow().new_event_calendar.as_deref() {
+            Some("icloud") => 1,
+            Some("google") => 2,
+            _ => 0,
+        },
+    );
+    dropdown.connect_selected_notify(move |dropdown| {
+        state.preferences.borrow_mut().new_event_calendar = match dropdown.selected() {
+            1 => Some("icloud".into()),
+            2 => Some("google".into()),
+            _ => None,
+        };
+        mark_settings_dirty(&session, &save);
+    });
+    row.append(&dropdown);
+    row
+}
+
+fn build_google_calendar_settings(
+    state: Rc<AppState>,
+    session: Rc<SettingsSession>,
+    save: gtk::Button,
+) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let title = gtk::Label::new(Some("Google Calendar"));
+    title.set_xalign(0.0);
+    title.add_css_class("mail-section-label");
+    page.append(&title);
+    let help = gtk::Label::new(Some(
+        "Sign in with Google in your browser to sync a Google calendar. This uses the Google OAuth client from ~/.config/omarchy-mail/oauth.json; enable the Google Calendar API for that client in Google Cloud Console. The sign-in is kept in the system keyring.",
+    ));
+    help.set_wrap(true);
+    help.set_xalign(0.0);
+    page.append(&help);
+    let configured = state.preferences.borrow().google_calendar.clone();
+    let (email_row, email) = planner_entry(
+        "Google account email",
+        configured.as_ref().map(|a| a.email.as_str()).unwrap_or(""),
+    );
+    page.append(&email_row);
+    let upload = gtk::CheckButton::with_label("Also upload my existing local calendar events");
+    page.append(&upload);
+    let status = gtk::Label::new(Some(
+        &configured
+            .as_ref()
+            .map(|a| format!("Connected: {} ({})", a.calendar_name, a.email))
+            .unwrap_or("Not connected".into()),
+    ));
+    status.set_wrap(true);
+    status.set_xalign(0.0);
+    page.append(&status);
+    let results = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    if let Some(account) = configured.as_ref() {
+        let saved = gtk::DropDown::from_strings(&[account.calendar_name.as_str()]);
+        saved.set_tooltip_text(Some("Saved calendar. Refresh the list to choose another."));
+        results.append(&saved);
+    }
+    page.append(&results);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let sign_in = gtk::Button::with_label("Sign in with Google…");
+    sign_in.add_css_class("mail-accent-button");
+    let refresh = gtk::Button::with_label("Refresh calendar list");
+    refresh.set_visible(configured.is_some());
+    let disconnect = gtk::Button::with_label("Disconnect Google Calendar");
+    disconnect.set_visible(configured.is_some());
+    buttons.append(&sign_in);
+    buttons.append(&refresh);
+    buttons.append(&disconnect);
+    page.append(&buttons);
+
+    {
+        let state = state.clone();
+        let session = session.clone();
+        let save = save.clone();
+        let status = status.clone();
+        disconnect.connect_clicked(move |_| {
+            state.preferences.borrow_mut().google_calendar = None;
+            mark_settings_dirty(&session, &save);
+            status.set_text(
+                "Disconnected. Cached events remain on this computer. Save Changes to keep this setting.",
+            );
+        });
+    }
+
+    // Shared continuation: discover calendars with a token, then offer a picker.
+    let discover: Rc<dyn Fn(gtk::Button, String, Option<mail::oauth::AuthorizationRequest>)> = {
+        let state = state.clone();
+        let status = status.clone();
+        let results = results.clone();
+        let upload = upload.clone();
+        Rc::new(move |button, account_email, authorization| {
+            button.set_sensitive(false);
+            let (sender, receiver) = async_channel::bounded(1);
+            let email_for_worker = account_email.clone();
+            std::thread::spawn(move || {
+                let token = match authorization {
+                    Some(request) => mail::oauth::complete(request)
+                        .map_err(|error| format!("Google sign-in failed: {error}"))
+                        .and_then(|tokens| {
+                            if tokens.refresh_token.is_none() {
+                                return Err("Google did not grant offline access. Remove Omarchy Mail from your Google account’s third-party access and sign in again.".to_string());
+                            }
+                            crate::google_calendar::store_tokens(&email_for_worker, &tokens)?;
+                            Ok(tokens.access_token)
+                        }),
+                    None => crate::google_calendar::access_token(&email_for_worker),
+                };
+                let _ = sender.send_blocking(
+                    token.and_then(|token| crate::google_calendar::discover(&token)),
+                );
+            });
+            let state = state.clone();
+            let session = session.clone();
+            let save = save.clone();
+            let status = status.clone();
+            let results = results.clone();
+            let include_existing = upload.is_active();
+            glib::MainContext::default().spawn_local(async move {
+                let found = receiver.recv().await;
+                button.set_sensitive(true);
+                if results.root().is_none() {
+                    return;
+                }
+                match found {
+                    Ok(Ok(calendars)) => {
+                        clear(&results);
+                        let names = calendars
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>();
+                        let dropdown = gtk::DropDown::from_strings(&names);
+                        let old = state.preferences.borrow().google_calendar.clone();
+                        let selected = old
+                            .as_ref()
+                            .and_then(|a| calendars.iter().position(|c| c.url == a.calendar_id))
+                            .unwrap_or(0) as u32;
+                        dropdown.set_selected(selected);
+                        let cutoff = if include_existing {
+                            0
+                        } else {
+                            state
+                                .database
+                                .list_calendar_events()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|e| e.id)
+                                .max()
+                                .unwrap_or(0)
+                        };
+                        let namespace = old
+                            .as_ref()
+                            .map(|a| a.namespace.clone())
+                            .unwrap_or_else(|| glib::uuid_string_random().to_string());
+                        let calendars = Rc::new(calendars);
+                        let configure = Rc::new(move |index: u32| {
+                            let Some(calendar) = calendars.get(index as usize) else {
+                                return;
+                            };
+                            let upload_after = old
+                                .as_ref()
+                                .filter(|a| {
+                                    a.email == account_email && a.calendar_id == calendar.url
+                                })
+                                .map(|a| if include_existing { 0 } else { a.upload_after })
+                                .unwrap_or(cutoff);
+                            state.preferences.borrow_mut().google_calendar =
+                                Some(crate::google_calendar::GoogleCalendarAccount {
+                                    email: account_email.clone(),
+                                    calendar_id: calendar.url.clone(),
+                                    calendar_name: calendar.name.clone(),
+                                    namespace: namespace.clone(),
+                                    upload_after,
+                                });
+                            mark_settings_dirty(&session, &save);
+                        });
+                        configure(selected);
+                        dropdown.connect_selected_notify(move |d| configure(d.selected()));
+                        results.append(&dropdown);
+                        status.set_text("Choose a Google calendar, then Save Changes.");
+                    }
+                    Ok(Err(error)) => status.set_text(&error),
+                    Err(_) => status.set_text("Google Calendar connection stopped."),
+                }
+            });
+        })
+    };
+
+    {
+        let discover = discover.clone();
+        let email = email.clone();
+        let status = status.clone();
+        sign_in.connect_clicked(move |button| {
+            let account_email = email.text().trim().to_string();
+            if !account_email.contains('@') {
+                status.set_text("Enter your Google account email.");
+                return;
+            }
+            let request = match mail::oauth::begin_with_scope(
+                mail::oauth::Provider::Google,
+                mail::oauth::GOOGLE_CALENDAR_SCOPE,
+                &account_email,
+                true,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    status.set_text(&error.to_string());
+                    return;
+                }
+            };
+            if let Err(error) = gio::AppInfo::launch_default_for_uri(
+                &request.authorization_url,
+                None::<&gio::AppLaunchContext>,
+            ) {
+                status.set_text(&format!("Couldn’t open the browser: {error}"));
+                return;
+            }
+            status.set_text("Waiting for Google sign-in in your browser…");
+            discover(button.clone(), account_email, Some(request));
+        });
+    }
+    refresh.connect_clicked(move |button| {
+        let account_email = email.text().trim().to_string();
+        status.set_text("Finding Google calendars…");
+        discover(button.clone(), account_email, None);
+    });
+    page
+}
+
+fn backup_section_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("mail-section-label");
+    label
+}
+
+fn backup_help(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    label.add_css_class("mail-empty-body");
+    label
+}
+
+fn backup_passphrase(placeholder: &str) -> gtk::PasswordEntry {
+    let entry = gtk::PasswordEntry::new();
+    entry.set_placeholder_text(Some(placeholder));
+    entry.set_show_peek_icon(true);
+    entry
+}
+
+/// Restarts the app after a restore was staged. The relaunch waits for this
+/// process to exit so the single-instance check cannot hand off to it.
+fn restart_application(state: &AppState) {
+    let pid = std::process::id().to_string();
+    if let Ok(executable) = std::env::current_exe() {
+        let _ = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"",
+                "omarchy-mail-restart",
+                &pid,
+            ])
+            .arg(executable)
+            .stdin(std::process::Stdio::null())
+            .spawn();
+    }
+    if let Some(application) = state.window.application() {
+        application.quit();
+    }
+}
+
+fn build_backup_settings(state: Rc<AppState>, parent: adw::Window) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.append(&backup_section_label("Create a backup"));
+    page.append(&backup_help(
+        "Saves accounts, settings, cached mail, drafts, the Outbox, calendar events, todos, and subscriptions into one encrypted file. It can be restored into another Omarchy Mail installation. The passphrase cannot be recovered — keep it somewhere safe.",
+    ));
+    let include_secrets = gtk::CheckButton::with_label(
+        "Include passwords and sign-in tokens (no need to sign in again)",
+    );
+    include_secrets.set_active(true);
+    page.append(&include_secrets);
+    let passphrase = backup_passphrase("Passphrase (at least 8 characters)");
+    let confirm = backup_passphrase("Repeat passphrase");
+    page.append(&passphrase);
+    page.append(&confirm);
+    let create = gtk::Button::with_label("Create backup…");
+    create.add_css_class("mail-accent-button");
+    create.set_halign(gtk::Align::Start);
+    page.append(&create);
+    let create_status = backup_help("");
+    page.append(&create_status);
+
+    {
+        let state = state.clone();
+        let parent = parent.clone();
+        create.connect_clicked(move |button| {
+            let secret = passphrase.text().to_string();
+            if secret.chars().count() < 8 {
+                create_status.set_text("Use a passphrase of at least 8 characters.");
+                return;
+            }
+            if secret != confirm.text().as_str() {
+                create_status.set_text("The passphrases do not match.");
+                return;
+            }
+            let name = format!(
+                "omarchy-mail-{}.{}",
+                Local::now().format("%Y-%m-%d"),
+                crate::backup::EXTENSION
+            );
+            let dialog = gtk::FileDialog::builder()
+                .title("Save backup")
+                .accept_label("Save")
+                .initial_name(&name)
+                .build();
+            let state = state.clone();
+            let button = button.clone();
+            let status = create_status.clone();
+            let passphrase = passphrase.clone();
+            let confirm = confirm.clone();
+            let include = include_secrets.is_active();
+            dialog.save(Some(&parent), None::<&gio::Cancellable>, move |result| {
+                let Ok(file) = result else { return };
+                let Some(destination) = file.path() else {
+                    status.set_text("That destination is not available locally.");
+                    return;
+                };
+                button.set_sensitive(false);
+                status.set_text(
+                    "Creating encrypted backup… this can take a minute for a large mailbox.",
+                );
+                let database = state.database.clone();
+                let preferences = state.preferences.borrow().clone();
+                let (sender, receiver) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let secrets = if include {
+                        crate::backup::collect_secrets(&database, &preferences)
+                    } else {
+                        Vec::new()
+                    };
+                    let result = crate::backup::create_backup(
+                        &crate::backup::Locations::current(),
+                        &destination,
+                        &secret,
+                        &secrets,
+                        include,
+                    )
+                    .map(|manifest| (manifest, destination, secrets.len()))
+                    .map_err(|error| error.to_string());
+                    let _ = sender.send_blocking(result);
+                });
+                glib::MainContext::default().spawn_local(async move {
+                    button.set_sensitive(true);
+                    match receiver.recv().await {
+                        Ok(Ok((manifest, path, secrets))) => {
+                            passphrase.set_text("");
+                            confirm.set_text("");
+                            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            status.set_text(&format!(
+                                "Backup saved to {} ({:.1} MB, {} account(s){}).",
+                                path.display(),
+                                size as f64 / 1_048_576.0,
+                                manifest.accounts.len(),
+                                if include {
+                                    format!(", {secrets} saved credential(s)")
+                                } else {
+                                    String::new()
+                                }
+                            ));
+                        }
+                        Ok(Err(error)) => status.set_text(&format!("Backup failed: {error}")),
+                        Err(_) => status.set_text("The backup worker stopped unexpectedly."),
+                    }
+                });
+            });
+        });
+    }
+
+    page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    page.append(&backup_section_label("Restore from a backup"));
+    page.append(&backup_help(
+        "Replaces this installation’s accounts, settings, and cached data with the backup. Your current data is kept in ~/.local/share/omarchy-mail-recovery/. The restore finishes when Omarchy Mail restarts.",
+    ));
+    let chosen: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+    let file_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let choose = gtk::Button::with_label("Choose backup file…");
+    let file_label = gtk::Label::new(Some("No file chosen"));
+    file_label.set_xalign(0.0);
+    file_label.set_hexpand(true);
+    file_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    file_row.append(&choose);
+    file_row.append(&file_label);
+    page.append(&file_row);
+    let restore_passphrase = backup_passphrase("Backup passphrase");
+    page.append(&restore_passphrase);
+    let restore = gtk::Button::with_label("Restore…");
+    restore.add_css_class("mail-secondary-button");
+    restore.set_halign(gtk::Align::Start);
+    page.append(&restore);
+    let restart = gtk::Button::with_label("Restart now to finish restoring");
+    restart.add_css_class("mail-accent-button");
+    restart.set_halign(gtk::Align::Start);
+    restart.set_visible(false);
+    page.append(&restart);
+    let restore_status = backup_help("");
+    page.append(&restore_status);
+
+    {
+        let parent = parent.clone();
+        let chosen = chosen.clone();
+        choose.connect_clicked(move |_| {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Omarchy Mail backups"));
+            filter.add_pattern(&format!("*.{}", crate::backup::EXTENSION));
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            let dialog = gtk::FileDialog::builder()
+                .title("Choose a backup")
+                .accept_label("Choose")
+                .filters(&filters)
+                .build();
+            let chosen = chosen.clone();
+            let file_label = file_label.clone();
+            dialog.open(Some(&parent), None::<&gio::Cancellable>, move |result| {
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    file_label.set_text(&path.display().to_string());
+                    *chosen.borrow_mut() = Some(path);
+                }
+            });
+        });
+    }
+    {
+        let state = state.clone();
+        restart.connect_clicked(move |_| restart_application(&state));
+    }
+    restore.connect_clicked(move |button| {
+        let Some(path) = chosen.borrow().clone() else {
+            restore_status.set_text("Choose a backup file first.");
+            return;
+        };
+        let secret = restore_passphrase.text().to_string();
+        if secret.is_empty() {
+            restore_status.set_text("Enter the backup passphrase.");
+            return;
+        }
+        if state.demo_mode {
+            restore_status.set_text("Restore is unavailable in demo mode.");
+            return;
+        }
+        button.set_sensitive(false);
+        restore_status.set_text("Decrypting and checking the backup…");
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = crate::backup::stage_restore(
+                &crate::backup::Locations::current(),
+                &path,
+                &secret,
+            )
+            .map_err(|error| error.to_string())
+            .map(|staged| {
+                // Secrets go straight from memory into the keyring.
+                let keyring = crate::backup::store_secrets(&staged.secrets).err();
+                (staged.manifest, staged.secrets.len(), keyring)
+            });
+            let _ = sender.send_blocking(result);
+        });
+        let button = button.clone();
+        let status = restore_status.clone();
+        let passphrase = restore_passphrase.clone();
+        let restart = restart.clone();
+        glib::MainContext::default().spawn_local(async move {
+            button.set_sensitive(true);
+            match receiver.recv().await {
+                Ok(Ok((manifest, secrets, keyring_error))) => {
+                    passphrase.set_text("");
+                    let mut text = format!(
+                        "Backup from {} verified: {} account(s){}. Restart to finish restoring; until then nothing has changed.",
+                        manifest.created_at.get(..10).unwrap_or(&manifest.created_at),
+                        manifest.accounts.len(),
+                        if secrets > 0 { format!(", {secrets} credential(s) saved to the keyring") } else { String::new() },
+                    );
+                    if !manifest.includes_secrets {
+                        text.push_str(" This backup has no passwords; re-enter them in Settings → Accounts after restarting.");
+                    }
+                    if let Some(error) = keyring_error {
+                        text.push(' ');
+                        text.push_str(&error);
+                    }
+                    status.set_text(&text);
+                    restart.set_visible(true);
+                }
+                Ok(Err(error)) => status.set_text(&format!("Restore failed: {error}")),
+                Err(_) => status.set_text("The restore worker stopped unexpectedly."),
+            }
+        });
+    });
+    page
+}
+
 fn open_settings(state: Rc<AppState>) {
     let original_account_notifications = state
         .accounts
@@ -7832,10 +8480,40 @@ fn open_settings(state: Rc<AppState>) {
     let general_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let accounts_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let calendar_page = build_icloud_settings(state.clone(), session.clone(), save_button.clone());
+    calendar_page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    calendar_page.append(&build_google_calendar_settings(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+    ));
+    calendar_page.append(&build_new_event_calendar_setting(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+    ));
+    calendar_page.append(&extras::build_google_tasks_settings(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+    ));
+    calendar_page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    calendar_page.append(&extras::build_reminder_settings(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+    ));
+    let backup_page = build_backup_settings(state.clone(), window.clone());
+    backup_page.append(&extras::build_auto_backup_settings(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+        window.clone(),
+    ));
     for (name, title, page) in [
         ("general", "General", &general_page),
         ("accounts", "Accounts", &accounts_page),
         ("calendar", "Calendar", &calendar_page),
+        ("backup", "Backup", &backup_page),
     ] {
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -8194,6 +8872,11 @@ fn open_settings(state: Rc<AppState>) {
         root.remove(&widget);
         general_page.append(&widget);
     }
+    general_page.append(&extras::build_undo_send_setting(
+        state.clone(),
+        session.clone(),
+        save_button.clone(),
+    ));
     pages.set_visible_child_name("general");
 
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -8898,6 +9581,10 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
         entry.set_hexpand(true);
         entry.set_margin_top(8);
     }
+    let contacts = extras::load_contacts(&state);
+    for entry in [&to, &cc, &bcc] {
+        extras::attach_address_completion(entry, contacts.clone());
+    }
     let cc_row_for_toggle = cc_row.clone();
     cc_toggle.connect_toggled(move |button| {
         cc_row_for_toggle.set_visible(button.is_active());
@@ -9002,9 +9689,12 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let cancel = gtk::Button::with_label("Cancel");
     let send = gtk::Button::with_label("Send");
     send.add_css_class("mail-accent-button");
+    let send_later = gtk::Button::with_label("Send later…");
+    send_later.set_tooltip_text(Some("Schedule this message"));
     toolbar.append(&attach);
     toolbar.append(&draft);
     toolbar.append(&cancel);
+    toolbar.append(&send_later);
     toolbar.append(&send);
     toolbar.set_halign(gtk::Align::End);
     root.append(&toolbar);
@@ -9228,12 +9918,28 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
     let schedule = schedule_autosave.clone();
     body.buffer().connect_changed(move |_| schedule());
 
+    // Send later picks a time, then runs the normal Send checks with it.
+    let scheduled_at: Rc<Cell<Option<chrono::DateTime<chrono::Utc>>>> = Rc::new(Cell::new(None));
+    {
+        let scheduled_at = scheduled_at.clone();
+        let send = send.clone();
+        let window = window.clone();
+        send_later.connect_clicked(move |_| {
+            let scheduled_at = scheduled_at.clone();
+            let send = send.clone();
+            extras::pick_send_later(&window, move |at| {
+                scheduled_at.set(Some(at.with_timezone(&chrono::Utc)));
+                send.emit_clicked();
+            });
+        });
+    }
     let state_for_send = state.clone();
     let window_for_send = window.clone();
     let account_selector_for_send = account_selector.clone();
     let attachments_for_send = attachment_paths.clone();
     let draft_id_for_send = draft_id.clone();
     send.connect_clicked(move |button| {
+        let schedule = scheduled_at.take();
         let to_value = to.text().trim().to_string();
         if to_value.is_empty() {
             compose_status.set_text("Add at least one recipient.");
@@ -9289,6 +9995,32 @@ fn open_compose_with_context(state: Rc<AppState>, context: Option<ComposeContext
             compose_status.set_text("This account is not ready to send mail yet.");
             return;
         };
+        let undo_seconds = state_for_send.preferences.borrow().undo_send_seconds;
+        if schedule.is_some() || undo_seconds > 0 {
+            let send_at = schedule.unwrap_or_else(|| {
+                chrono::Utc::now() + chrono::Duration::seconds(undo_seconds as i64)
+            });
+            extras::queue_composed(
+                state_for_send.clone(),
+                window_for_send.clone(),
+                button.clone(),
+                compose_status.clone(),
+                draft_id_for_send.clone(),
+                extras::Composed {
+                    account,
+                    to: to_value,
+                    cc: cc_values,
+                    bcc: bcc_values,
+                    subject: subject_value,
+                    body: body_value,
+                    body_html,
+                    attachments,
+                },
+                send_at,
+                schedule.is_none().then_some(undo_seconds),
+            );
+            return;
+        }
         button.set_sensitive(false);
         compose_status.set_text("Sending securely…");
         let (sender, receiver) = async_channel::bounded(1);
@@ -9734,12 +10466,13 @@ mod tests {
                         url: "https://example.com/feed.ics".into(),
                         visible: feed_visible,
                     });
-                let events = combine_calendar_events(&prefs, vec![event.clone()], |_| {
-                    vec![CalendarEvent {
-                        title: "Fixture".into(),
-                        ..event.clone()
-                    }]
-                });
+                let events =
+                    combine_calendar_events(&prefs, vec![event.clone()], &HashMap::new(), |_| {
+                        vec![CalendarEvent {
+                            title: "Fixture".into(),
+                            ..event.clone()
+                        }]
+                    });
                 assert_eq!(
                     events.len(),
                     usize::from(personal_visible) + usize::from(feed_visible)
@@ -9753,6 +10486,324 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn find_label(widget: &gtk::Widget, needle: &str) -> bool {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>()
+            && label.text().contains(needle)
+        {
+            return true;
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if find_label(&current, needle) {
+                return true;
+            }
+            child = current.next_sibling();
+        }
+        false
+    }
+
+    /// Saves a PNG of a widget when OMARCHY_MAIL_SHOTS names a directory.
+    fn save_shot(widget: &impl IsA<gtk::Widget>, name: &str) {
+        let Some(directory) = std::env::var_os("OMARCHY_MAIL_SHOTS") else {
+            return;
+        };
+        let paintable = gtk::WidgetPaintable::new(Some(widget));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, widget.width() as f64, widget.height() as f64);
+        if let (Some(node), Some(native)) = (snapshot.to_node(), widget.native())
+            && let Some(renderer) = native.renderer()
+        {
+            let texture = renderer.render_texture(&node, None);
+            let _ =
+                texture.save_to_png(std::path::Path::new(&directory).join(format!("{name}.png")));
+        }
+    }
+
+    fn find_widget<T: IsA<gtk::Widget>>(
+        widget: &gtk::Widget,
+        test: &dyn Fn(&T) -> bool,
+    ) -> Option<T> {
+        if let Some(found) = widget.downcast_ref::<T>()
+            && test(found)
+        {
+            return Some(found.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_widget(&current, test) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "Requires a GTK display; opens the new feature screens against a temporary database"]
+    fn gtk_new_feature_screens_build_cleanly() {
+        adw::init().unwrap();
+        let pump = |duration| {
+            let until = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().pending() {
+                    glib::MainContext::default().iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        let mut account = Account::new("jim@example.com", "Jim");
+        account.id = Some(database.save_account(&account).unwrap());
+        let invite_path = directory.path().join("invite.ics");
+        std::fs::write(&invite_path, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@example.com\r\nDTSTART:20261120T100000Z\r\nDTEND:20261120T110000Z\r\nSUMMARY:Quarterly review\r\nORGANIZER;CN=Ann:mailto:ann@example.com\r\nATTENDEE:mailto:jim@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").unwrap();
+        let mut messages = Message::demo_messages();
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.account_id = account.id;
+            message.folder = if index == 1 {
+                "Sent".into()
+            } else {
+                "Inbox".into()
+            };
+            message.thread_key = Some(format!("smoke-{index}"));
+            message.body_html = None;
+            message.attachments.clear();
+        }
+        messages[1].recipients = "Anna Karenina <anna@example.com>".into();
+        messages[0].list_unsubscribe = Some("<https://list.example/u>".into());
+        messages[0].list_unsubscribe_one_click = true;
+        messages[0].attachments = vec![AttachmentInfo {
+            filename: "invite.ics".into(),
+            content_type: "text/calendar".into(),
+            size: 300,
+            cache_path: invite_path.to_string_lossy().into(),
+            content_id: None,
+        }];
+        database.upsert_messages(&messages).unwrap();
+        let event_id = database
+            .create_calendar_event(&CalendarEvent {
+                id: 0,
+                title: "Smoke event".into(),
+                notes: String::new(),
+                starts_at: format!("{} 09:00", Local::now().format("%Y-%m-%d")),
+                ends_at: format!("{} 10:00", Local::now().format("%Y-%m-%d")),
+                location: "Here".into(),
+                message_id: None,
+            })
+            .unwrap();
+        let vertical = || gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let middle = vertical();
+        let list = gtk::ListBox::new();
+        middle.append(&list);
+        let (monitor_sender, _) = async_channel::unbounded();
+        let (outbox_sender, _) = async_channel::unbounded();
+        let state = Rc::new(AppState {
+            window: adw::ApplicationWindow::builder()
+                .title("Feature smoke test")
+                .default_width(1000)
+                .default_height(700)
+                .build(),
+            database,
+            accounts: RefCell::new(vec![account]),
+            preferences: RefCell::new(preferences::Preferences::default()),
+            folders: RefCell::new(Vec::new()),
+            messages: RefCell::new(messages.clone()),
+            sidebar: vertical(),
+            sidebar_structure: RefCell::new(None),
+            sidebar_rows: RefCell::new(Vec::new()),
+            message_list: list,
+            displayed_messages: RefCell::new(Vec::new()),
+            displayed_date_format: RefCell::new(String::new()),
+            refreshing_selection: Cell::new(false),
+            middle: middle.clone(),
+            sidebar_scroll: gtk::ScrolledWindow::new(),
+            reader: vertical(),
+            reader_snapshot: RefCell::new(None),
+            navigation: gtk::Button::new(),
+            search_entry: gtk::SearchEntry::new(),
+            empty_trash_button: gtk::Button::new(),
+            search_results: RefCell::new(None),
+            search_generation: Cell::new(0),
+            search_pending: Cell::new(false),
+            cache_load_generation: Cell::new(0),
+            cache_load_pending: Cell::new(false),
+            scope: RefCell::new(MailScope::Unified("Inbox".into())),
+            search_filters: RefCell::new(SearchFilters::default()),
+            selected_message: RefCell::new(None),
+            read_dwell_generation: Cell::new(0),
+            calendar_sync_busy: Cell::new(false),
+            calendar_sync_status: RefCell::new(String::new()),
+            planner: RefCell::new(None),
+            account_expanded: RefCell::new(HashMap::new()),
+            narrow_mode: Cell::new(false),
+            mobile_mode: Cell::new(false),
+            sidebar_revealed: Cell::new(false),
+            allowed_remote_images: RefCell::new(HashSet::new()),
+            monitor_sender,
+            monitor_stops: RefCell::new(HashMap::new()),
+            outbox_sender,
+            outbox_stops: RefCell::new(HashMap::new()),
+            status: gtk::Label::new(None),
+            selection_bar: vertical(),
+            selection_count: gtk::Label::new(None),
+            selected_messages: RefCell::new(HashSet::new()),
+            selection_anchor: Cell::new(None),
+            undo_button: gtk::Button::new(),
+            undo_action: RefCell::new(None),
+            undo_send: RefCell::new(None),
+            undo_send_generation: Cell::new(0),
+            server_search: gtk::Button::new(),
+            auto_backup_running: Cell::new(false),
+            undo_generation: Cell::new(0),
+            load_more: gtk::Button::new(),
+            message_offset: Cell::new(0),
+            has_more_messages: Cell::new(false),
+            demo_mode: false,
+        });
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        content.append(&state.sidebar);
+        content.append(&state.reader);
+        state.window.set_content(Some(&content));
+        state.window.present();
+        render_sidebar(&state);
+        assert!(find_label(state.sidebar.upcast_ref(), "Snoozed"));
+
+        // Reader: Snooze, Unsubscribe and the parsed invitation banner.
+        state.selected_message.replace(Some(messages[0].id));
+        render_reader(&state, Some(messages[0].clone()));
+        pump(Duration::from_millis(2500));
+        let reader: gtk::Widget = state.reader.clone().upcast();
+        assert!(find_label(&reader, "Unsubscribe"));
+        assert!(find_label(&reader, "Snooze"));
+        assert!(
+            find_label(&reader, "Invitation: Quarterly review"),
+            "invitation banner"
+        );
+        assert!(find_label(&reader, "Accept"));
+        save_shot(&state.window, "reader");
+
+        // Snoozing hides it from the Inbox and shows it under Snoozed.
+        state
+            .database
+            .snooze_message(messages[0].id, "2099-01-01T00:00:00+00:00")
+            .unwrap();
+        assert!(
+            state
+                .database
+                .list_messages(None, "Inbox")
+                .unwrap()
+                .iter()
+                .all(|m| m.id != messages[0].id)
+        );
+        state.reader_snapshot.replace(None);
+        render_reader(&state, Some(messages[0].clone()));
+        pump(Duration::from_millis(100));
+        assert!(find_label(state.reader.upcast_ref(), "Snoozed until"));
+
+        // Planner: month, week and agenda views; details; editor.
+        open_planner_window(state.clone(), PlannerTab::Calendar, None);
+        pump(Duration::from_millis(300));
+        let (planner, _) = live_planner(&state).unwrap();
+        assert!(find_label(planner.upcast_ref(), "Smoke event"));
+        save_shot(&planner, "planner-month");
+        let views = find_widget::<gtk::DropDown>(planner.upcast_ref(), &|d| {
+            d.tooltip_text().as_deref() == Some("Calendar view")
+        })
+        .unwrap();
+        views.set_selected(1);
+        pump(Duration::from_millis(200));
+        save_shot(&planner, "planner-week");
+        views.set_selected(2);
+        pump(Duration::from_millis(200));
+        assert!(find_label(planner.upcast_ref(), "Smoke event"));
+        save_shot(&planner, "planner-agenda");
+        let event = visible_calendar_events(&state)
+            .into_iter()
+            .find(|e| e.id == event_id)
+            .unwrap();
+        extras::open_event_details(
+            &state,
+            &planner.clone().upcast(),
+            &event,
+            "day-month-24-hour",
+        );
+        open_calendar_event_dialog(
+            state.clone(),
+            planner.clone().upcast(),
+            None,
+            false,
+            None,
+            None,
+            Some(event.event.clone()),
+        );
+        pump(Duration::from_millis(200));
+
+        // Settings (all pages) and the composer with address suggestions.
+        open_settings(state.clone());
+        pump(Duration::from_millis(300));
+        let settings = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Omarchy Mail settings"))
+            .unwrap();
+        let stack = find_widget::<gtk::Stack>(settings.upcast_ref(), &|s| {
+            s.child_by_name("backup").is_some()
+        })
+        .unwrap();
+        for page in ["general", "calendar", "backup"] {
+            stack.set_visible_child_name(page);
+            pump(Duration::from_millis(200));
+            save_shot(&settings, &format!("settings-{page}"));
+            if let Some(scroll) = stack.visible_child().and_downcast::<gtk::ScrolledWindow>() {
+                let adjustment = scroll.vadjustment();
+                adjustment.set_value(adjustment.upper());
+                pump(Duration::from_millis(200));
+                save_shot(&settings, &format!("settings-{page}-bottom"));
+            }
+        }
+        open_compose_with_context(state.clone(), None);
+        pump(Duration::from_millis(500));
+        let compose = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("New message"))
+            .expect("composer open");
+        assert!(find_label(compose.upcast_ref(), "Send later"));
+        let mut entries = Vec::new();
+        fn collect(widget: &gtk::Widget, out: &mut Vec<gtk::Entry>) {
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                out.push(entry.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                collect(&current, out);
+                child = current.next_sibling();
+            }
+        }
+        collect(compose.upcast_ref(), &mut entries);
+        let to = entries
+            .iter()
+            .find(|e| e.placeholder_text().as_deref() == Some("Recipients"))
+            .unwrap();
+        to.grab_focus();
+        to.set_text("ann");
+        pump(Duration::from_millis(200));
+        let popover = to
+            .last_child()
+            .and_then(|w| w.downcast::<gtk::Popover>().ok())
+            .expect("suggestions");
+        assert!(popover.is_visible());
+        assert!(find_label(popover.upcast_ref(), "anna@example.com"));
+        save_shot(&compose, "compose");
+        pump(Duration::from_millis(1500));
+        for window in gtk::Window::list_toplevels() {
+            if let Ok(window) = window.downcast::<gtk::Window>() {
+                window.close();
+            }
+        }
+        pump(Duration::from_millis(100));
     }
 
     #[test]
@@ -9825,6 +10876,7 @@ mod tests {
             read_dwell_generation: Cell::new(0),
             calendar_sync_busy: Cell::new(false),
             calendar_sync_status: RefCell::new(String::new()),
+            planner: RefCell::new(None),
             account_expanded: RefCell::new(HashMap::new()),
             narrow_mode: Cell::new(false),
             mobile_mode: Cell::new(false),
@@ -9841,6 +10893,10 @@ mod tests {
             selection_anchor: Cell::new(None),
             undo_button: gtk::Button::new(),
             undo_action: RefCell::new(None),
+            undo_send: RefCell::new(None),
+            undo_send_generation: Cell::new(0),
+            server_search: gtk::Button::new(),
+            auto_backup_running: Cell::new(false),
             undo_generation: Cell::new(0),
             load_more: gtk::Button::new(),
             message_offset: Cell::new(0),

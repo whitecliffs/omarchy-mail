@@ -58,6 +58,56 @@ pub fn queue_failed_send(
     }
 }
 
+/// Queues a message to send at `send_at` (used by Undo send and Send later).
+#[allow(clippy::too_many_arguments)]
+pub fn queue_send_at(
+    database: &Database,
+    account_id: i64,
+    to: &str,
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    body: &str,
+    body_html: Option<&str>,
+    attachment_paths: &[PathBuf],
+    send_at: chrono::DateTime<Utc>,
+) -> Result<i64, OutboxError> {
+    let (staging_dir, attachments) = stage_attachments(attachment_paths)?;
+    let send = PendingSend {
+        id: 0,
+        account_id,
+        to: to.to_string(),
+        cc: cc.to_vec(),
+        bcc: bcc.to_vec(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        body_html: body_html.map(crate::mail::mime::sanitize_html),
+        attachments,
+        created_at: Utc::now().to_rfc3339(),
+        attempts: 0,
+        retryable: true,
+        next_attempt_at: Some(send_at.to_rfc3339()),
+        last_error: None,
+    };
+    match database.queue_send(&send) {
+        Ok(id) => Ok(id),
+        Err(error) => {
+            remove_staged_directory(staging_dir.as_deref());
+            Err(error.into())
+        }
+    }
+}
+
+/// True for a message waiting for its scheduled time rather than a retry.
+pub fn is_scheduled(send: &PendingSend) -> bool {
+    send.attempts == 0
+        && send
+            .next_attempt_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|at| at > Utc::now())
+}
+
 pub fn remove_staged_files(send: &PendingSend) {
     let Some(root) = outbox_root() else {
         return;

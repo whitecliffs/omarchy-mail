@@ -124,4 +124,168 @@ class CalendarTests(unittest.TestCase):
         with self.assertRaises(worker.SafeError):
             worker.serialize({**EVENT, 'ends_at':'2026-09-10 11:00'}, 'invalid')
 
+class GoogleCalendarTests(unittest.TestCase):
+    CAL = 'family123@group.calendar.google.com'
+
+    def test_rejects_untrusted_google_destinations(self):
+        for url in ['http://www.googleapis.com/calendar/v3/x', 'https://googleapis.com.evil.test/calendar/v3/',
+                    'https://www.googleapis.com/drive/v3/files', 'https://www.googleapis.com:8443/calendar/v3/x']:
+            with self.assertRaises(worker.SafeError): worker.google_trusted(url)
+        url = worker.google_calendar_url(self.CAL)
+        self.assertEqual(worker.google_trusted(url), url)
+        self.assertIn('family123%40group.calendar.google.com', url)
+
+    def test_event_ids_are_stable_base32hex(self):
+        first = worker.google_event_id('3f2a-9c11-ffee', 42)
+        self.assertEqual(first, worker.google_event_id('3f2a-9c11-ffee', 42))
+        self.assertNotEqual(first, worker.google_event_id('3f2a-9c11-ffee', 43))
+        self.assertTrue(all(ch in '0123456789abcdefghijklmnopqrstuv' for ch in first))
+
+    def test_maps_timed_all_day_recurring_and_cancelled_events(self):
+        timed = worker.google_event(self.CAL, {'id': 'abc', 'summary': 'Dentist',
+            'start': {'dateTime': '2026-09-10T12:00:00Z'}, 'end': {'dateTime': '2026-09-10T13:00:00Z'}})
+        self.assertEqual(timed['event']['title'], 'Dentist')
+        self.assertEqual(timed['href'], f'google:{self.CAL}#abc')
+        allday = worker.google_event(self.CAL, {'id': 'r_20260910', 'recurringEventId': 'r',
+            'start': {'date': '2026-09-10'}, 'end': {'date': '2026-09-11'}})
+        self.assertEqual(allday['event']['starts_at'], '2026-09-10 00:00')
+        self.assertEqual(allday['event']['title'], '(Untitled)')
+        self.assertEqual(allday['href'], f'google:{self.CAL}#r')
+        self.assertNotEqual(allday['key'], allday['href'])
+        self.assertIsNone(worker.google_event(self.CAL, {'id': 'x', 'status': 'cancelled'}))
+
+    def test_sync_pages_and_retried_upload_does_not_duplicate(self):
+        remote_id = worker.google_event_id('stable', 42)
+        saved = worker.google_body(EVENT, remote_id)
+        class FakeClient:
+            calls = []
+            def pages(self, url, params):
+                self.params = params
+                yield {'items': [{'id': 'one', 'start': {'date': '2026-01-01'}, 'end': {'date': '2026-01-02'}}]}
+                yield {'items': [{'id': 'two', 'status': 'cancelled'}]}
+            def request(self, method, url, body=None, acceptable=(200,)):
+                self.calls.append(method)
+                return (409, {}) if method == 'POST' else (200, saved)
+        client = FakeClient()
+        result = worker.google_sync(client, {'calendar_url': self.CAL, 'namespace': 'stable', 'pending': [EVENT]})
+        self.assertEqual(client.params['singleEvents'], 'true')
+        self.assertEqual(client.calls, ['POST', 'GET'])
+        self.assertEqual(result['uploaded'], [{'id': 42, 'href': f'google:{self.CAL}#{remote_id}'}])
+        self.assertEqual(sorted(e['event']['title'] for e in result['events']), ['(Untitled)', EVENT['title']])
+
+    def test_upload_body_keeps_local_times_and_rejects_bad_ranges(self):
+        body = worker.google_body(EVENT, 'abcde')
+        self.assertTrue(body['start']['dateTime'].startswith('2026-09-10T12:00:00'))
+        with self.assertRaises(worker.SafeError):
+            worker.google_body({**EVENT, 'ends_at': '2026-09-10 11:00'}, 'abcde')
+
+    def test_discover_lists_primary_first_and_requires_writable(self):
+        class FakeClient:
+            def pages(self, url, params):
+                self.params = params
+                yield {'items': [{'id': 'b', 'summary': 'Work'}, {'id': 'me@gmail.com', 'summary': 'Me', 'primary': True}]}
+        client = FakeClient()
+        result = worker.google_discover(client)
+        self.assertEqual(client.params['minAccessRole'], 'writer')
+        self.assertEqual([c['url'] for c in result['calendars']], ['me@gmail.com', 'b'])
+
+INVITE = ('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:meet-1@example.com\r\n'
+          'SEQUENCE:2\r\nDTSTART:20260910T120000Z\r\nDTEND:20260910T130000Z\r\nSUMMARY:Planning\r\n'
+          'LOCATION:Room 4\r\nORGANIZER;CN=Ann Boss:mailto:ann@example.com\r\n'
+          'ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:Jim@Example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n')
+
+class ChangeAndInviteTests(unittest.TestCase):
+    def test_recurring_flag_marks_series_instances(self):
+        raw = b'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:r\r\nDTSTART:20260910T120000Z\r\nDTEND:20260910T130000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\nSUMMARY:R\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'
+        self.assertTrue(all(e['recurring'] for e in worker.expand(raw, URL+'r.ics', date(2026,1,1), date(2027,1,1))))
+        self.assertFalse(worker.expand(worker.serialize(EVENT, 's'), URL+'s.ics', date(2026,1,1), date(2027,1,1))[0]['recurring'])
+
+    def test_icloud_edit_keeps_other_properties_and_uses_etag(self):
+        original = INVITE.replace('METHOD:REQUEST\r\n', '').encode()
+        class FakeClient:
+            headers = {}
+            calls = []
+            def request(self, method, url, body=None, headers=None, acceptable=None):
+                self.calls.append((method, headers))
+                if method == 'GET':
+                    self.headers = {'ETag': '"v1"'}
+                    return 200, original, url
+                if method == 'PUT': self.body = body
+                return 204, b'', url
+        client = FakeClient()
+        edited = {**EVENT, 'title': 'Planning (moved)', 'starts_at': '2026-09-11 09:00', 'ends_at': '2026-09-11 10:00'}
+        applied, dropped = worker.apply_icloud_changes(client, [
+            {'id': 1, 'action': 'update', 'href': URL+'meet.ics', 'event': edited},
+            {'id': 2, 'action': 'delete', 'href': URL+'gone.ics', 'event': EVENT}])
+        self.assertEqual((applied, dropped), ([1, 2], []))
+        self.assertEqual(client.calls[1][1]['If-Match'], '"v1"')
+        saved = Calendar.from_ical(client.body).walk('VEVENT')[0]
+        self.assertEqual(str(saved['summary']), 'Planning (moved)')
+        self.assertIn('ATTENDEE', saved)
+        self.assertEqual(int(saved['sequence']), 3)
+        self.assertEqual(client.calls[2][0], 'DELETE')
+
+    def test_icloud_edit_conflict_or_series_is_dropped_not_overwritten(self):
+        class FakeClient:
+            headers = {}
+            def __init__(self, raw, put_status): self.raw, self.put_status = raw, put_status
+            def request(self, method, url, body=None, headers=None, acceptable=None):
+                return (200, self.raw, url) if method == 'GET' else (self.put_status, b'', url)
+        change = [{'id': 7, 'action': 'update', 'href': URL+'x.ics', 'event': EVENT}]
+        self.assertEqual(worker.apply_icloud_changes(FakeClient(worker.serialize(EVENT, 'x'), 412), change), ([], [7]))
+        series = b'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nDTSTART:20260910T120000Z\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n'
+        self.assertEqual(worker.apply_icloud_changes(FakeClient(series, 204), change), ([], [7]))
+
+    def test_google_edit_patches_all_day_dates(self):
+        class FakeClient:
+            def request(self, method, url, body=None, acceptable=(200,)):
+                self.method, self.url, self.body = method, url, body
+                return 200, {}
+        client = FakeClient()
+        allday = {**EVENT, 'starts_at': '2026-09-10 00:00', 'ends_at': '2026-09-11 00:00'}
+        applied, _ = worker.apply_google_changes(client, 'cal', [
+            {'id': 3, 'action': 'update', 'remote_key': 'google:cal#abc', 'event': allday}])
+        self.assertEqual(applied, [3])
+        self.assertEqual(client.method, 'PATCH')
+        self.assertTrue(client.url.endswith('/events/abc'))
+        self.assertEqual(client.body['start'], {'date': '2026-09-10'})
+
+    def test_tasks_sync_pushes_then_lists(self):
+        class FakeClient:
+            calls = []
+            def request(self, method, url, body=None, acceptable=(200,)):
+                self.calls.append((method, body))
+                return 200, {'id': 'new-remote'}
+            def pages(self, url, params):
+                self.params = params
+                yield {'items': [{'id': 'r1', 'title': 'Buy milk', 'status': 'completed', 'due': '2026-12-01T00:00:00.000Z'},
+                                 {'id': 'gone', 'deleted': True}]}
+        client = FakeClient()
+        todo = {'id': 5, 'title': 'Call Ann', 'notes': '', 'due_at': '2026-12-02', 'completed': False}
+        result = worker.tasks_sync(client, {'list_id': '@default', 'creates': [{'todo': todo, 'revision': 1}],
+                                            'updates': [{'remote_id': 'r1', 'todo': {**todo, 'id': 6}, 'revision': 4}],
+                                            'deletes': [{'id': 9, 'remote_id': 'old'}]})
+        self.assertEqual([c[0] for c in client.calls], ['DELETE', 'PATCH', 'POST'])
+        self.assertEqual(client.calls[2][1]['due'], '2026-12-02T00:00:00.000Z')
+        self.assertEqual(result['created'], [{'id': 5, 'remote_id': 'new-remote', 'revision': 1}])
+        self.assertEqual(result['pushed'], [{'id': 6, 'revision': 4}])
+        self.assertEqual(result['deletions_done'], [9])
+        self.assertEqual(result['remote'], [{'remote_id': 'r1', 'title': 'Buy milk', 'notes': '', 'due_at': '2026-12-01', 'completed': True}])
+        self.assertTrue(worker.google_trusted('https://tasks.googleapis.com/tasks/v1/lists/x/tasks'))
+        with self.assertRaises(worker.SafeError): worker.google_trusted('https://tasks.googleapis.com/drive/v3/x')
+
+    def test_parses_invitation_and_builds_reply(self):
+        invite = worker.parse_invite(INVITE)
+        self.assertEqual((invite['method'], invite['title'], invite['organizer_email']), ('REQUEST', 'Planning', 'ann@example.com'))
+        self.assertEqual(invite['organizer_name'], 'Ann Boss')
+        self.assertIn('jim@example.com', invite['attendees'])
+        self.assertFalse(invite['cancelled'])
+        reply = Calendar.from_ical(worker.invite_reply(INVITE, 'jim@example.com', 'Jim', 'ACCEPTED')['ics'])
+        self.assertEqual(str(reply['method']), 'REPLY')
+        event = reply.walk('VEVENT')[0]
+        self.assertEqual(str(event['uid']), 'meet-1@example.com')
+        self.assertEqual(event['attendee'].params['PARTSTAT'], 'ACCEPTED')
+        with self.assertRaises(worker.SafeError): worker.invite_reply(INVITE, 'a@b', '', 'MAYBE')
+        self.assertTrue(worker.parse_invite(INVITE.replace('METHOD:REQUEST', 'METHOD:CANCEL'))['cancelled'])
+
 if __name__ == '__main__': unittest.main()

@@ -131,6 +131,37 @@ needed for everyday mail—bold, italic, underline, bullets, links, and a
 signature insert action—and always sends a plain-text alternative as well.
 HTML is sanitized before it is stored in a draft or handed to SMTP.
 
+## Productivity features
+
+- **Undo send** (default 10 seconds, Settings → General) and **Send later**:
+  outgoing mail waits in the Outbox until its time; Undo returns it to Drafts.
+- **Snooze** a message until later today, tomorrow, the weekend, next week or a
+  chosen time. It leaves its folder, appears under Snoozed, and comes back
+  unread with a notification. Snoozes are local to this computer.
+- **One-click unsubscribe** from mailing lists (RFC 8058 POST, mailto, or the
+  list's web page, always after confirmation).
+- **Address suggestions** in To/Cc/Bcc, ranked by people you write to.
+- **Search all mail on the server** (IMAP SEARCH) for messages outside the
+  locally cached window; results are added to the cache.
+- **Meeting invitations**: `.ics` invites show a banner with Accept, Maybe and
+  Decline. Responses add or remove the event and email an iTIP REPLY to the
+  organiser.
+- **Calendar**: Month, Week and Agenda views; edit and delete events (synced to
+  iCloud/Google); desktop **event reminders** (Settings → Calendar).
+- **Todos** sync with Google Tasks.
+- **Automatic encrypted backups** on a schedule.
+
+## Calendars and backup
+
+The planner syncs iCloud (CalDAV, app-specific password) and Google Calendar
+(browser sign-in) side by side, plus read-only ICS subscriptions. See
+[docs/icloud-calendar.md](docs/icloud-calendar.md) and
+[docs/google-calendar.md](docs/google-calendar.md).
+
+Settings → Backup writes a passphrase-encrypted `.omailbackup` file with accounts,
+settings, cached mail, drafts, calendar data and (optionally) saved credentials,
+which can be restored into another installation. See [docs/backup.md](docs/backup.md).
+
 ## Build and preview
 
 System requirements are GTK4, libadwaita, WebKitGTK 6, Rust, SQLite, and a

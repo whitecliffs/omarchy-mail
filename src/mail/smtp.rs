@@ -205,16 +205,29 @@ fn build_message_with_names(
         };
         for (filename, path) in attachments {
             let bytes = fs::read(path)?;
+            let content_type = attachment_content_type(filename, &bytes);
             let attachment = Attachment::new(filename.clone()).body(
                 bytes,
-                ContentType::parse("application/octet-stream")
-                    .expect("application/octet-stream is a valid MIME type"),
+                ContentType::parse(content_type).expect("attachment MIME types are valid"),
             );
             multipart = multipart.singlepart(attachment);
         }
         builder.multipart(multipart)?
     };
     Ok(message)
+}
+
+/// Calendar files are labelled so mail clients recognise invitation replies.
+fn attachment_content_type(filename: &str, bytes: &[u8]) -> &'static str {
+    if !filename.to_ascii_lowercase().ends_with(".ics") {
+        return "application/octet-stream";
+    }
+    let text = String::from_utf8_lossy(bytes).to_ascii_uppercase();
+    if text.contains("METHOD:REPLY") {
+        "text/calendar; charset=utf-8; method=REPLY"
+    } else {
+        "text/calendar; charset=utf-8"
+    }
 }
 
 fn safe_attachment_filename(filename: &str) -> String {

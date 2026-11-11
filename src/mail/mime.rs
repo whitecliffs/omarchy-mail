@@ -25,6 +25,8 @@ pub struct ParsedMessage {
     pub body: String,
     pub is_html: bool,
     pub attachments: Vec<Attachment>,
+    pub list_unsubscribe: Option<String>,
+    pub list_unsubscribe_one_click: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +82,19 @@ pub fn parse(raw: &[u8]) -> Result<ParsedMessage, MimeError> {
         body,
         is_html,
         attachments,
+        list_unsubscribe: mail
+            .headers
+            .get_first_value("List-Unsubscribe")
+            .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|value| value.contains('<')),
+        list_unsubscribe_one_click: mail
+            .headers
+            .get_first_value("List-Unsubscribe-Post")
+            .is_some_and(|value| {
+                value
+                    .replace(' ', "")
+                    .eq_ignore_ascii_case("List-Unsubscribe=One-Click")
+            }),
     })
 }
 
@@ -1239,6 +1254,10 @@ fn collect_attachments_inner(mail: &ParsedMail<'_>, attachments: &mut Vec<Attach
             .mimetype
             .to_ascii_lowercase()
             .starts_with("image/");
+    // Invitations often arrive as an unnamed text/calendar alternative part.
+    let is_invitation =
+        mail.subparts.is_empty() && mail.ctype.mimetype.eq_ignore_ascii_case("text/calendar");
+    let filename = filename.or_else(|| is_invitation.then(|| "invite.ics".to_string()));
     if filename.is_some() || is_inline_image {
         if !mail.subparts.is_empty() {
             for part in &mail.subparts {

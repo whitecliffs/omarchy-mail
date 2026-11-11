@@ -30,6 +30,24 @@ pub struct Preferences {
     pub date_time_format: String,
     #[serde(default)]
     pub icloud_calendar: Option<crate::icloud::CalendarAccount>,
+    #[serde(default)]
+    pub google_calendar: Option<crate::google_calendar::GoogleCalendarAccount>,
+    /// Which connected calendar receives events created in Omarchy Mail:
+    /// "icloud" or "google". Unset or unavailable falls back to whichever is connected.
+    #[serde(default)]
+    pub new_event_calendar: Option<String>,
+    #[serde(default)]
+    pub google_tasks: Option<crate::google_tasks::GoogleTasksAccount>,
+    /// Minutes before a timed event to notify; None turns reminders off.
+    #[serde(default = "default_reminder_minutes")]
+    pub reminder_minutes: Option<u32>,
+    #[serde(default)]
+    pub remind_subscriptions: bool,
+    /// Seconds a sent message waits in the Outbox so it can be undone.
+    #[serde(default = "default_undo_send_seconds")]
+    pub undo_send_seconds: u32,
+    #[serde(default)]
+    pub auto_backup: Option<AutoBackup>,
     #[serde(default = "default_true")]
     pub show_personal_calendar: bool,
     #[serde(default)]
@@ -50,6 +68,13 @@ impl Default for Preferences {
             message_list_width: default_message_list_width(),
             date_time_format: default_date_time_format(),
             icloud_calendar: None,
+            google_calendar: None,
+            new_event_calendar: None,
+            google_tasks: None,
+            reminder_minutes: default_reminder_minutes(),
+            remind_subscriptions: false,
+            undo_send_seconds: default_undo_send_seconds(),
+            auto_backup: None,
             show_personal_calendar: true,
             calendar_subscriptions: Vec::new(),
         }
@@ -89,6 +114,19 @@ impl Preferences {
         self.allowed_remote_image_senders
             .push(sender_email.to_ascii_lowercase());
         self.allowed_remote_image_senders.sort_unstable();
+    }
+
+    /// The calendar that new local events upload to, if any is connected.
+    pub fn upload_calendar(&self) -> Option<&'static str> {
+        let icloud = self.icloud_calendar.is_some();
+        let google = self.google_calendar.is_some();
+        match self.new_event_calendar.as_deref() {
+            Some("google") if google => Some("google"),
+            Some("icloud") if icloud => Some("icloud"),
+            _ if icloud => Some("icloud"),
+            _ if google => Some("google"),
+            _ => None,
+        }
     }
 
     pub fn account_is_collapsed(&self, email: &str) -> bool {
@@ -148,6 +186,26 @@ fn path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(config_home.join("omarchy-mail").join("preferences.json"))
+}
+
+/// Scheduled encrypted backups. The passphrase lives in the keyring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoBackup {
+    pub folder: String,
+    pub every_days: u32,
+    pub keep: u32,
+    #[serde(default)]
+    pub last_run: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_reminder_minutes() -> Option<u32> {
+    Some(10)
+}
+
+fn default_undo_send_seconds() -> u32 {
+    10
 }
 
 fn default_true() -> bool {
@@ -218,6 +276,37 @@ mod tests {
         assert!(preferences.account_is_collapsed("jim@example.com"));
         preferences.set_account_collapsed("jim@example.com", false);
         assert!(!preferences.account_is_collapsed("jim@example.com"));
+    }
+
+    #[test]
+    fn new_events_upload_to_exactly_one_connected_calendar() {
+        let icloud = crate::icloud::CalendarAccount {
+            username: "a@icloud.com".into(),
+            calendar_url: "https://caldav.icloud.com/1/".into(),
+            calendar_name: "Home".into(),
+            namespace: "n".into(),
+            upload_after: 0,
+        };
+        let google = crate::google_calendar::GoogleCalendarAccount {
+            email: "a@gmail.com".into(),
+            calendar_id: "primary".into(),
+            calendar_name: "Me".into(),
+            namespace: "n".into(),
+            upload_after: 0,
+        };
+        let mut preferences = Preferences::default();
+        assert_eq!(preferences.upload_calendar(), None);
+        preferences.new_event_calendar = Some("google".into());
+        assert_eq!(preferences.upload_calendar(), None);
+        preferences.google_calendar = Some(google);
+        assert_eq!(preferences.upload_calendar(), Some("google"));
+        preferences.icloud_calendar = Some(icloud);
+        assert_eq!(preferences.upload_calendar(), Some("google"));
+        preferences.new_event_calendar = None;
+        assert_eq!(preferences.upload_calendar(), Some("icloud"));
+        preferences.google_calendar = None;
+        preferences.new_event_calendar = Some("google".into());
+        assert_eq!(preferences.upload_calendar(), Some("icloud"));
     }
 
     #[test]

@@ -287,6 +287,132 @@ pub fn sync_folder(
     Ok(snapshot)
 }
 
+/// Builds an IMAP SEARCH criterion for free text. Quoted strings cannot carry
+/// CR/LF, and quotes/backslashes are escaped so the text stays one argument.
+pub fn text_search_criteria(query: &str) -> Result<String, ImapError> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 200 || query.contains(['\r', '\n', '\0']) {
+        return Err(ImapError::InvalidAction("unsupported search text".into()));
+    }
+    let quoted = format!("\"{}\"", query.replace('\\', "\\\\").replace('"', "\\\""));
+    Ok(if query.is_ascii() {
+        format!("TEXT {quoted}")
+    } else {
+        format!("CHARSET UTF-8 TEXT {quoted}")
+    })
+}
+
+/// Public mapping from a cached folder name to its server mailbox.
+pub fn remote_name_for(
+    folders: &[MailFolder],
+    account_id: Option<i64>,
+    local_name: &str,
+) -> Option<String> {
+    remote_name_for_local(folders, account_id, local_name)
+}
+
+/// Searches one mailbox on the server and fetches the newest `limit` matches,
+/// so messages outside the cached window can be found.
+pub fn search_folder(
+    account: &Account,
+    auth: &AuthMaterial,
+    remote_name: &str,
+    local_name: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Message>, ImapError> {
+    let criteria = text_search_criteria(query)?;
+    let tls = TlsConnector::builder().build()?;
+    let address = (account.incoming.hostname.as_str(), account.incoming.port);
+    match account.incoming.security {
+        SecurityMode::Tls => {
+            let client = imap::connect(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            search_client(
+                client,
+                account,
+                auth,
+                remote_name,
+                local_name,
+                &criteria,
+                limit,
+            )
+        }
+        SecurityMode::StartTls => {
+            let client = imap::connect_starttls(address, &account.incoming.hostname, &tls)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            search_client(
+                client,
+                account,
+                auth,
+                remote_name,
+                local_name,
+                &criteria,
+                limit,
+            )
+        }
+        SecurityMode::None => {
+            let stream = TcpStream::connect(address)
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|error| ImapError::Protocol(error.to_string()))?;
+            search_client(
+                client,
+                account,
+                auth,
+                remote_name,
+                local_name,
+                &criteria,
+                limit,
+            )
+        }
+    }
+}
+
+fn search_client<T: Read + Write>(
+    client: imap::Client<T>,
+    account: &Account,
+    auth: &AuthMaterial,
+    remote_name: &str,
+    local_name: &str,
+    criteria: &str,
+    limit: usize,
+) -> Result<Vec<Message>, ImapError> {
+    let mut session = authenticate(client, account, auth)?;
+    let mailbox = session
+        .select(remote_name)
+        .map_err(|error| ImapError::Protocol(error.to_string()))?;
+    let mut uids = session
+        .uid_search(criteria)
+        .map_err(|error| ImapError::Protocol(error.to_string()))?
+        .into_iter()
+        .collect::<Vec<_>>();
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.truncate(limit);
+    let mut messages = Vec::new();
+    if !uids.is_empty() {
+        let sequence = uids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = session
+            .uid_fetch(sequence, "(BODY.PEEK[] FLAGS INTERNALDATE)")
+            .map_err(|error| ImapError::Protocol(error.to_string()))?;
+        for fetch in fetches.iter() {
+            if let Ok(Some(message)) =
+                message_from_fetch(fetch, account.id, mailbox.uid_validity, local_name)
+            {
+                messages.push(message);
+            }
+        }
+    }
+    let _ = session.logout();
+    Ok(messages)
+}
+
 /// Re-fetches one complete RFC822 message when its disposable attachment
 /// cache has been evicted. The selected mailbox UIDVALIDITY is checked before
 /// parsing so a recycled UID can never populate the wrong local message.
@@ -884,6 +1010,8 @@ fn message_from_fetch(
         has_attachments: !attachments.is_empty(),
         attachments,
         thread_size: 1,
+        list_unsubscribe: parsed.list_unsubscribe,
+        list_unsubscribe_one_click: parsed.list_unsubscribe_one_click,
     }))
 }
 
@@ -933,6 +1061,53 @@ fn derive_thread_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Read-only IMAP search of the first configured account's INBOX; uses its keyring credential"]
+    fn live_server_search_is_read_only() {
+        let database = crate::database::Database::open_default().unwrap();
+        let account = database
+            .load_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.enabled)
+            .unwrap();
+        let auth = crate::mail::credentials::load_auth_material(
+            &account.email,
+            "imap",
+            &account.incoming.auth,
+        )
+        .unwrap();
+        let found = search_folder(&account, &auth, "INBOX", "Inbox", "the", 5).unwrap();
+        eprintln!(
+            "server search returned {} message(s); nothing was saved",
+            found.len()
+        );
+        assert!(
+            found
+                .iter()
+                .all(|m| m.folder == "Inbox" && m.remote_uid.is_some())
+        );
+    }
+
+    #[test]
+    fn search_text_is_quoted_as_one_argument() {
+        assert_eq!(
+            text_search_criteria(" invoice ").unwrap(),
+            "TEXT \"invoice\""
+        );
+        assert_eq!(
+            text_search_criteria("say \"hi\" \\ bye").unwrap(),
+            "TEXT \"say \\\"hi\\\" \\\\ bye\""
+        );
+        assert!(
+            text_search_criteria("café")
+                .unwrap()
+                .starts_with("CHARSET UTF-8 TEXT")
+        );
+        assert!(text_search_criteria("a\r\nb").is_err());
+        assert!(text_search_criteria("   ").is_err());
+    }
     use crate::models::ServerConfig;
     use imap::Authenticator;
     use std::io::{BufRead, BufReader, Write};

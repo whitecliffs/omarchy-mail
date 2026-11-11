@@ -39,6 +39,14 @@ without making the GTK main loop responsible for network activity.
   cache and queues the UID-safe IMAP flag action. A malformed MIME payload is
   isolated to its message during a mailbox fetch, counted in the sync report,
   and does not discard the other messages returned by that server response.
+- `icloud.rs` and `google_calendar.rs` drive the isolated Python calendar
+  helper (`scripts/icloud_worker.py`) and apply complete snapshots per source.
+  Google access tokens come from a dedicated keyring slot and are refreshed in
+  Rust; the helper only accepts `www.googleapis.com/calendar/v3/` URLs.
+- `backup.rs` writes and restores encrypted, portable backups (Argon2id +
+  ChaCha20-Poly1305 STREAM over a gzip tar). Restores are staged and only
+  applied at the next start, before the database opens. `cli.rs` exposes
+  `--backup` / `--restore`.
 - `theme.rs` reads the staged Omarchy `colors.toml`, installs GTK CSS, and
   watches the active palette for live theme changes.
 - `ui/window.rs` contains the desktop experience, including adaptive pane

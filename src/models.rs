@@ -164,6 +164,12 @@ pub struct Message {
     pub has_attachments: bool,
     pub attachments: Vec<AttachmentInfo>,
     pub thread_size: u32,
+    /// Raw List-Unsubscribe header (comma-separated <uri> list), if any.
+    #[serde(default)]
+    pub list_unsubscribe: Option<String>,
+    /// RFC 8058 one-click unsubscribe is advertised (List-Unsubscribe-Post).
+    #[serde(default)]
+    pub list_unsubscribe_one_click: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +181,18 @@ pub struct CalendarEvent {
     pub ends_at: String,
     pub location: String,
     pub message_id: Option<i64>,
+}
+
+/// A pending change to an event that already exists on a remote calendar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarChange {
+    pub id: i64,
+    pub source: String,
+    pub href: String,
+    pub remote_key: String,
+    /// "update" or "delete".
+    pub action: String,
+    pub event: CalendarEvent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +229,8 @@ impl Message {
                 has_attachments: true,
                 attachments: Vec::new(),
                 thread_size: 2,
+                list_unsubscribe: None,
+                list_unsubscribe_one_click: false,
             },
             Self {
                 id: 2,
@@ -235,6 +255,8 @@ impl Message {
                 has_attachments: false,
                 attachments: Vec::new(),
                 thread_size: 1,
+                list_unsubscribe: None,
+                list_unsubscribe_one_click: false,
             },
             Self {
                 id: 3,
@@ -257,6 +279,8 @@ impl Message {
                 has_attachments: false,
                 attachments: Vec::new(),
                 thread_size: 3,
+                list_unsubscribe: None,
+                list_unsubscribe_one_click: false,
             },
             Self {
                 id: 4,
@@ -279,6 +303,8 @@ impl Message {
                 has_attachments: true,
                 attachments: Vec::new(),
                 thread_size: 1,
+                list_unsubscribe: None,
+                list_unsubscribe_one_click: false,
             },
             Self {
                 id: 5,
@@ -301,6 +327,8 @@ impl Message {
                 has_attachments: false,
                 attachments: Vec::new(),
                 thread_size: 1,
+                list_unsubscribe: None,
+                list_unsubscribe_one_click: false,
             },
         ]
     }

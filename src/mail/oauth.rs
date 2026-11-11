@@ -186,8 +186,25 @@ fn configured_client_values(provider: Provider) -> (Option<String>, Option<Strin
     )
 }
 
+/// Google Calendar access for the planner. Requested separately from mail so
+/// connecting a calendar never changes what a mail account was authorised for.
+/// Tasks is included so todos can sync with Google Tasks from the same sign-in.
+pub const GOOGLE_CALENDAR_SCOPE: &str =
+    "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/tasks";
+
 pub fn begin(email: &str) -> Result<AuthorizationRequest, OAuthError> {
     let provider = provider_for_email(email).ok_or(OAuthError::UnsupportedProvider)?;
+    begin_with_scope(provider, provider.scope(), email, false)
+}
+
+/// Starts a browser sign-in for an explicit provider and scope. `offline`
+/// asks Google for a refresh token even when the account consented before.
+pub fn begin_with_scope(
+    provider: Provider,
+    scope: &str,
+    login_hint: &str,
+    offline: bool,
+) -> Result<AuthorizationRequest, OAuthError> {
     let client_id = configured_client_id(provider)?;
     let client_secret = configured_client_secret(provider);
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -202,11 +219,16 @@ pub fn begin(email: &str) -> Result<AuthorizationRequest, OAuthError> {
         .append_pair("client_id", &client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", provider.scope())
+        .append_pair("scope", scope)
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("login_hint", email.trim());
+        .append_pair("login_hint", login_hint.trim());
+    if offline && provider == Provider::Google {
+        query
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent");
+    }
     Ok(AuthorizationRequest {
         authorization_url: format!("{}?{}", provider.authorization_endpoint(), query.finish()),
         listener,
@@ -311,7 +333,7 @@ fn parse_token_response(body: String) -> Result<OAuthTokens, OAuthError> {
     })
 }
 
-fn http_post_form(endpoint: &str, form: &str) -> Result<String, OAuthError> {
+pub(crate) fn http_post_form(endpoint: &str, form: &str) -> Result<String, OAuthError> {
     let endpoint = Url::parse(endpoint)?;
     if endpoint.scheme() != "https" {
         return Err(OAuthError::Authorization(
