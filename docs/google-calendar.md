@@ -42,3 +42,7 @@ todo keeps a revision number: local edits made since the last sync are pushed,
 untouched todos take Google's values, and deletions on either side are applied.
 If a todo was edited here but deleted in Google, it is uploaded again rather
 than lost.
+
+Disconnecting a calendar, or switching to a different one, removes its cached
+events from this computer on the next sync. Nothing is deleted from the
+provider, and local events that were never uploaded are kept.

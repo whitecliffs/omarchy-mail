@@ -1615,6 +1615,11 @@ fn start_calendar_sync(state: Rc<AppState>) {
         && prefs.google_tasks.is_none()
         && prefs.calendar_subscriptions.is_empty()
     {
+        // Nothing to sync, but a just-disconnected calendar is still cleared.
+        let database = state.database.clone();
+        std::thread::spawn(move || {
+            let _ = database.purge_calendar_sources_except(&[]);
+        });
         return;
     }
     if state.demo_mode || state.calendar_sync_busy.replace(true) {
@@ -1626,6 +1631,21 @@ fn start_calendar_sync(state: Rc<AppState>) {
     let (sender, receiver) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let mut messages = Vec::new();
+        // Calendars that were disconnected or swapped for another one leave
+        // nothing behind locally; their remote events are not touched.
+        let connected = prefs
+            .icloud_calendar
+            .iter()
+            .map(|account| account.calendar_url.clone())
+            .chain(prefs.google_calendar.iter().map(|account| account.source()))
+            .collect::<Vec<_>>();
+        if let Ok(removed) = database.purge_calendar_sources_except(&connected)
+            && removed > 0
+        {
+            messages.push(format!(
+                "Removed {removed} cached event(s) from disconnected calendars"
+            ));
+        }
         let upload = prefs.upload_calendar();
         if let Some(account) = prefs.icloud_calendar.as_ref() {
             messages.push(
@@ -7840,7 +7860,7 @@ fn build_icloud_settings(
     disconnect.connect_clicked(move |_| {
         disconnect_state.preferences.borrow_mut().icloud_calendar = None;
         mark_settings_dirty(&disconnect_session, &disconnect_save);
-        disconnect_status.set_text("Disconnected. Cached events remain on this computer. Save Changes to keep this setting.");
+        disconnect_status.set_text("Disconnected. After Save Changes, this calendar’s events are removed from this computer (not from iCloud).");
     });
     find.connect_clicked(move |button| {
         if state.calendar_sync_busy.get() { status.set_text("Wait for the current sync to finish."); return; }
@@ -8004,7 +8024,7 @@ fn build_google_calendar_settings(
             state.preferences.borrow_mut().google_calendar = None;
             mark_settings_dirty(&session, &save);
             status.set_text(
-                "Disconnected. Cached events remain on this computer. Save Changes to keep this setting.",
+                "Disconnected. After Save Changes, this calendar’s events are removed from this computer (not from Google).",
             );
         });
     }

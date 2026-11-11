@@ -709,6 +709,38 @@ impl Database {
             .map_err(DatabaseError::from)
     }
 
+    /// Removes cached events (and queued edits) for calendars that are no
+    /// longer connected. Remote calendars are untouched, and local events
+    /// that were never synced are kept. Returns how many events were removed.
+    pub fn purge_calendar_sources_except(&self, keep: &[String]) -> Result<usize> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
+        let stale = {
+            let mut statement = tx.prepare("SELECT DISTINCT source FROM calendar_sync_links")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|source| !keep.contains(source))
+                .collect::<Vec<_>>()
+        };
+        let mut removed = 0;
+        for source in &stale {
+            removed += tx.execute(
+                "DELETE FROM calendar_events WHERE id IN
+                 (SELECT event_id FROM calendar_sync_links WHERE source = ?1)",
+                [source],
+            )?;
+            tx.execute(
+                "DELETE FROM calendar_sync_links WHERE source = ?1",
+                [source],
+            )?;
+            tx.execute("DELETE FROM calendar_changes WHERE source = ?1", [source])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn pending_calendar_events(&self, after: i64) -> Result<Vec<CalendarEvent>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT event_id FROM calendar_sync_links")?;
@@ -2069,6 +2101,76 @@ mod tests {
         );
         assert!(database.claim_reminder("icloud#a").unwrap());
         assert!(!database.claim_reminder("icloud#a").unwrap());
+    }
+
+    #[test]
+    fn purging_removed_calendars_keeps_connected_and_local_events() {
+        use crate::icloud::{RemoteEvent, Snapshot};
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path()).unwrap();
+        let snapshot = |title: &str| Snapshot {
+            events: vec![RemoteEvent {
+                key: title.into(),
+                href: title.into(),
+                event: CalendarEvent {
+                    title: title.into(),
+                    ..sample_event()
+                },
+                recurring: false,
+            }],
+            uploaded: vec![],
+            applied: vec![],
+            dropped: vec![],
+        };
+        database
+            .apply_calendar_snapshot("google:old", &snapshot("Old"))
+            .unwrap();
+        database
+            .apply_calendar_snapshot("google:new", &snapshot("New"))
+            .unwrap();
+        database
+            .create_calendar_event(&CalendarEvent {
+                title: "Local".into(),
+                ..sample_event()
+            })
+            .unwrap();
+        let old_id = database
+            .list_calendar_events()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.title == "Old")
+            .unwrap()
+            .id;
+        database.delete_calendar_event(old_id).unwrap();
+        database
+            .apply_calendar_snapshot("google:old", &snapshot("Old 2"))
+            .unwrap();
+        assert_eq!(
+            database
+                .purge_calendar_sources_except(&["google:new".into()])
+                .unwrap(),
+            1
+        );
+        let mut titles = database
+            .list_calendar_events()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.title)
+            .collect::<Vec<_>>();
+        titles.sort();
+        assert_eq!(titles, ["Local", "New"]);
+        assert!(
+            database
+                .pending_calendar_changes("google:old")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .purge_calendar_sources_except(&["google:new".into()])
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

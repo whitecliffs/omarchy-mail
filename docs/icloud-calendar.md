@@ -65,3 +65,7 @@ iCloud. Add the same URL on other devices to see the subscription there.
 Unchecking a source hides it; Remove removes the subscription from settings
 when changes are saved. Neither operation deletes events from iCloud or the
 provider. Previously downloaded feed caches are retained locally.
+
+Disconnecting a calendar, or switching to a different one, removes its cached
+events from this computer on the next sync. Nothing is deleted from the
+provider, and local events that were never uploaded are kept.
